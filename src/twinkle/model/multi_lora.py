@@ -135,6 +135,28 @@ class MultiLora:
         return [_lora for _lora in self.loras if _lora.adapter_name == adapter_name][0]
 
     @staticmethod
+    def _is_distributed_tensor(tensor: Any) -> bool:
+        return hasattr(tensor, 'full_tensor') and hasattr(tensor, 'device_mesh') and hasattr(tensor, 'placements')
+
+    def _prepare_parameter_tensor(self, parameter):
+        param_data = parameter.data
+        if self._is_distributed_tensor(param_data):
+            full_tensor = torch_util.to_local_tensor(param_data).clone()
+            return full_tensor, True
+        return param_data.clone(), False
+
+    def _write_parameter_tensor(self, parameter, tensor: torch.Tensor, is_distributed: bool):
+        param_data = parameter.data
+        tensor = tensor.to(device=param_data.device, dtype=param_data.dtype)
+        if not is_distributed:
+            param_data.copy_(tensor)
+            return
+
+        from torch.distributed.tensor import distribute_tensor
+        distributed_tensor = distribute_tensor(tensor, param_data.device_mesh, param_data.placements)
+        param_data.copy_(distributed_tensor)
+
+    @staticmethod
     def match_target_modules(
         module_name: str,
         target_modules: Optional[Union[List[str], str]],
@@ -475,19 +497,22 @@ class MultiLora:
             for name, parameter in _module.named_parameters():
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
                     name = name.replace(f'.{_lora.adapter_name}.', '.')
-                    src_tensor = state_dict[name]
+                    src_tensor = torch_util.to_local_tensor(state_dict[name])
+                    target_tensor, is_distributed = self._prepare_parameter_tensor(parameter)
+                    src_tensor = src_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
                     if 'embedding_A' in name:
                         r_saved = src_tensor.shape[1]
-                        parameter.data[:, :r_saved].copy_(src_tensor)
+                        target_tensor[:, :r_saved].copy_(src_tensor)
                     elif 'embedding_B' in name:
                         r_saved = src_tensor.shape[0]
-                        parameter.data[:r_saved, :].copy_(src_tensor)
+                        target_tensor[:r_saved, :].copy_(src_tensor)
                     elif '_A' in name:
                         r_saved = src_tensor.shape[0]
-                        parameter.data[:r_saved, :].copy_(src_tensor)
+                        target_tensor[:r_saved, :].copy_(src_tensor)
                     elif '_B' in name:
                         r_saved = src_tensor.shape[1]
-                        parameter.data[:, :r_saved].copy_(src_tensor)
+                        target_tensor[:, :r_saved].copy_(src_tensor)
+                    self._write_parameter_tensor(parameter, target_tensor, is_distributed)
 
         if isinstance(self.module, list):
             for _module in self.module:
@@ -531,10 +556,17 @@ class MultiLora:
 
         def _load_initial_weights(_module):
             for name, parameter in _module.named_parameters():
+                target_tensor, is_distributed = self._prepare_parameter_tensor(parameter)
                 if pattern_A.search(name):
-                    parameter.data.copy_(_lora.lora_A_weights[name])
+                    source_tensor = _lora.lora_A_weights[name].to(
+                        device=target_tensor.device,
+                        dtype=target_tensor.dtype,
+                    )
+                    target_tensor.copy_(source_tensor)
+                    self._write_parameter_tensor(parameter, target_tensor, is_distributed)
                 if pattern_B.search(name):
-                    parameter.data.copy_(torch.zeros_like(parameter.data).to(parameter.data.dtype))
+                    target_tensor.zero_()
+                    self._write_parameter_tensor(parameter, target_tensor, is_distributed)
 
         if isinstance(self.module, list):
             for _module in self.module:

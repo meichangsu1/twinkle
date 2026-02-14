@@ -11,6 +11,8 @@ class MultiLoraTransformersModel:
                  config: Optional[PretrainedConfig] = None,
                  device_mesh: Optional[DeviceMesh] = None,
                  mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+                 strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
+                 fsdp_config: Dict[str, Any] = None,
                  grad_scaler_config: Dict[str, Any] = None,
                  max_loras: int = 5,
                  max_r: int = 32,
@@ -25,8 +27,13 @@ In addition to the same parameters as the base class, this class provides severa
 - max_loras: Maximum number of loras
 - max_r: Maximum lora rank
 - max_length: Maximum supported training length
+- strategy: for multi-tenant LoRA, FSDP mode only supports `native_fsdp`
+- fsdp_config: config used by `native_fsdp`
 
 The reason for the existence of max_loras and max_r parameters is that Twinkle's multi-lora technical solution is to add loras to `max_loras` before DDP wrap to prevent later added loras from being unable to accept DDP management.
 Because of this, the user's r must be less than or equal to the max_r configuration. During actual training, only part of the lora's rank will be used in the calculation.
+
+When `device_mesh.fsdp_world_size > 1`, MultiLoraTransformersModel forces `native_fsdp`
+and keeps the same multi-tenant LoRA behavior: pre-allocated slots + runtime tenant reuse.
 
 MultiLoraTransformersModel supports the `@remote_class` annotation and supports device_mesh, which means it can run in Ray workers.

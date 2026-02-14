@@ -12,9 +12,12 @@ from twinkle.hub import HubOperation
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
+from twinkle.utils.logger import get_logger
 from ..multi_lora import MultiLora
-from .strategy import AccelerateStrategy
+from .strategy import AccelerateStrategy, NativeFSDPStrategy
 from .transformers import OptimizerGroup, TransformersModel
+
+logger = get_logger()
 
 
 @remote_class()
@@ -27,12 +30,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             config: Optional[PretrainedConfig] = None,
             device_mesh: Optional[DeviceMesh] = None,
             mixed_precision: Literal['no', 'fp8', 'fp16', 'bf16'] = 'bf16',
+            strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
+            fsdp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
             max_loras: int = 5,
             max_r: int = 32,
             max_length: int = 8192,
             **kwargs):
-        assert device_mesh.fsdp_world_size <= 0, f'MultiLora does not support FSDP, current is: {str(device_mesh)}'
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         super(PreTrainedModel, self).__init__()
         model_id = HubOperation.download_model(model_id)
@@ -41,6 +45,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
+        self._strategy_name = strategy
+        self._fsdp_config = dict(fsdp_config or {})
         self.grad_scaler_config = grad_scaler_config
         self._model_wrapped = False
         self.sp_strategy = None
@@ -52,11 +58,29 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model)
-        self.strategy = AccelerateStrategy(mixed_precision=mixed_precision, device_mesh=None)
-        self.model = self.strategy.wrap_model(self.model)
+        self.strategy = self._build_strategy()
+        wrapped_model = self.strategy.wrap_model(self.model)
+        if isinstance(wrapped_model, tuple):
+            self.model = wrapped_model[0]
+        else:
+            self.model = wrapped_model
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
+
+    def _build_strategy(self):
+        fsdp_world_size = getattr(self.device_mesh, 'fsdp_world_size', 0) or 0
+        if fsdp_world_size > 1:
+            if self._strategy_name != 'native_fsdp':
+                logger.warning('FSDP world size is %s; forcing strategy to native_fsdp for MultiLoraTransformersModel.',
+                               fsdp_world_size)
+            return NativeFSDPStrategy(
+                mixed_precision=self.mixed_precision,
+                fsdp_config=self._fsdp_config,
+                device_mesh=self.device_mesh,
+                enable_ep=False,
+            )
+        return AccelerateStrategy(mixed_precision=self.mixed_precision, device_mesh=None)
 
     def _check_adapter_valid(self, adapter_name: str):
         assert adapter_name and adapter_name in self.optimizer_group, (f'Use a valid adapter_name first, '
