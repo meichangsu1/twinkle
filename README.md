@@ -69,8 +69,8 @@ pip install -e .
 | --------------------------------- | --------------- | ------------------------------------------------- |
 | FSDP finetuning                   | transformers    | [Script](cookbook/transformers/fsdp2.py)             |
 | FSDP MoE finetuning               | transformers    | [Script](cookbook/transformers/fsdp2_moe.py)         |
-| ep FSDP MoE finetuning            | transformers    | [Script](cookbook/transformers/ep_fsdp_qwen3_moe.py)|
-| sp FSDP finetuning              | transformers    | [Script](cookbook/transformers/sp_fsdp_dense.py) |
+| ep FSDP MoE finetuning            | transformers    | [Script](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
+| sp FSDP finetuning                | transformers    | [Script](cookbook/transformers/sp_fsdp_dense.py)     |
 | EP MoE finetuning                 | transformers    | [Script](cookbook/transformers/ep_fsdp_qwen3_moe.py) |
 | pp/tp/cp finetuning               | megatron        | [Script](cookbook/megatron/tp.py)                    |
 | pp/tp/cp MoE finetuning           | megatron        | [Script](cookbook/megatron/tp_moe.py)                |
@@ -88,7 +88,7 @@ pip install -e .
 We are rolling out training service built atop Twinkle✨ on ModelScope. It is currently in _Beta_. You may
 sign up for free access by joining the [Twinkle-Explorers](https://modelscope.cn/organization/twinkle-explorers) organization, and
 train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to
-our [documentation](docs/source_en/Usage%20Guide/ModelScope-Official-Resources.md).
+our [documentation](docs/source_en/Usage%20Guide/Train-as-a-Service.md).
 
 ## Supported Hardware
 
@@ -130,7 +130,7 @@ supported on Twinkle✨ framework.
 |                     | [deepseek-ai/DeepSeek-R1](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1)                                          | transformers>=4.39.3 | ✅               | [deepseek-ai/DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)                                     |
 | deepSeek-r1-distill | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) ~32B | transformers>=4.37   | ✅               | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) |
 
-For a more detailed model support list 👉  [Quick Start.md](https://github.com/modelscope/twinkle/blob/dev/docs/source/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%BC%95/%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B.md)
+For more detailed model support list 👉  [Quick Start](docs/source_en/Usage%20Guide/Quick-Start.md)
 
 ## Sample Code
 
@@ -355,11 +355,16 @@ foundation for building customizable, enterprise-grade training services.
 | -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
 | Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | Fixes Qwen3 MoE model hang issue during FSDP2 training, effective for transformers==4.x | ModelScope Official |
 
-## Acknowledgements
+## Contributions
 
-This project is maintained and supported by multiple teams under Workshop:
+Twinkle✨ is a collaborative initiative put together by ModelScope in partnership
+with the open-source community, with key contributions from strategic stakeholders
+including China Merchants Bank Tech Team.
 
-- ModelScope Team
-- CMB-Tech Team
+We are grateful to the open-source community, particularly the projects that inspired us,
+including [Transformers](https://github.com/huggingface/transformers),
+[MS-SWIFT](https://github.com/modelscope/swift),
+[veRL](https://github.com/verl-project/verl), [Tinker](https://github.com/thinking-machines-lab/tinker), and many others.
 
-Twinkle is built on the shoulders of giants, including [Transformers](https://github.com/huggingface/transformers),[MS-SWIFT](https://github.com/modelscope/swift), [veRL](https://github.com/verl-project/verl), and other excellent projects.
+We welcome
+open contributions via [issues](https://github.com/modelscope/twinkle/issues) and [pull-requests](https://github.com/modelscope/twinkle/pulls).
