@@ -520,7 +520,12 @@ def build_model_app(model_id: str,
             self.register_adapter(adapter_name, token)
 
             # Create adapter AFTER successful registration
-            self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
+            try:
+                self.model.add_adapter_to_model(adapter_name, config, **extra_kwargs)
+            except Exception:
+                self.clear_adapter_state(adapter_name)
+                self.unregister_adapter(adapter_name)
+                raise
 
             # Save training run metadata (similar to tinker's create_model)
             # Create a training run config from the adapter configuration
