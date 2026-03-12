@@ -14,13 +14,192 @@ def get_config_attr(config, key, default=None):
     return getattr(config, key, default)
 
 
+def _extract_text_position_ids(position_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Extract text-aligned position ids as [B, S] from 1D/2D/3D/4D inputs."""
+    if position_ids is None or not torch.is_tensor(position_ids):
+        return None
+    if position_ids.dim() == 1:
+        return position_ids.unsqueeze(0)
+    if position_ids.dim() == 2:
+        return position_ids
+    # Channel-first multimodal layouts, e.g. [3,B,S] / [4,B,S].
+    return position_ids[0]
+
+
+def _split_position_ids_for_sp(
+    position_ids: Optional[torch.Tensor],
+    sp_world_size: Optional[int],
+    sp_group: Optional[dist.ProcessGroup],
+) -> Optional[torch.Tensor]:
+    if position_ids is None or not torch.is_tensor(position_ids) or sp_world_size is None or sp_world_size <= 1:
+        return position_ids
+    rank = dist.get_rank(sp_group) if sp_group is not None else 0
+    seq_len = position_ids.size(-1)
+    if seq_len % sp_world_size != 0:
+        raise ValueError(f'position_ids seq_len ({seq_len}) must be divisible by sp_world_size ({sp_world_size}).')
+    local_seq = seq_len // sp_world_size
+    return torch.split(position_ids, local_seq, dim=-1)[rank].contiguous()
+
+
+def _gather_position_ids_for_sp(
+    position_ids: Optional[torch.Tensor],
+    sp_world_size: Optional[int],
+    sp_group: Optional[dist.ProcessGroup],
+) -> Optional[torch.Tensor]:
+    if position_ids is None or not torch.is_tensor(position_ids) or sp_world_size is None or sp_world_size <= 1:
+        return position_ids
+    position_ids = position_ids.contiguous()
+    local_shape = tuple(position_ids.shape)
+    gather_shape = (local_shape[0] * sp_world_size, *local_shape[1:])
+    gathered = torch.empty(gather_shape, dtype=position_ids.dtype, device=position_ids.device)
+    dist.all_gather_into_tensor(gathered, position_ids, group=sp_group)
+    return torch.cat(gathered.split(local_shape[0], dim=0), dim=-1).contiguous()
+
+
 def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
-    position_ids = position_ids[0]
+    text_position_ids = _extract_text_position_ids(position_ids)
+    if text_position_ids is None:
+        raise ValueError('position_ids must be a tensor when computing cu_seqlens.')
+    # Packed mode is expected to operate on batch-size 1 streams.
+    position_ids = text_position_ids[0]
     seq_start_indices = torch.where(position_ids == 0)[0]
+    if seq_start_indices.numel() == 0:
+        return torch.tensor([0, len(position_ids)], device=position_ids.device)
     seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(position_ids)], device=position_ids.device)])
     seq_lengths = seq_end_indices - seq_start_indices
     cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=position_ids.device), seq_lengths]), dim=0)
     return cu_seqlens
+
+
+def _sp_prev_next_rank(
+    sp_group: Optional[dist.ProcessGroup],
+) -> Tuple[int, int, Optional[int], Optional[int]]:
+    """Return (group_rank, group_world_size, prev_global_rank, next_global_rank)."""
+    if sp_group is None:
+        return 0, 1, None, None
+    sp_rank = dist.get_rank(sp_group)
+    sp_world_size = dist.get_world_size(sp_group)
+    prev_rank = dist.get_global_rank(sp_group, sp_rank - 1) if sp_rank > 0 else None
+    next_rank = dist.get_global_rank(sp_group, sp_rank + 1) if sp_rank + 1 < sp_world_size else None
+    return sp_rank, sp_world_size, prev_rank, next_rank
+
+
+class _QwenLinearStateParallelFn(torch.autograd.Function):
+    """State-parallel autograd for Qwen3.5 linear attention chunk rule.
+
+    Forward: recv previous recurrent state -> run local chunk rule -> send final recurrent state.
+    Backward: recv grad(final_state) -> recompute local chunk rule -> send grad(initial_state).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        sp_group: Optional[dist.ProcessGroup],
+        chunk_rule,
+        chunk_size: Optional[int],
+        use_qk_l2norm_in_kernel: bool,
+    ) -> torch.Tensor:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        g = g.contiguous()
+        beta = beta.contiguous()
+
+        ctx.sp_group = sp_group
+        ctx.chunk_rule = chunk_rule
+        ctx.chunk_size = int(chunk_size) if chunk_size is not None else None
+        ctx.use_qk_l2norm_in_kernel = bool(use_qk_l2norm_in_kernel)
+
+        sp_rank, sp_world_size, prev_rank, next_rank = _sp_prev_next_rank(sp_group)
+        ctx.sp_rank = sp_rank
+        ctx.sp_world_size = sp_world_size
+        ctx.prev_rank = prev_rank
+        ctx.next_rank = next_rank
+
+        state_shape = (query.shape[0], query.shape[2], query.shape[3], value.shape[3])
+        initial_state = torch.zeros(state_shape, dtype=torch.float32, device=query.device)
+        if sp_group is not None and sp_world_size > 1 and prev_rank is not None:
+            dist.recv(initial_state, src=prev_rank, group=sp_group)
+        initial_state = initial_state.contiguous()
+
+        chunk_kwargs = {
+            'g': g,
+            'beta': beta,
+            'initial_state': (initial_state if prev_rank is not None else None),
+            'output_final_state': True,
+            'use_qk_l2norm_in_kernel': ctx.use_qk_l2norm_in_kernel,
+        }
+        if ctx.chunk_size is not None:
+            chunk_kwargs['chunk_size'] = ctx.chunk_size
+        local_output, final_state = chunk_rule(query, key, value, **chunk_kwargs)
+        local_output = local_output.contiguous()
+        if sp_group is not None and sp_world_size > 1 and next_rank is not None:
+            dist.send(final_state.contiguous().to(torch.float32), dst=next_rank, group=sp_group)
+
+        # Always save a tensor initial_state so backward can re-run deterministically.
+        ctx.save_for_backward(query, key, value, g, beta, initial_state)
+        return local_output
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+    ):
+        query, key, value, g, beta, initial_state = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+
+        grad_final_state = torch.zeros_like(initial_state, dtype=torch.float32, device=grad_output.device)
+        if ctx.sp_group is not None and ctx.sp_world_size > 1 and ctx.next_rank is not None:
+            dist.recv(grad_final_state, src=ctx.next_rank, group=ctx.sp_group)
+        grad_final_state = grad_final_state.contiguous()
+
+        query_ = query.detach().requires_grad_(True)
+        key_ = key.detach().requires_grad_(True)
+        value_ = value.detach().requires_grad_(True)
+        g_ = g.detach().requires_grad_(True)
+        beta_ = beta.detach().requires_grad_(True)
+        initial_state_ = initial_state.detach().requires_grad_(True)
+
+        with torch.enable_grad():
+            chunk_kwargs = {
+                'g': g_,
+                'beta': beta_,
+                'initial_state': (initial_state_ if ctx.prev_rank is not None else None),
+                'output_final_state': True,
+                'use_qk_l2norm_in_kernel': ctx.use_qk_l2norm_in_kernel,
+            }
+            if ctx.chunk_size is not None:
+                chunk_kwargs['chunk_size'] = ctx.chunk_size
+            local_output, final_state = ctx.chunk_rule(query_, key_, value_, **chunk_kwargs)
+        local_output = local_output.contiguous()
+        final_state = final_state.contiguous()
+
+        grad_args = [query_, key_, value_, g_, beta_]
+        if ctx.prev_rank is not None:
+            grad_args.append(initial_state_)
+
+        grad_outputs = [grad_output, grad_final_state.to(final_state.dtype)]
+        grads = torch.autograd.grad(
+            outputs=(local_output, final_state),
+            inputs=tuple(grad_args),
+            grad_outputs=tuple(grad_outputs),
+            allow_unused=True,
+        )
+
+        grad_query, grad_key, grad_value, grad_g, grad_beta = grads[:5]
+        grad_initial_state = grads[5] if len(grads) > 5 else None
+
+        if ctx.sp_group is not None and ctx.sp_world_size > 1 and ctx.prev_rank is not None:
+            if grad_initial_state is None:
+                grad_initial_state = torch.zeros_like(initial_state, dtype=torch.float32, device=grad_output.device)
+            dist.send(grad_initial_state.contiguous().to(torch.float32), dst=ctx.prev_rank, group=ctx.sp_group)
+
+        return grad_query, grad_key, grad_value, grad_g, grad_beta, None, None, None, None
 
 
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
@@ -307,14 +486,13 @@ class DistributedAttention(torch.nn.Module):
         else:
             query_layer, key_layer, value_layer = query, key, value
 
-        position_ids = kwargs.pop('position_ids')
+        position_ids = kwargs.pop('position_ids', None)
         if position_ids is not None:
-            shape0 = position_ids.shape[0]
-            position_ids_output = torch.empty((shape0 * self.sequence_parallel.sp_world_size, position_ids.shape[1]),
-                                              dtype=position_ids.dtype,
-                                              device=position_ids.device)
-            dist.all_gather_into_tensor(position_ids_output, position_ids, group=self.sequence_parallel._sp_group)
-            position_ids = torch.cat(position_ids_output.split(shape0, dim=0), dim=1)
+            position_ids = _gather_position_ids_for_sp(
+                position_ids,
+                self.sequence_parallel.sp_world_size,
+                self.sequence_parallel._sp_group,
+            )
 
         context_layer = self.local_attn(
             query_layer, key_layer, value_layer, attention_mask, *args, position_ids=position_ids, **kwargs)
@@ -343,12 +521,18 @@ class SequenceParallel:
         self._sp_group = None
         self.num_heads = None
         self.causal_mask_func = None
+        self.has_qwen35_linear_attn = False
         self.extra_kwargs = {}
 
     @property
     def real_position_ids(self) -> torch.Tensor:
         """The real position ids, this is different from the position_ids in mrope"""
         return self.extra_kwargs.get('position_ids')
+
+    @property
+    def text_position_ids(self) -> Optional[torch.Tensor]:
+        """Text-aligned position ids with shape [B, S]."""
+        return self.extra_kwargs.get('text_position_ids')
 
     def _prepare_flash_attn(self, base_model: torch.nn.Module):
         try:
@@ -382,10 +566,14 @@ class SequenceParallel:
                                                                                                      cache_position,
                                                                                                      kv_length, *args,
                                                                                                      **kwargs)
-                # Rebuild cache positions from real (full) position ids.
+                # Rebuild cache positions from full-sequence text-aligned position ids.
                 device = cache_position.device
-                cache_position = self.real_position_ids[0]
-                cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
+                text_position_ids = _extract_text_position_ids(self.real_position_ids)
+                if text_position_ids is None:
+                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](
+                        batch_size, cache_position, kv_length, *args, **kwargs)
+                cache_position = text_position_ids[0]
+                cache_position = self.pad(cache_position, padding_value=-1, position_ids=text_position_ids, dim=0)
                 cache_position = torch.arange(0, cache_position.shape[0], device=device)
                 kv_length = cache_position.shape[0]
                 return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
@@ -463,9 +651,9 @@ class SequenceParallel:
                         if position_ids is None:
                             position_ids = self.real_position_ids
                         # Treat SP-alignment padding (-1) as separate 1-token sequences by mapping -1 -> 0.
-                        pos = position_ids
-                        if pos.dim() == 1:
-                            pos = pos.unsqueeze(0)
+                        pos = _extract_text_position_ids(position_ids)
+                        if pos is None:
+                            raise RuntimeError('SequenceParallel: packed mode requires position_ids.')
                         pos = pos.clone()
                         pos[pos < 0] = 0
 
@@ -483,8 +671,15 @@ class SequenceParallel:
                         position_ids = kwargs.get('position_ids')
                         if position_ids is None:
                             position_ids = self.real_position_ids
-                        position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
-                        cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
+                        text_position_ids = _extract_text_position_ids(position_ids)
+                        if text_position_ids is None:
+                            raise RuntimeError('SequenceParallel: cu_seqlens mode requires position_ids.')
+                        text_position_ids = self.pad(
+                            text_position_ids,
+                            padding_value=-1,
+                            position_ids=text_position_ids,
+                        )
+                        cu_seqlens = get_cu_seqlens_from_position_ids(text_position_ids).to(torch.int32)
                         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
                         assert query.shape[2] == cu_seqlens[-1]
                         kwargs['cu_seq_lens_q'] = cu_seqlens
@@ -532,6 +727,78 @@ class SequenceParallel:
             local_flash_attn, dist_attn=DistributedAttention(None, self))
         ALL_ATTENTION_FUNCTIONS['sdpa'] = partial(local_sdpa_attn, dist_attn=DistributedAttention(None, self))
 
+    def _wrap_qwen35_chunk_rule(self, module: torch.nn.Module, origin_rule):
+
+        def wrapped_chunk_rule(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            chunk_size: Optional[int] = None,
+            initial_state: Optional[torch.Tensor] = None,
+            output_final_state: bool = False,
+            use_qk_l2norm_in_kernel: bool = False,
+        ):
+            call_kwargs = {
+                'g': g,
+                'beta': beta,
+                'initial_state': initial_state,
+                'output_final_state': output_final_state,
+                'use_qk_l2norm_in_kernel': use_qk_l2norm_in_kernel,
+            }
+            if chunk_size is not None:
+                call_kwargs['chunk_size'] = chunk_size
+
+            if self.sp_world_size is None or self.sp_world_size <= 1 or self._sp_group is None:
+                return origin_rule(query, key, value, **call_kwargs)
+            # Respect cache/incremental path semantics.
+            if initial_state is not None or output_final_state:
+                return origin_rule(query, key, value, **call_kwargs)
+
+            if self.extra_kwargs.get('is_packed', False):
+                raise RuntimeError(
+                    'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
+                    'Packed reset semantics for recurrent states are not implemented.')
+
+            output = _QwenLinearStateParallelFn.apply(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                self._sp_group,
+                origin_rule,
+                (int(chunk_size) if chunk_size is not None else None),
+                bool(use_qk_l2norm_in_kernel),
+            )
+            return output, None
+
+        wrapped_chunk_rule._twinkle_origin_rule = origin_rule
+        wrapped_chunk_rule._twinkle_wrapped_module = module.__class__.__name__
+        return wrapped_chunk_rule
+
+    def _prepare_qwen35_linear_attn(self, base_model: torch.nn.Module):
+        if hasattr(base_model, 'language_model'):
+            text_model = base_model.language_model
+        else:
+            text_model = base_model
+
+        has_linear_attn = False
+        for module in text_model.modules():
+            if module.__class__.__name__ != 'Qwen3_5GatedDeltaNet':
+                continue
+            origin_rule = getattr(module, 'chunk_gated_delta_rule', None)
+            if origin_rule is None:
+                continue
+            has_linear_attn = True
+            if getattr(module, '_twinkle_sp_linear_chunk_patched', False):
+                continue
+            module.chunk_gated_delta_rule = self._wrap_qwen35_chunk_rule(module, origin_rule)
+            module._twinkle_sp_linear_chunk_patched = True
+        self.has_qwen35_linear_attn = has_linear_attn
+        self.extra_kwargs['has_qwen35_linear_attn'] = has_linear_attn
+
     def _prepare_forward_hook(self, base_model: torch.nn.Module):
 
         def pre_forward_split_hook(_self, args, kwargs):
@@ -542,11 +809,18 @@ class SequenceParallel:
             inputs_embeds = kwargs.get('inputs_embeds', None)
             position_ids = kwargs['position_ids']
             attention_mask = kwargs.get('attention_mask', None)
+            extra_names = []
+            extra_split_values = []
+            for name in ('mm_token_type_ids', 'token_type_ids'):
+                value = kwargs.get(name, None)
+                if value is not None:
+                    extra_names.append(name)
+                    extra_split_values.append((value, 0, -1))
             if hasattr(_self, 'language_model'):
                 embed_tokens = getattr(_self.language_model, 'embed_tokens', None)
             else:
                 embed_tokens = getattr(_self, 'embed_tokens', None)
-            input_ids, inputs_embeds, _, position_ids, attention_mask, _, _ = self.pad_and_split_inputs(
+            input_ids, inputs_embeds, _, position_ids, attention_mask, _, extra_values = self.pad_and_split_inputs(
                 input_ids,
                 inputs_embeds,
                 None,
@@ -554,11 +828,15 @@ class SequenceParallel:
                 attention_mask,
                 None,
                 embed_tokens=embed_tokens,
-                real_position_ids=self.real_position_ids)
+                real_position_ids=self.real_position_ids,
+                extra_split_values=extra_split_values if extra_split_values else None,
+            )
             kwargs['input_ids'] = input_ids
             kwargs['inputs_embeds'] = inputs_embeds
             kwargs['position_ids'] = position_ids
             kwargs['attention_mask'] = attention_mask
+            for i, name in enumerate(extra_names):
+                kwargs[name] = extra_values[i]
             return args, kwargs
 
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
@@ -588,8 +866,9 @@ class SequenceParallel:
                 _bs_logits, _ = GatherLoss.apply(_bs_logits, None, 1, self.real_position_ids)
                 _gathered_logits.append(_bs_logits)
             router_logits = torch.stack(_gathered_logits, dim=0)
-            if self.real_position_ids is not None:
-                router_logits = router_logits[:, :, :self.real_position_ids.shape[1], :]
+            text_position_ids = _extract_text_position_ids(self.real_position_ids)
+            if text_position_ids is not None:
+                router_logits = router_logits[:, :, :text_position_ids.shape[1], :]
             output['router_logits'] = tuple(
                 [logit.reshape(-1, logit.shape[-1]) for logit in router_logits.split(1, dim=1)])
             return output
@@ -636,6 +915,8 @@ class SequenceParallel:
             self._prepare_flash_attn(llm_model)
             SequenceParallel._global_inited = True
 
+        # Model-specific patch: Qwen3.5 linear attention state passing for SP.
+        self._prepare_qwen35_linear_attn(llm_model)
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
@@ -696,6 +977,33 @@ class SequenceParallel:
         output = tensor_list[rank].contiguous()
         return output
 
+    def _split_attention_mask(self, attention_mask: Optional[torch.Tensor], seq_len: Optional[int],
+                              real_position_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Split attention_mask to align with sequence-parallel local chunks."""
+        if attention_mask is None or self.world_size == 1:
+            return attention_mask
+
+        if attention_mask.dim() == 2:
+            return self.split(attention_mask, dim=1, position_ids=real_position_ids)
+
+        if seq_len is None:
+            return attention_mask
+
+        # Prefer splitting sequence-related trailing dims.
+        split_dims = []
+        if attention_mask.shape[-1] == seq_len:
+            split_dims.append(-1)
+        if attention_mask.dim() >= 3 and attention_mask.shape[-2] == seq_len:
+            split_dims.append(-2)
+        # Fallback for uncommon layouts where sequence is on dim=1.
+        if not split_dims and attention_mask.dim() > 1 and attention_mask.shape[1] == seq_len:
+            split_dims.append(1)
+
+        output = attention_mask
+        for dim in split_dims:
+            output = self.split(output, dim=dim, position_ids=real_position_ids)
+        return output
+
     def pad_and_split_inputs(self,
                              input_ids,
                              input_embeds,
@@ -723,14 +1031,18 @@ class SequenceParallel:
         """
         tokenizer = self.tokenizer
         real_position_ids = real_position_ids if real_position_ids is not None else position_ids
+        text_position_ids = _extract_text_position_ids(real_position_ids)
         # Track packed batches to drive attention backend behavior (packed => require flash_attention_2 varlen).
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
+        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(text_position_ids)
+        self.extra_kwargs['has_qwen35_linear_attn'] = self.has_qwen35_linear_attn
+        if self.world_size is not None and self.world_size > 1 and self.has_qwen35_linear_attn and self.extra_kwargs[
+                'is_packed']:
+            raise RuntimeError(
+                'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
+                'Packed reset semantics for recurrent states are not implemented.')
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
-        if real_position_ids is not None and batch_size is not None and real_position_ids.shape[0] == batch_size:
-            # TODO clone everytime, but the position_ids is a small tensor
-            self.extra_kwargs['position_ids'] = real_position_ids.clone()
         if input_ids is not None:
             input_ids = self.pad(input_ids, padding_value=tokenizer.pad_token_id, position_ids=real_position_ids)
             self.extra_kwargs['input_ids'] = input_ids.clone()
@@ -748,6 +1060,11 @@ class SequenceParallel:
             loss_scale = self.pad(loss_scale, padding_value=0., position_ids=real_position_ids)
         if real_position_ids is not None:
             real_position_ids = self.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
+        text_position_ids = _extract_text_position_ids(real_position_ids)
+        if real_position_ids is not None:
+            self.extra_kwargs['position_ids'] = real_position_ids.clone()
+        if text_position_ids is not None and batch_size is not None and text_position_ids.shape[0] == batch_size:
+            self.extra_kwargs['text_position_ids'] = text_position_ids.clone()
         # Build a 2D attention_mask whenever we padded for SP alignment so FlashAttention2 can unpad correctly.
         # For packed batches (batch_size==1 with multiple position_id resets), relying on position_ids alone is
         # unsafe if we also appended SP-alignment padding (position_ids=-1), because HF's FA2 varlen path will
@@ -759,13 +1076,17 @@ class SequenceParallel:
             if attention_mask is None:
                 # Mask out padded positions introduced by sequence-parallel padding.
                 # `real_position_ids` is padded with `-1` (see above), so use it to build a valid-token mask.
-                attention_mask = (real_position_ids != -1).to(dtype=torch.int64)
+                if text_position_ids is not None:
+                    attention_mask = (text_position_ids != -1).to(dtype=torch.int64)
+                else:
+                    attention_mask = torch.ones((batch_size, attn_shape), dtype=torch.int64, device=inputs.device)
             # no need position_ids here, because padding_free does not need attention_mask,
             # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
             cache_position = torch.arange(0, attn_shape, device=inputs.device)
             # pad attention mask to 4d to avoid calculation errors
-            if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
+            if (hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
+                    and not self.has_qwen35_linear_attn):
                 attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
                                                        None, None)
         if extra_split_values is not None:
@@ -776,8 +1097,10 @@ class SequenceParallel:
             input_ids = self.split(input_ids, dim=1, position_ids=real_position_ids)
         if input_embeds is not None:
             input_embeds = self.split(input_embeds, dim=1, position_ids=real_position_ids)
+        seq_len = input_ids.shape[1] if input_ids is not None else input_embeds.shape[1] if input_embeds is not None else None
+        attention_mask = self._split_attention_mask(attention_mask, seq_len=seq_len, real_position_ids=real_position_ids)
         if labels is not None:
-            if self.extra_kwargs.get('is_packed', False) and real_position_ids is not None:
+            if self.extra_kwargs.get('is_packed', False) and text_position_ids is not None:
                 # PackingDataset + padding_free collate concatenates multiple sequences into a single token stream.
                 # `position_ids` resets to 0 at each boundary, but our labels are already next-token aligned by
                 # Template._roll_labels(). Therefore the cross-subsequence supervision term lives at the *previous*
@@ -786,7 +1109,7 @@ class SequenceParallel:
                 # Example (boundary at index b where position_ids[b] == 0):
                 # - Bad term is: token[b-1] predicting token[b]
                 # - In next-token-aligned labels, this appears at labels[b-1]
-                boundary_starts = (real_position_ids == 0)
+                boundary_starts = (text_position_ids == 0)
                 prev = torch.zeros_like(boundary_starts, dtype=torch.bool)
                 # Mask token b-1 when boundary starts at b.
                 prev[..., :-1] = boundary_starts[..., 1:]
@@ -800,7 +1123,7 @@ class SequenceParallel:
             loss_scale = self.split(loss_scale, dim=-1, position_ids=real_position_ids)
 
         if position_ids is not None:
-            position_ids = self.split(position_ids, dim=-1, position_ids=real_position_ids)
+            position_ids = _split_position_ids_for_sp(position_ids, self.sp_world_size, self._sp_group)
         if extra_split_values is not None:
             for i in range(len(extra_values)):
                 extra_values[i] = self.split(
@@ -825,15 +1148,16 @@ class SequenceParallel:
 
         PackingDataset packs multiple sequences into one row by resetting position_ids to 0/1/... at each boundary.
         """
-        if position_ids is None or not torch.is_tensor(position_ids):
+        text_position_ids = _extract_text_position_ids(position_ids)
+        if text_position_ids is None:
             return False
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
-        if position_ids.dim() != 2:
+        if text_position_ids.dim() == 1:
+            text_position_ids = text_position_ids.unsqueeze(0)
+        if text_position_ids.dim() != 2:
             return False
         # A batch may contain multiple packed samples; consider it "packed" if any row is packed.
-        for i in range(position_ids.size(0)):
-            row = position_ids[i]
+        for i in range(text_position_ids.size(0)):
+            row = text_position_ids[i]
             zero_count = int((row == 0).sum().item())
             one_count = int((row == 1).sum().item())
             if zero_count > 1 and one_count > 1:
@@ -849,9 +1173,18 @@ class SequenceParallel:
         position_ids = None
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
-        if position_ids is not None and input_ids is not None and position_ids.shape[0] == input_ids.shape[0]:
+        text_position_ids = _extract_text_position_ids(position_ids)
+        if position_ids is not None:
             self.extra_kwargs['position_ids'] = position_ids.clone()
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(position_ids)
+        if text_position_ids is not None:
+            self.extra_kwargs['text_position_ids'] = text_position_ids.clone()
+        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(text_position_ids)
+        self.extra_kwargs['has_qwen35_linear_attn'] = self.has_qwen35_linear_attn
+        if self.world_size is not None and self.world_size > 1 and self.has_qwen35_linear_attn and self.extra_kwargs[
+                'is_packed']:
+            raise RuntimeError(
+                'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
+                'Packed reset semantics for recurrent states are not implemented.')
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
@@ -963,9 +1296,9 @@ class SequenceParallelStrategy:
         gathered = sequence_parallel.gather(logits, dim=1, position_ids=sequence_parallel.real_position_ids)
         # Scheme A: SP pads to make seq_len divisible by sp_size. Trim back to the original
         # (unpadded) length using the cached real_position_ids.
-        real_pos = sequence_parallel.real_position_ids
-        if real_pos is not None and torch.is_tensor(real_pos) and real_pos.dim() >= 2:
-            gathered = gathered[:, :real_pos.shape[1]].contiguous()
+        text_pos = sequence_parallel.text_position_ids
+        if text_pos is not None and torch.is_tensor(text_pos) and text_pos.dim() >= 2:
+            gathered = gathered[:, :text_pos.shape[1]].contiguous()
         outputs['logits'] = gathered
         return outputs
 

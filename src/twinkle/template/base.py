@@ -38,7 +38,11 @@ class Template:
         model_id = HubOperation.download_model(model_id, ignore_model=True)
         if os.path.exists(os.path.join(model_id, 'preprocessor_config.json')):
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_id, **kwargs)
+            try:
+                self.processor = AutoProcessor.from_pretrained(model_id, **kwargs)
+            except Exception:
+                from transformers import AutoTokenizer
+                self.processor = AutoTokenizer.from_pretrained(model_id, **kwargs)
         else:
             from transformers import AutoTokenizer
             self.processor = AutoTokenizer.from_pretrained(model_id, **kwargs)
