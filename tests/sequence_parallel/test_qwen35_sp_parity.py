@@ -24,6 +24,13 @@ def _first_grad_norm(parameters) -> torch.Tensor:
     return torch.tensor(0.0)
 
 
+def _format_tensor_slice(tensor: torch.Tensor, seq_tokens: int = 2, vocab_tokens: int = 8) -> str:
+    if tensor.dim() < 3:
+        return str(tuple(tensor.shape))
+    slice_ = tensor[0, :min(seq_tokens, tensor.shape[1]), :min(vocab_tokens, tensor.shape[2])].detach().cpu()
+    return str(slice_.tolist())
+
+
 class TestQwen35SPParity(unittest.TestCase):
     """Opt-in parity test for Qwen3.5: SP=0 vs SP>1.
 
@@ -183,10 +190,34 @@ class TestQwen35SPParity(unittest.TestCase):
         # Logits parity: compare global logits element-wise.
         max_abs_diff = (logits_base - logits_sp_full).abs().max().detach().to(device)
         dist.all_reduce(max_abs_diff, op=dist.ReduceOp.MAX)
+        mean_abs_diff = (logits_base - logits_sp_full).abs().mean().detach().to(device)
+        dist.all_reduce(mean_abs_diff, op=dist.ReduceOp.SUM)
+        mean_abs_diff.div_(world_size)
 
-        self.assertLessEqual(abs((loss_base_metric - loss_sp_metric).item()), loss_atol)
-        self.assertLessEqual(abs((grad_base - grad_sp).item()), grad_atol)
-        self.assertLessEqual(max_abs_diff.item(), logits_atol)
+        local_logits_base = logits_base[:, seq_start:seq_end, :].contiguous()
+        local_logits_sp = logits_sp_full[:, seq_start:seq_end, :].contiguous()
+        local_max_abs_diff = (local_logits_base - local_logits_sp).abs().max().detach().to(device)
+        dist.all_reduce(local_max_abs_diff, op=dist.ReduceOp.MAX)
+
+        diagnostics = (
+            f'world_size={world_size}, rank={rank}, '
+            f'loss_base={loss_base_metric.item():.6f}, loss_sp={loss_sp_metric.item():.6f}, '
+            f'loss_diff={abs((loss_base_metric - loss_sp_metric).item()):.6f}, '
+            f'grad_base={grad_base.item():.6f}, grad_sp={grad_sp.item():.6f}, '
+            f'grad_diff={abs((grad_base - grad_sp).item()):.6f}, '
+            f'max_abs_diff={max_abs_diff.item():.6f}, mean_abs_diff={mean_abs_diff.item():.6f}, '
+            f'local_max_abs_diff={local_max_abs_diff.item():.6f}, '
+            f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}'
+        )
+
+        if os.environ.get('QWEN35_SP_PARITY_DEBUG', '0') == '1' and rank == 0:
+            print('SP parity diagnostics:', diagnostics, flush=True)
+            print('Baseline logits slice:', _format_tensor_slice(logits_base), flush=True)
+            print('SP logits slice:', _format_tensor_slice(logits_sp_full), flush=True)
+
+        self.assertLessEqual(max_abs_diff.item(), logits_atol, msg=diagnostics)
+        self.assertLessEqual(abs((loss_base_metric - loss_sp_metric).item()), loss_atol, msg=diagnostics)
+        self.assertLessEqual(abs((grad_base - grad_sp).item()), grad_atol, msg=diagnostics)
 
 
 if __name__ == '__main__':
