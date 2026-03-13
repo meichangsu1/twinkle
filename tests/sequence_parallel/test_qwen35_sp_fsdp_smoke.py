@@ -15,6 +15,21 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
     torchrun --nproc_per_node=2 -m pytest -q tests/sequence_parallel/test_qwen35_sp_fsdp_smoke.py -rs
     """
 
+    @classmethod
+    def setUpClass(cls):
+        if not dist.is_available() or dist.is_initialized():
+            return
+        world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        if world_size <= 1:
+            return
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend, init_method='env://')
+
+    @classmethod
+    def tearDownClass(cls):
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
     def test_qwen35_sp_fsdp_smoke(self):
         if os.environ.get('QWEN35_SP_SMOKE', '0') != '1':
             self.skipTest('Set QWEN35_SP_SMOKE=1 to enable this test.')
