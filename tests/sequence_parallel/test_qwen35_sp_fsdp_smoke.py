@@ -57,6 +57,7 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
         device = torch.device('cuda', local_rank)
 
         local_files_only = os.environ.get('QWEN35_LOCAL_ONLY', '1') == '1'
+        attn_impl = os.environ.get('QWEN35_SP_SMOKE_ATTN_IMPL', 'sdpa')
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=True,
@@ -67,6 +68,7 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             local_files_only=local_files_only,
+            attn_implementation=attn_impl,
         ).to(device)
         model.train()
 
@@ -88,7 +90,15 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
         optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=1e-6)
 
         batch_size = int(os.environ.get('QWEN35_SP_SMOKE_BATCH', '1'))
-        seq_len = int(os.environ.get('QWEN35_SP_SMOKE_SEQ_LEN', '16'))
+        qwen35_linear_chunk = int(os.environ.get('QWEN35_SP_LINEAR_CHUNK', '64'))
+        seq_len = int(os.environ.get('QWEN35_SP_SMOKE_SEQ_LEN', str(qwen35_linear_chunk * world_size)))
+        local_seq = seq_len // world_size
+        if seq_len % world_size != 0:
+            self.skipTest(f'seq_len ({seq_len}) must be divisible by world_size ({world_size}).')
+        if local_seq % qwen35_linear_chunk != 0:
+            self.skipTest(
+                f'local_seq ({local_seq}) must be a multiple of Qwen3.5 linear-attention chunk '
+                f'size ({qwen35_linear_chunk}) for this smoke test.')
         vocab_size = min(int(getattr(fsdp_model.module.config, 'vocab_size', 32000)), 32000)
 
         input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)

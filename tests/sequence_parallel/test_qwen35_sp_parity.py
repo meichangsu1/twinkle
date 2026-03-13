@@ -91,10 +91,16 @@ class TestQwen35SPParity(unittest.TestCase):
         device = torch.device('cuda', local_rank)
         torch.manual_seed(int(os.environ.get('QWEN35_SP_PARITY_SEED', '20260313')))
 
+        qwen35_linear_chunk = int(os.environ.get('QWEN35_SP_LINEAR_CHUNK', '64'))
         batch_size = int(os.environ.get('QWEN35_SP_PARITY_BATCH', '1'))
-        seq_len = int(os.environ.get('QWEN35_SP_PARITY_SEQ_LEN', '32'))
+        seq_len = int(os.environ.get('QWEN35_SP_PARITY_SEQ_LEN', str(qwen35_linear_chunk * world_size)))
         if seq_len % world_size != 0:
             self.skipTest(f'seq_len ({seq_len}) must be divisible by world_size ({world_size}).')
+        local_seq = seq_len // world_size
+        if local_seq % qwen35_linear_chunk != 0:
+            self.skipTest(
+                f'local_seq ({local_seq}) must be a multiple of Qwen3.5 linear-attention chunk '
+                f'size ({qwen35_linear_chunk}) for exact parity.')
 
         local_files_only = os.environ.get('QWEN35_LOCAL_ONLY', '1') == '1'
         logits_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_ATOL', '5e-2'))
@@ -131,7 +137,6 @@ class TestQwen35SPParity(unittest.TestCase):
             attention_mask = torch.ones_like(input_ids, device=device)
             position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1).contiguous()
 
-        local_seq = seq_len // world_size
         seq_start = rank * local_seq
         seq_end = seq_start + local_seq
         labels_local = labels[:, seq_start:seq_end].contiguous()
