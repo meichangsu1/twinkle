@@ -56,6 +56,90 @@ def _gather_position_ids_for_sp(
     return torch.cat(gathered.split(local_shape[0], dim=0), dim=-1).contiguous()
 
 
+def _gather_tensor_along_dim_for_sp(
+    tensor: Optional[torch.Tensor],
+    gather_dim: int,
+    sp_world_size: Optional[int],
+    sp_group: Optional[dist.ProcessGroup],
+) -> Optional[torch.Tensor]:
+    if tensor is None or not torch.is_tensor(tensor) or sp_world_size is None or sp_world_size <= 1:
+        return tensor
+    gather_dim = gather_dim if gather_dim >= 0 else tensor.dim() + gather_dim
+    if gather_dim < 0 or gather_dim >= tensor.dim():
+        raise ValueError(f'Invalid gather_dim={gather_dim} for tensor dim={tensor.dim()}')
+    tensor = tensor.contiguous()
+    tensor = tensor.movedim(gather_dim, 0).contiguous()
+    local_size = tensor.shape[0]
+    gather_shape = (local_size * sp_world_size, *tensor.shape[1:])
+    gathered = torch.empty(gather_shape, dtype=tensor.dtype, device=tensor.device)
+    dist.all_gather_into_tensor(gathered, tensor, group=sp_group)
+    gathered = torch.cat(gathered.split(local_size, dim=0), dim=0).contiguous()
+    return gathered.movedim(0, gather_dim).contiguous()
+
+
+def _get_attention_mask_sequence_dims(
+    attention_mask: Optional[torch.Tensor],
+    seq_len: int,
+) -> Tuple[int, ...]:
+    if attention_mask is None or not torch.is_tensor(attention_mask):
+        return tuple()
+    if attention_mask.dim() == 0:
+        return tuple()
+    if attention_mask.dim() == 1:
+        return (0,) if attention_mask.shape[0] == seq_len else tuple()
+    if attention_mask.dim() == 2:
+        if attention_mask.shape[1] == seq_len:
+            return (1,)
+        if attention_mask.shape[0] == seq_len:
+            return (0,)
+        return tuple()
+
+    dims = []
+    if attention_mask.shape[-1] == seq_len:
+        dims.append(attention_mask.dim() - 1)
+    if attention_mask.dim() >= 3 and attention_mask.shape[-2] == seq_len:
+        dims.append(attention_mask.dim() - 2)
+    if not dims and attention_mask.shape[1] == seq_len:
+        dims.append(1)
+    # Keep order stable and remove duplicates.
+    dedup = []
+    for dim in dims:
+        if dim not in dedup:
+            dedup.append(dim)
+    return tuple(dedup)
+
+
+def _gather_attention_mask_for_sp(
+    attention_mask: Optional[torch.Tensor],
+    local_seq_len: int,
+    sp_world_size: Optional[int],
+    sp_group: Optional[dist.ProcessGroup],
+) -> Optional[torch.Tensor]:
+    if attention_mask is None or not torch.is_tensor(attention_mask):
+        return attention_mask
+    if sp_world_size is None or sp_world_size <= 1:
+        return attention_mask
+
+    gathered = attention_mask.contiguous()
+    seq_dims = _get_attention_mask_sequence_dims(gathered, local_seq_len)
+    for dim in seq_dims:
+        gathered = _gather_tensor_along_dim_for_sp(gathered, dim, sp_world_size, sp_group)
+    return gathered.contiguous()
+
+
+def _assert_attention_mask_matches_sequence(
+    attention_mask: Optional[torch.Tensor],
+    expected_seq_len: int,
+) -> None:
+    if attention_mask is None or not torch.is_tensor(attention_mask):
+        return
+    seq_dims = _get_attention_mask_sequence_dims(attention_mask, expected_seq_len)
+    if not seq_dims:
+        raise ValueError(
+            'SequenceParallel: gathered attention_mask shape is incompatible with attention sequence length. '
+            f'attention_mask.shape={tuple(attention_mask.shape)}, expected_seq_len={expected_seq_len}.')
+
+
 def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     text_position_ids = _extract_text_position_ids(position_ids)
     if text_position_ids is None:
@@ -485,6 +569,14 @@ class DistributedAttention(torch.nn.Module):
             value_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, value, self.scatter_idx, self.gather_idx)
         else:
             query_layer, key_layer, value_layer = query, key, value
+
+        attention_mask = _gather_attention_mask_for_sp(
+            attention_mask,
+            local_seq_len=key.shape[1],
+            sp_world_size=self.sequence_parallel.sp_world_size,
+            sp_group=self.sequence_parallel._sp_group,
+        )
+        _assert_attention_mask_matches_sequence(attention_mask, expected_seq_len=key_layer.shape[1])
 
         position_ids = kwargs.pop('position_ids', None)
         if position_ids is not None:
@@ -1084,8 +1176,9 @@ class SequenceParallel:
             # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
             cache_position = torch.arange(0, attn_shape, device=inputs.device)
-            # pad attention mask to 4d to avoid calculation errors
-            if (hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
+            # For SP>1 keep 2D masks and let full-attention gather to global mask later.
+            # Prebuilding 4D causal masks before split can break full-sequence semantics.
+            if (self.world_size == 1 and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
                     and not self.has_qwen35_linear_attn):
                 attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
                                                        None, None)

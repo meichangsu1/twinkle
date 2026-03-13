@@ -1,0 +1,178 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import os
+import unittest
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+def _compute_next_token_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+
+def _first_grad_norm(parameters) -> torch.Tensor:
+    for param in parameters:
+        if param.grad is not None:
+            return param.grad.detach().float().norm()
+    return torch.tensor(0.0)
+
+
+class TestQwen35SPParity(unittest.TestCase):
+    """Opt-in parity test for Qwen3.5: SP=0 vs SP>1.
+
+    Run manually with torchrun, e.g.:
+    QWEN35_SP_PARITY=1 \
+    QWEN35_MODEL_ID=/path/to/model \
+    torchrun --nproc_per_node=2 -m pytest -q tests/sequence_parallel/test_qwen35_sp_parity.py -rs
+    """
+
+    def test_qwen35_sp_parity(self):
+        if os.environ.get('QWEN35_SP_PARITY', '0') != '1':
+            self.skipTest('Set QWEN35_SP_PARITY=1 to enable this test.')
+        if not dist.is_available() or not dist.is_initialized():
+            self.skipTest('Run this test with torchrun (distributed initialized).')
+        if not torch.cuda.is_available():
+            self.skipTest('CUDA is required for this test.')
+        if torch.cuda.device_count() < dist.get_world_size():
+            self.skipTest('Need at least world_size CUDA devices.')
+
+        model_id = os.environ.get('QWEN35_MODEL_ID')
+        if not model_id:
+            self.skipTest('Set QWEN35_MODEL_ID to a local Qwen3.5 model path.')
+
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+        torch.manual_seed(int(os.environ.get('QWEN35_SP_PARITY_SEED', '20260313')))
+
+        batch_size = int(os.environ.get('QWEN35_SP_PARITY_BATCH', '1'))
+        seq_len = int(os.environ.get('QWEN35_SP_PARITY_SEQ_LEN', '32'))
+        if seq_len % world_size != 0:
+            self.skipTest(f'seq_len ({seq_len}) must be divisible by world_size ({world_size}).')
+
+        local_files_only = os.environ.get('QWEN35_LOCAL_ONLY', '1') == '1'
+        logits_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_ATOL', '5e-2'))
+        loss_atol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_ATOL', '5e-2'))
+        grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', '2e-1'))
+
+        try:
+            import numpy as np
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            from twinkle.model.transformers.strategy.sequence_parallel import sequence_parallel
+            from twinkle.utils import DeviceMesh
+        except Exception as exc:
+            self.skipTest(f'Required dependencies are unavailable: {exc}')
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+
+        with torch.no_grad():
+            vocab_size = min(max(int(getattr(tokenizer, 'vocab_size', 32000) or 32000), 1000), 32000)
+            input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+            labels = input_ids.clone()
+            attention_mask = torch.ones_like(input_ids, device=device)
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1).contiguous()
+
+        local_seq = seq_len // world_size
+        seq_start = rank * local_seq
+        seq_end = seq_start + local_seq
+        labels_local = labels[:, seq_start:seq_end].contiguous()
+
+        # Baseline: no SP
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        ).to(device)
+        base_model.eval()
+        base_fsdp = FSDP(base_model, use_orig_params=True, device_id=device)
+        base_outputs = base_fsdp(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            return_dict=True,
+        )
+        logits_base = base_outputs.logits.float()
+        logits_base_local = logits_base[:, seq_start:seq_end, :].contiguous()
+        loss_base_local = _compute_next_token_ce(logits_base_local, labels_local)
+        loss_base_local.backward()
+        grad_base = _first_grad_norm(base_fsdp.parameters()).to(device)
+        loss_base_metric = _compute_next_token_ce(logits_base, labels).detach().to(device)
+
+        # Free baseline graph before SP run to avoid OOM.
+        del base_outputs
+        del base_fsdp
+        del base_model
+        torch.cuda.empty_cache()
+        dist.barrier()
+
+        # SP run: prepare sequence parallel and compare local objective + global logits.
+        sp_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        ).to(device)
+        sp_model.eval()
+        device_mesh = DeviceMesh(
+            device_type='cuda',
+            mesh=np.arange(world_size),
+            mesh_dim_names=('fsdp',),
+            ulysses_size=world_size,
+        )
+        sequence_parallel.prepare(
+            sp_size=world_size,
+            model=sp_model,
+            tokenizer=tokenizer,
+            device_mesh=device_mesh,
+        )
+        sp_fsdp = FSDP(sp_model, use_orig_params=True, device_id=device)
+
+        sp_outputs = sp_fsdp(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            return_dict=True,
+        )
+        logits_sp_local = sp_outputs.logits[:, :local_seq, :].contiguous().float()
+        loss_sp_local = _compute_next_token_ce(logits_sp_local, labels_local)
+        loss_sp_local.backward()
+        grad_sp = _first_grad_norm(sp_fsdp.parameters()).to(device)
+
+        logits_sp_full = sequence_parallel.gather(logits_sp_local, dim=1, position_ids=position_ids)
+        logits_sp_full = logits_sp_full[:, :seq_len, :].contiguous()
+        loss_sp_metric = _compute_next_token_ce(logits_sp_full, labels).detach().to(device)
+
+        # Compare scalar metrics globally (averaged across ranks).
+        for tensor in (loss_base_metric, loss_sp_metric, grad_base, grad_sp):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            tensor.div_(world_size)
+
+        # Logits parity: compare global logits element-wise.
+        max_abs_diff = (logits_base - logits_sp_full).abs().max().detach().to(device)
+        dist.all_reduce(max_abs_diff, op=dist.ReduceOp.MAX)
+
+        self.assertLessEqual(abs((loss_base_metric - loss_sp_metric).item()), loss_atol)
+        self.assertLessEqual(abs((grad_base - grad_sp).item()), grad_atol)
+        self.assertLessEqual(max_abs_diff.item(), logits_atol)
+
+
+if __name__ == '__main__':
+    unittest.main()
