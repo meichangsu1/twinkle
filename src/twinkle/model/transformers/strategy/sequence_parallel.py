@@ -815,12 +815,27 @@ class SequenceParallel:
 
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+        def _normalize_flash_attention_mask(
+            attention_mask: Optional[torch.Tensor],
+            kwargs: Dict[str, Any],
+        ) -> Optional[torch.Tensor]:
+            if attention_mask is None or not torch.is_tensor(attention_mask):
+                return attention_mask
+            if self.extra_kwargs.get('is_packed', False):
+                return attention_mask
+            if any(kwargs.get(name) is not None for name in ('cu_seq_lens_q', 'cu_seq_lens_k', 'cu_seqlens_q', 'cu_seqlens_k')):
+                return attention_mask
+            if attention_mask.dim() == 2 and bool(attention_mask.detach().all().item()):
+                return None
+            return attention_mask
+
         def local_flash_attn(module: torch.nn.Module, query_states, key_states, value_states, attention_mask, *args,
                              dist_attn, **kwargs):
             if self.world_size == 1 or module.__class__ not in [m.__class__ for m in text_model.modules()]:
                 return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query_states, key_states,
                                                                            value_states, attention_mask, *args,
                                                                            **kwargs)
+            attention_mask = _normalize_flash_attention_mask(attention_mask, kwargs)
             if dist_attn.local_attn is None:
 
                 def _attention(query, key, value, *args, **kwargs):
