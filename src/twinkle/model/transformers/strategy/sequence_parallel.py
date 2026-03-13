@@ -681,6 +681,17 @@ class SequenceParallel:
                 if self.world_size == 1:
                     return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
                                                                    *args, **kwargs)
+                if (attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() == 2
+                        and getattr(config, '_attn_implementation', None) == 'sdpa'):
+                    # SDPA materializes a 4D causal mask before attention. If we feed it the per-rank 2D padding mask,
+                    # each rank builds the same local causal block, and later gathering only the KV axis produces an
+                    # incorrect global mask. Gather the 2D padding mask first so HF builds the full causal mask once.
+                    attention_mask = _gather_attention_mask_for_sp(
+                        attention_mask,
+                        local_seq_len=attention_mask.shape[-1],
+                        sp_world_size=self.sp_world_size,
+                        sp_group=self._sp_group,
+                    )
                 input_embeds = torch.ones(
                     (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
                     dtype=input_embeds.dtype,
