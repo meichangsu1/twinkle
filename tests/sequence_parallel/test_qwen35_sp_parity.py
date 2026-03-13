@@ -31,6 +31,21 @@ def _format_tensor_slice(tensor: torch.Tensor, seq_tokens: int = 2, vocab_tokens
     return str(slice_.tolist())
 
 
+def _resolve_torch_dtype(name: str) -> torch.dtype:
+    mapping = {
+        'bfloat16': torch.bfloat16,
+        'bf16': torch.bfloat16,
+        'float16': torch.float16,
+        'fp16': torch.float16,
+        'float32': torch.float32,
+        'fp32': torch.float32,
+    }
+    key = str(name).strip().lower()
+    if key not in mapping:
+        raise ValueError(f'Unsupported dtype override: {name}')
+    return mapping[key]
+
+
 class TestQwen35SPParity(unittest.TestCase):
     """Opt-in parity test for Qwen3.5: SP=0 vs SP>1.
 
@@ -85,6 +100,8 @@ class TestQwen35SPParity(unittest.TestCase):
         logits_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_ATOL', '5e-2'))
         loss_atol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_ATOL', '5e-2'))
         grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', '2e-1'))
+        attn_impl = os.environ.get('QWEN35_SP_PARITY_ATTN_IMPL')
+        model_dtype = _resolve_torch_dtype(os.environ.get('QWEN35_SP_PARITY_DTYPE', 'bfloat16'))
 
         try:
             import numpy as np
@@ -117,9 +134,10 @@ class TestQwen35SPParity(unittest.TestCase):
         # Baseline: no SP
         base_model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             trust_remote_code=True,
             local_files_only=local_files_only,
+            attn_implementation=attn_impl,
         ).to(device)
         base_model.eval()
         base_fsdp = FSDP(base_model, use_orig_params=True, device_id=device)
@@ -147,9 +165,10 @@ class TestQwen35SPParity(unittest.TestCase):
         # SP run: prepare sequence parallel and compare local objective + global logits.
         sp_model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             trust_remote_code=True,
             local_files_only=local_files_only,
+            attn_implementation=attn_impl,
         ).to(device)
         sp_model.eval()
         device_mesh = DeviceMesh(
@@ -193,6 +212,8 @@ class TestQwen35SPParity(unittest.TestCase):
         mean_abs_diff = (logits_base - logits_sp_full).abs().mean().detach().to(device)
         dist.all_reduce(mean_abs_diff, op=dist.ReduceOp.SUM)
         mean_abs_diff.div_(world_size)
+        p99_abs_diff = torch.quantile((logits_base - logits_sp_full).abs().flatten(), 0.99).detach().to(device)
+        dist.all_reduce(p99_abs_diff, op=dist.ReduceOp.MAX)
 
         local_logits_base = logits_base[:, seq_start:seq_end, :].contiguous()
         local_logits_sp = logits_sp_full[:, seq_start:seq_end, :].contiguous()
@@ -206,8 +227,10 @@ class TestQwen35SPParity(unittest.TestCase):
             f'grad_base={grad_base.item():.6f}, grad_sp={grad_sp.item():.6f}, '
             f'grad_diff={abs((grad_base - grad_sp).item()):.6f}, '
             f'max_abs_diff={max_abs_diff.item():.6f}, mean_abs_diff={mean_abs_diff.item():.6f}, '
+            f'p99_abs_diff={p99_abs_diff.item():.6f}, '
             f'local_max_abs_diff={local_max_abs_diff.item():.6f}, '
-            f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}'
+            f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}, '
+            f'dtype={str(model_dtype).replace("torch.", "")}'
         )
 
         if os.environ.get('QWEN35_SP_PARITY_DEBUG', '0') == '1' and rank == 0:
