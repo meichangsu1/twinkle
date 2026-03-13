@@ -853,12 +853,12 @@ class SequenceParallel:
                     if position_ids is None:
                         position_ids = self.real_position_ids
                     position_ids = _normalize_flash_position_ids(position_ids)
-                    if position_ids is not None:
-                        kwargs['position_ids'] = position_ids
                     # Packed batches (produced by PackingDataset + padding_free collate) require FA2 varlen
                     # semantics to avoid cross-subsequence attention. We derive cu_seqlens from position_ids
                     # resets (0,1,...) and pass cu_seq_lens_* to FA2.
                     if self.extra_kwargs.get('is_packed', False):
+                        if position_ids is not None:
+                            kwargs['position_ids'] = position_ids
                         # Treat SP-alignment padding (-1) as separate 1-token sequences by mapping -1 -> 0.
                         pos = position_ids
                         if pos is None:
@@ -877,6 +877,8 @@ class SequenceParallel:
                         if len(args) > 0:
                             args = (None, *args[1:])
                     elif 'cu_seq_lens_q' in kwargs:
+                        if position_ids is not None:
+                            kwargs['position_ids'] = position_ids
                         text_position_ids = position_ids
                         if text_position_ids is None:
                             raise RuntimeError('SequenceParallel: cu_seqlens mode requires position_ids.')
@@ -892,6 +894,11 @@ class SequenceParallel:
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
                         kwargs['max_length_k'] = max_seqlen
+                    else:
+                        # Qwen3.5 applies RoPE before the FA2 kernel call, so plain (non-packed) text batches do not
+                        # need position_ids here. Keeping 3D mRoPE position_ids can make HF treat batch_size=1 inputs
+                        # as packed and incorrectly enter the varlen kernel path.
+                        kwargs.pop('position_ids', None)
                     return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
                                                                                **kwargs)[0]
 
