@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import unittest
 import torch
+import unittest
 
 from twinkle.model.transformers.strategy.sequence_parallel import (SequenceParallel, _extract_text_position_ids,
+                                                                   _normalize_flash_position_ids,
                                                                    get_cu_seqlens_from_position_ids)
 
 
@@ -24,6 +25,17 @@ class TestSequenceParallelPositionIdsCompat(unittest.TestCase):
 
         pos_4d = torch.arange(4 * 2 * 6).view(4, 2, 6)
         out_4d = _extract_text_position_ids(pos_4d)
+        self.assertTrue(torch.equal(out_4d, pos_4d[0]))
+
+    def test_normalize_flash_position_ids_returns_text_aligned_2d_tensor(self):
+        pos_3d = torch.arange(3 * 1 * 6).view(3, 1, 6)
+        out_3d = _normalize_flash_position_ids(pos_3d)
+        self.assertEqual(out_3d.shape, (1, 6))
+        self.assertTrue(torch.equal(out_3d, pos_3d[0]))
+
+        pos_4d = torch.arange(4 * 2 * 6).view(4, 2, 6)
+        out_4d = _normalize_flash_position_ids(pos_4d)
+        self.assertEqual(out_4d.shape, (2, 6))
         self.assertTrue(torch.equal(out_4d, pos_4d[0]))
 
     def test_get_cu_seqlens_supports_2d_and_4d(self):

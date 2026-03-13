@@ -156,6 +156,13 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     return cu_seqlens
 
 
+def _normalize_flash_position_ids(position_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """FlashAttention packed detection expects text-aligned [B, S] position ids."""
+    if position_ids is None or not torch.is_tensor(position_ids):
+        return position_ids
+    return _extract_text_position_ids(position_ids)
+
+
 def _sp_prev_next_rank(
     sp_group: Optional[dist.ProcessGroup],
 ) -> Tuple[int, int, Optional[int], Optional[int]]:
@@ -842,15 +849,18 @@ class SequenceParallel:
                     query = query.transpose(1, 2)
                     key = key.transpose(1, 2)
                     value = value.transpose(1, 2)
+                    position_ids = kwargs.get('position_ids')
+                    if position_ids is None:
+                        position_ids = self.real_position_ids
+                    position_ids = _normalize_flash_position_ids(position_ids)
+                    if position_ids is not None:
+                        kwargs['position_ids'] = position_ids
                     # Packed batches (produced by PackingDataset + padding_free collate) require FA2 varlen
                     # semantics to avoid cross-subsequence attention. We derive cu_seqlens from position_ids
                     # resets (0,1,...) and pass cu_seq_lens_* to FA2.
                     if self.extra_kwargs.get('is_packed', False):
-                        position_ids = kwargs.get('position_ids')
-                        if position_ids is None:
-                            position_ids = self.real_position_ids
                         # Treat SP-alignment padding (-1) as separate 1-token sequences by mapping -1 -> 0.
-                        pos = _extract_text_position_ids(position_ids)
+                        pos = position_ids
                         if pos is None:
                             raise RuntimeError('SequenceParallel: packed mode requires position_ids.')
                         pos = pos.clone()
@@ -867,10 +877,7 @@ class SequenceParallel:
                         if len(args) > 0:
                             args = (None, *args[1:])
                     elif 'cu_seq_lens_q' in kwargs:
-                        position_ids = kwargs.get('position_ids')
-                        if position_ids is None:
-                            position_ids = self.real_position_ids
-                        text_position_ids = _extract_text_position_ids(position_ids)
+                        text_position_ids = position_ids
                         if text_position_ids is None:
                             raise RuntimeError('SequenceParallel: cu_seqlens mode requires position_ids.')
                         text_position_ids = self.pad(
