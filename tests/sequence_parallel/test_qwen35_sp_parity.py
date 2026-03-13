@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import math
 import os
 import unittest
 
@@ -44,6 +45,16 @@ def _resolve_torch_dtype(name: str) -> torch.dtype:
     if key not in mapping:
         raise ValueError(f'Unsupported dtype override: {name}')
     return mapping[key]
+
+
+def _quantile_via_kthvalue(tensor: torch.Tensor, q: float) -> torch.Tensor:
+    flat = tensor.reshape(-1)
+    if flat.numel() == 0:
+        raise ValueError('quantile input tensor must be non-empty')
+    if flat.numel() == 1:
+        return flat[0]
+    k = min(flat.numel(), max(1, math.ceil(q * flat.numel())))
+    return flat.kthvalue(k).values
 
 
 class TestQwen35SPParity(unittest.TestCase):
@@ -222,7 +233,7 @@ class TestQwen35SPParity(unittest.TestCase):
         mean_abs_diff = (logits_base - logits_sp_full).abs().mean().detach().to(device)
         dist.all_reduce(mean_abs_diff, op=dist.ReduceOp.SUM)
         mean_abs_diff.div_(world_size)
-        p99_abs_diff = torch.quantile((logits_base - logits_sp_full).abs().flatten(), 0.99).detach().to(device)
+        p99_abs_diff = _quantile_via_kthvalue((logits_base - logits_sp_full).abs(), 0.99).detach().to(device)
         dist.all_reduce(p99_abs_diff, op=dist.ReduceOp.MAX)
 
         local_logits_base = logits_base[:, seq_start:seq_end, :].contiguous()
