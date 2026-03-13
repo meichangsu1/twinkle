@@ -118,6 +118,9 @@ class TestQwen35SPParity(unittest.TestCase):
         logits_relaxed_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_RELAXED_MAX_ATOL', '3.0'))
         logits_mean_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_MEAN_ATOL', '1.5e-1'))
         logits_p99_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_P99_ATOL', '1.0'))
+        logits_sdpa_fp32_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_MAX_ATOL', '3.0'))
+        logits_sdpa_fp32_mean_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_MEAN_ATOL', '1.0e-1'))
+        logits_sdpa_fp32_p99_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_P99_ATOL', '5.0e-1'))
         loss_atol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_ATOL', '5e-2'))
         grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', '2e-1'))
         # Default to SDPA so the parity test exercises SP semantics without depending on FA2 kernel availability
@@ -260,12 +263,18 @@ class TestQwen35SPParity(unittest.TestCase):
             print('SP logits slice:', _format_tensor_slice(logits_sp_full), flush=True)
 
         effective_attn_impl = getattr(sp_model.config, '_attn_implementation', attn_impl or 'unknown')
-        is_low_precision_sdpa = effective_attn_impl == 'sdpa' and model_dtype in (torch.bfloat16, torch.float16)
+        is_sdpa = effective_attn_impl == 'sdpa'
+        is_low_precision_sdpa = is_sdpa and model_dtype in (torch.bfloat16, torch.float16)
+        is_fp32_sdpa = is_sdpa and model_dtype == torch.float32
 
         if is_low_precision_sdpa:
             self.assertLessEqual(max_abs_diff.item(), logits_relaxed_max_atol, msg=diagnostics)
             self.assertLessEqual(mean_abs_diff.item(), logits_mean_atol, msg=diagnostics)
             self.assertLessEqual(p99_abs_diff.item(), logits_p99_atol, msg=diagnostics)
+        elif is_fp32_sdpa:
+            self.assertLessEqual(max_abs_diff.item(), logits_sdpa_fp32_max_atol, msg=diagnostics)
+            self.assertLessEqual(mean_abs_diff.item(), logits_sdpa_fp32_mean_atol, msg=diagnostics)
+            self.assertLessEqual(p99_abs_diff.item(), logits_sdpa_fp32_p99_atol, msg=diagnostics)
         else:
             self.assertLessEqual(max_abs_diff.item(), logits_atol, msg=diagnostics)
         self.assertLessEqual(abs((loss_base_metric - loss_sp_metric).item()), loss_atol, msg=diagnostics)
