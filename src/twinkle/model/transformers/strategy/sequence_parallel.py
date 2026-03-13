@@ -943,6 +943,8 @@ class SequenceParallel:
     def _wrap_qwen35_chunk_rule(self, module: torch.nn.Module, origin_rule):
 
         recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
+        module_impl = importlib.import_module(module.__class__.__module__)
+        torch_recurrent_rule = getattr(module_impl, 'torch_recurrent_gated_delta_rule', None)
 
         def recurrent_rule_wrapper(
             query: torch.Tensor,
@@ -955,9 +957,10 @@ class SequenceParallel:
             output_final_state: bool = False,
             use_qk_l2norm_in_kernel: bool = False,
         ):
-            if recurrent_rule is None:
+            rule = torch_recurrent_rule or recurrent_rule
+            if rule is None:
                 raise RuntimeError('SequenceParallel: Qwen3.5 recurrent_gated_delta_rule is unavailable.')
-            return recurrent_rule(
+            return rule(
                 query,
                 key,
                 value,

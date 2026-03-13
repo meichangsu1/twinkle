@@ -5,8 +5,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import unittest
 from datetime import timedelta
+from unittest import mock
 
-from twinkle.model.transformers.strategy.sequence_parallel import _QwenLinearStateParallelFn
+from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel, _QwenLinearStateParallelFn
 
 
 def _find_free_port() -> int:
@@ -43,6 +44,20 @@ def _mock_chunk_rule(
         outputs.append(out_t.unsqueeze(1))
     output = torch.cat(outputs, dim=1).contiguous()
     return output, state if output_final_state else None
+
+
+def _mock_torch_recurrent_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+):
+    del key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
+    return query, None
 
 
 def _run_state_parallel_worker(rank: int, world_size: int, port: int):
@@ -151,6 +166,43 @@ class TestQwen35LinearStateParallel(unittest.TestCase):
             nprocs=world_size,
             join=True,
         )
+
+    def test_wrap_qwen35_chunk_rule_prefers_torch_recurrent_for_misaligned_local_seq(self):
+
+        class DummyModule:
+            recurrent_gated_delta_rule = staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError('fused recurrent rule should not be selected')))
+
+        sp = SequenceParallel()
+        sp.sp_world_size = 2
+        sp._sp_group = object()
+        sp.extra_kwargs['is_packed'] = False
+
+        dummy_module = DummyModule()
+        wrapped = sp._wrap_qwen35_chunk_rule(dummy_module, _mock_chunk_rule)
+
+        query = torch.randn(1, 16, 2, 4)
+        key = torch.randn(1, 16, 2, 4)
+        value = torch.randn(1, 16, 2, 5)
+        g = torch.randn(1, 16, 2)
+        beta = torch.randn(1, 16, 2)
+
+        with mock.patch.object(_QwenLinearStateParallelFn, 'apply', autospec=True) as mock_apply:
+            mock_apply.return_value = query
+            output, _ = wrapped(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+        self.assertIs(output, query)
+        self.assertIs(mock_apply.call_args.args[7], _mock_torch_recurrent_rule)
+        self.assertIsNone(mock_apply.call_args.args[8])
 
 
 if __name__ == '__main__':
