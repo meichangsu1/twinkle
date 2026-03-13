@@ -942,6 +942,32 @@ class SequenceParallel:
 
     def _wrap_qwen35_chunk_rule(self, module: torch.nn.Module, origin_rule):
 
+        recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
+
+        def recurrent_rule_wrapper(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            chunk_size: Optional[int] = None,
+            initial_state: Optional[torch.Tensor] = None,
+            output_final_state: bool = False,
+            use_qk_l2norm_in_kernel: bool = False,
+        ):
+            if recurrent_rule is None:
+                raise RuntimeError('SequenceParallel: Qwen3.5 recurrent_gated_delta_rule is unavailable.')
+            return recurrent_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
         def wrapped_chunk_rule(
             query: torch.Tensor,
             key: torch.Tensor,
@@ -974,6 +1000,17 @@ class SequenceParallel:
                     'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
                     'Packed reset semantics for recurrent states are not implemented.')
 
+            sp_rule = origin_rule
+            sp_chunk_size = int(chunk_size) if chunk_size is not None else None
+            effective_chunk_size = sp_chunk_size or 64
+            if recurrent_rule is not None and query.shape[1] % effective_chunk_size != 0:
+                # Qwen3.5's chunk rule is only exact when split points align with chunk boundaries. If SP splits a
+                # sequence inside a chunk (e.g. seq_len=32, sp=2, local_seq=16, default chunk_size=64), carrying only
+                # the final recurrent state is not enough to reproduce the monolithic chunked prefill path. Fall back
+                # to the recurrent rule for exact state hand-off across SP ranks.
+                sp_rule = recurrent_rule_wrapper
+                sp_chunk_size = None
+
             output = _QwenLinearStateParallelFn.apply(
                 query,
                 key,
@@ -981,8 +1018,8 @@ class SequenceParallel:
                 g,
                 beta,
                 self._sp_group,
-                origin_rule,
-                (int(chunk_size) if chunk_size is not None else None),
+                sp_rule,
+                sp_chunk_size,
                 bool(use_qk_l2norm_in_kernel),
             )
             return output, None
