@@ -678,7 +678,7 @@ class SequenceParallel:
                 'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
-            def _prepare_full_sequence_mask_inputs(config, input_embeds, attention_mask):
+            def _prepare_full_sequence_mask_inputs(config, inputs_embeds, attention_mask, cache_position=None):
                 if (attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() == 2
                         and getattr(config, '_attn_implementation', None) == 'sdpa'):
                     # SDPA materializes a 4D causal mask before attention. If we feed it the per-rank 2D padding mask,
@@ -690,31 +690,81 @@ class SequenceParallel:
                         sp_world_size=self.sp_world_size,
                         sp_group=self._sp_group,
                     )
-                input_embeds = torch.ones(
-                    (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
-                    dtype=input_embeds.dtype,
-                    device=input_embeds.device)
-                cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
-                return input_embeds, attention_mask, cache_position
+                inputs_embeds = torch.ones(
+                    (inputs_embeds.shape[0], inputs_embeds.shape[1] * self.sp_world_size, inputs_embeds.shape[2]),
+                    dtype=inputs_embeds.dtype,
+                    device=inputs_embeds.device)
+                if cache_position is None:
+                    cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+                else:
+                    cache_position = torch.arange(0, inputs_embeds.shape[1], device=cache_position.device)
+                return inputs_embeds, attention_mask, cache_position
 
-            def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
+            def create_causal_mask(config,
+                                   inputs_embeds=None,
+                                   attention_mask=None,
+                                   cache_position=None,
+                                   past_key_values=None,
+                                   position_ids=None,
+                                   *args,
+                                   **kwargs):
+                if inputs_embeds is None and 'input_embeds' in kwargs:
+                    inputs_embeds = kwargs.pop('input_embeds')
                 if self.world_size == 1:
-                    return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                                   *args, **kwargs)
-                input_embeds, attention_mask, cache_position = _prepare_full_sequence_mask_inputs(
-                    config, input_embeds, attention_mask)
-                return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                               *args, **kwargs)
+                    return masking_utils.origin_create_causal_mask(
+                        config,
+                        inputs_embeds,
+                        attention_mask,
+                        cache_position,
+                        past_key_values,
+                        position_ids,
+                        *args,
+                        **kwargs,
+                    )
+                inputs_embeds, attention_mask, cache_position = _prepare_full_sequence_mask_inputs(
+                    config, inputs_embeds, attention_mask, cache_position)
+                return masking_utils.origin_create_causal_mask(
+                    config,
+                    inputs_embeds,
+                    attention_mask,
+                    cache_position,
+                    past_key_values,
+                    position_ids,
+                    *args,
+                    **kwargs,
+                )
 
-            def create_sliding_window_causal_mask(config, input_embeds, attention_mask, cache_position, *args,
+            def create_sliding_window_causal_mask(config,
+                                                  inputs_embeds=None,
+                                                  attention_mask=None,
+                                                  cache_position=None,
+                                                  past_key_values=None,
+                                                  position_ids=None,
+                                                  *args,
                                                   **kwargs):
+                if inputs_embeds is None and 'input_embeds' in kwargs:
+                    inputs_embeds = kwargs.pop('input_embeds')
                 if self.world_size == 1:
                     return masking_utils.origin_create_sliding_window_causal_mask(
-                        config, input_embeds, attention_mask, cache_position, *args, **kwargs)
-                input_embeds, attention_mask, cache_position = _prepare_full_sequence_mask_inputs(
-                    config, input_embeds, attention_mask)
+                        config,
+                        inputs_embeds,
+                        attention_mask,
+                        cache_position,
+                        past_key_values,
+                        position_ids,
+                        *args,
+                        **kwargs)
+                inputs_embeds, attention_mask, cache_position = _prepare_full_sequence_mask_inputs(
+                    config, inputs_embeds, attention_mask, cache_position)
                 return masking_utils.origin_create_sliding_window_causal_mask(
-                    config, input_embeds, attention_mask, cache_position, *args, **kwargs)
+                    config,
+                    inputs_embeds,
+                    attention_mask,
+                    cache_position,
+                    past_key_values,
+                    position_ids,
+                    *args,
+                    **kwargs)
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
