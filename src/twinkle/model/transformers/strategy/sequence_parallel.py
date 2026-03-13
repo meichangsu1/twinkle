@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 import torch.distributed as dist
+import importlib
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
 from transformers import PreTrainedTokenizer
@@ -677,10 +678,7 @@ class SequenceParallel:
                 'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
-            def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
-                if self.world_size == 1:
-                    return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                                   *args, **kwargs)
+            def _prepare_full_sequence_mask_inputs(config, input_embeds, attention_mask):
                 if (attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() == 2
                         and getattr(config, '_attn_implementation', None) == 'sdpa'):
                     # SDPA materializes a 4D causal mask before attention. If we feed it the per-rank 2D padding mask,
@@ -697,11 +695,44 @@ class SequenceParallel:
                     dtype=input_embeds.dtype,
                     device=input_embeds.device)
                 cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
+                return input_embeds, attention_mask, cache_position
+
+            def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
+                if self.world_size == 1:
+                    return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
+                                                                   *args, **kwargs)
+                input_embeds, attention_mask, cache_position = _prepare_full_sequence_mask_inputs(
+                    config, input_embeds, attention_mask)
                 return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
                                                                *args, **kwargs)
 
+            def create_sliding_window_causal_mask(config, input_embeds, attention_mask, cache_position, *args,
+                                                  **kwargs):
+                if self.world_size == 1:
+                    return masking_utils.origin_create_sliding_window_causal_mask(
+                        config, input_embeds, attention_mask, cache_position, *args, **kwargs)
+                input_embeds, attention_mask, cache_position = _prepare_full_sequence_mask_inputs(
+                    config, input_embeds, attention_mask)
+                return masking_utils.origin_create_sliding_window_causal_mask(
+                    config, input_embeds, attention_mask, cache_position, *args, **kwargs)
+
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
+            if hasattr(masking_utils, 'create_sliding_window_causal_mask'):
+                masking_utils.origin_create_sliding_window_causal_mask = masking_utils.create_sliding_window_causal_mask
+                masking_utils.create_sliding_window_causal_mask = create_sliding_window_causal_mask
+
+            # Some models bind these helpers via `from transformers.masking_utils import create_causal_mask`
+            # at import time, so patching masking_utils alone is not enough. Patch the model module globals too.
+            model_module = importlib.import_module(base_model.__class__.__module__)
+            if hasattr(model_module, 'create_causal_mask'):
+                if not hasattr(model_module, 'origin_create_causal_mask'):
+                    model_module.origin_create_causal_mask = model_module.create_causal_mask
+                model_module.create_causal_mask = create_causal_mask
+            if hasattr(model_module, 'create_sliding_window_causal_mask'):
+                if not hasattr(model_module, 'origin_create_sliding_window_causal_mask'):
+                    model_module.origin_create_sliding_window_causal_mask = model_module.create_sliding_window_causal_mask
+                model_module.create_sliding_window_causal_mask = create_sliding_window_causal_mask
         except ImportError:
             pass
 
