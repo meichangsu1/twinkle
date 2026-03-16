@@ -1,0 +1,192 @@
+{
+  "model_id": "/nas/disk1/Qwen3.5-0.8B",
+  "datasets": "ms://swift/self-cognition",
+  "seed": 1234,
+  "batch_index": 0,
+  "batch_size": 8,
+  "env": {
+    "QWEN35_SP_LINEAR_STRICT": "0",
+    "QWEN35_SP_LINEAR_CONV_HALO": "0",
+    "QWEN35_SP_LINEAR_STRICT_BARRIER": "0",
+    "QWEN35_SP_PARITY_ATTN_IMPL": null
+  },
+  "experiments": [
+    {
+      "mode": "eval",
+      "loss": 241.0,
+      "metric": {
+        "loss": "3.0000",
+        "accuracy": "0.45",
+        "correct_tokens": 142,
+        "total_tokens": 318,
+        "learning rate(param group 1)": "0.00e+00",
+        "learning rate(param group 2)": "0.00e+00",
+        "iters": -1,
+        "total time elapse": "6 seconds",
+        "speed": "-0.16 iters/s"
+      },
+      "outputs": {
+        "logits": {
+          "shape": [
+            2,
+            69,
+            248320
+          ],
+          "mean": -1.5457031726837158,
+          "std": 2.8326728343963623,
+          "max_abs": 33.0,
+          "slice": [
+            1.75,
+            3.90625,
+            6.59375,
+            1.4765625,
+            2.890625,
+            2.28125,
+            2.140625,
+            4.78125
+          ]
+        },
+        "logps": {
+          "shape": [
+            2,
+            69
+          ],
+          "mean": -8.787003517150879,
+          "std": 8.139016151428223,
+          "max_abs": 26.625,
+          "slice": [
+            -13.5625,
+            -21.75,
+            -18.25,
+            -19.625,
+            -13.125,
+            -13.0625,
+            -11.375,
+            -9.9375
+          ]
+        }
+      }
+    },
+    {
+      "mode": "train_no_step",
+      "loss": 241.0,
+      "grad_norm": null,
+      "metric": {
+        "loss": "3.0000",
+        "accuracy": "0.45",
+        "correct_tokens": 142,
+        "total_tokens": 318,
+        "learning rate(param group 1)": "0.00e+00",
+        "learning rate(param group 2)": "0.00e+00",
+        "iters": 0,
+        "total time elapse": "8 seconds",
+        "speed": "0.00 iters/s"
+      },
+      "outputs": {
+        "logits": {
+          "shape": [
+            2,
+            69,
+            248320
+          ],
+          "mean": -1.5457031726837158,
+          "std": 2.8326728343963623,
+          "max_abs": 33.0,
+          "slice": [
+            1.75,
+            3.90625,
+            6.59375,
+            1.4765625,
+            2.890625,
+            2.28125,
+            2.140625,
+            4.78125
+          ]
+        },
+               "logps": {
+          "shape": [
+            2,
+            69
+          ],
+          "mean": -8.787003517150879,
+          "std": 8.139016151428223,
+          "max_abs": 26.625,
+          "slice": [
+            -13.5625,
+            -21.75,
+            -18.25,
+            -19.625,
+            -13.125,
+            -13.0625,
+            -11.375,
+            -9.9375
+          ]
+        }
+      }
+    },
+    {
+      "mode": "train_step",
+      "loss": 241.0,
+      "grad_norm": 0.6715084910392761,
+      "metric": {
+        "loss": "3.0000",
+        "grad_norm": "0.671508",
+        "accuracy": "0.45",
+        "correct_tokens": 142,
+        "total_tokens": 318,
+        "learning rate(param group 1)": "0.00e+00",
+        "learning rate(param group 2)": "0.00e+00",
+        "iters": 1,
+        "total time elapse": "9 seconds",
+        "speed": "0.77 iters/s"
+      },
+      "outputs": {
+        "logits": {
+          "shape": [
+            2,
+            69,
+            248320
+          ],
+          "mean": -1.5457031726837158,
+          "std": 2.8326728343963623,
+          "max_abs": 33.0,
+          "slice": [
+            1.75,
+            3.90625,
+            6.59375,
+            1.4765625,
+            2.890625,
+            2.28125,
+            2.140625,
+            4.78125
+          ]
+        },
+        "logps": {
+          "shape": [
+            2,
+            69
+          ],
+          "mean": -8.787003517150879,
+          "std": 8.139016151428223,
+          "max_abs": 26.625,
+          "slice": [
+            -13.5625,
+            -21.75,
+            -18.25,
+            -19.625,
+            -13.125,
+            -13.0625,
+            -11.375,
+            -9.9375
+          ]
+        }
+      },
+      "state_delta": {
+        "param_delta_l2": 0.0,
+        "param_delta_rms": 0.0,
+        "param_delta_max_abs": 0.0,
+        "param_delta_max_abs_key": null
+      }
+    }
+  ]
+}

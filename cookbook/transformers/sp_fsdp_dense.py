@@ -76,6 +76,7 @@ def _maybe_barrier() -> None:
 
 
 def _create_model(num_training_steps: int) -> TransformersModel:
+    warmup_steps = int(os.environ.get('TWINKLE_DIAG_WARMUP_STEPS', '5'))
     model = TransformersModel(
         model_id=MODEL_ID,
         device_mesh=device_mesh,
@@ -87,7 +88,7 @@ def _create_model(num_training_steps: int) -> TransformersModel:
     model.set_optimizer('AdamW', lr=1e-4, adapter_name='default')
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',
-        num_warmup_steps=5,
+        num_warmup_steps=warmup_steps,
         num_training_steps=num_training_steps,
         adapter_name='default',
     )
