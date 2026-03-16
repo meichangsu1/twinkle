@@ -29,6 +29,10 @@ def _sp_linear_collective_debug(message: str, sp_group: Optional[dist.ProcessGro
     print(f'{prefix} {message}', flush=True)
 
 
+def _sp_qwen35_decoder_debug_enabled() -> bool:
+    return os.environ.get('QWEN35_SP_DEBUG_DECODER_LAYERS', '0') == '1'
+
+
 def get_config_attr(config, key, default=None):
     return getattr(config, key, default)
 
@@ -1544,6 +1548,48 @@ class SequenceParallel:
                     getattr(module, 'causal_conv1d_fn', None),
                 )
             module._twinkle_sp_linear_chunk_patched = True
+
+        if _sp_qwen35_decoder_debug_enabled() and hasattr(text_model, 'layers'):
+            for layer_idx, decoder_layer in enumerate(text_model.layers):
+                if decoder_layer.__class__.__name__ != 'Qwen3_5DecoderLayer':
+                    continue
+                if getattr(decoder_layer, '_twinkle_sp_decoder_debug_hooked', False):
+                    continue
+
+                def _make_pre_hook(idx):
+
+                    def _pre_hook(_module, _args, _kwargs):
+                        hidden_states = None
+                        if 'hidden_states' in _kwargs:
+                            hidden_states = _kwargs['hidden_states']
+                        elif _args:
+                            hidden_states = _args[0]
+                        _sp_linear_collective_debug(
+                            f'qwen35_decoder_layer_{idx}: before forward '
+                            f'layer_type={getattr(_module, "layer_type", "unknown")} '
+                            f'hidden_states={None if hidden_states is None else tuple(hidden_states.shape)}',
+                            self._sp_group,
+                        )
+
+                    return _pre_hook
+
+                def _make_post_hook(idx):
+
+                    def _post_hook(_module, _args, _kwargs, output):
+                        hidden_states = output[0] if isinstance(output, (tuple, list)) else output
+                        _sp_linear_collective_debug(
+                            f'qwen35_decoder_layer_{idx}: after forward '
+                            f'layer_type={getattr(_module, "layer_type", "unknown")} '
+                            f'hidden_states={None if hidden_states is None else tuple(hidden_states.shape)}',
+                            self._sp_group,
+                        )
+
+                    return _post_hook
+
+                decoder_layer.register_forward_pre_hook(_make_pre_hook(layer_idx), with_kwargs=True)
+                decoder_layer.register_forward_hook(_make_post_hook(layer_idx), with_kwargs=True)
+                decoder_layer._twinkle_sp_decoder_debug_hooked = True
+
         self.has_qwen35_linear_attn = has_linear_attn
         self.extra_kwargs['has_qwen35_linear_attn'] = has_linear_attn
 
