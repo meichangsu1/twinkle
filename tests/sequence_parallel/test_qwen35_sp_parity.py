@@ -250,10 +250,15 @@ class TestQwen35SPParity(unittest.TestCase):
         logits_sdpa_fp32_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_MAX_ATOL', '3.0'))
         logits_sdpa_fp32_mean_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_MEAN_ATOL', '1.0e-1'))
         logits_sdpa_fp32_p99_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_P99_ATOL', '5.0e-1'))
+        logits_linear_exact_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_LINEAR_EXACT_MAX_ATOL', '1.0e-2'))
+        logits_linear_exact_mean_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_LINEAR_EXACT_MEAN_ATOL', '1.0e-3'))
+        logits_linear_exact_p99_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_LINEAR_EXACT_P99_ATOL', '5.0e-3'))
         loss_atol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_ATOL', close_defaults['loss_atol']))
         loss_rtol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_RTOL', close_defaults['loss_rtol']))
         grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', close_defaults['grad_atol']))
         grad_rtol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_RTOL', close_defaults['grad_rtol']))
+        linear_strict = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
+        linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
 
         try:
             import numpy as np
@@ -420,6 +425,7 @@ class TestQwen35SPParity(unittest.TestCase):
             f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}, '
             f'dtype={str(model_dtype).replace("torch.", "")}, '
             f'force_recurrent={force_recurrent}, forced_recurrent_layers={forced_recurrent_layers}, '
+            f'linear_strict={linear_strict}, linear_conv_halo={linear_conv_halo}, '
             f'loss_atol={loss_atol:.2e}, loss_rtol={loss_rtol:.2e}, '
             f'grad_atol={grad_atol:.2e}, grad_rtol={grad_rtol:.2e}'
         )
@@ -433,11 +439,20 @@ class TestQwen35SPParity(unittest.TestCase):
         is_sdpa = effective_attn_impl == 'sdpa'
         is_low_precision_sdpa = is_sdpa and model_dtype in (torch.bfloat16, torch.float16)
         is_fp32_sdpa = is_sdpa and model_dtype == torch.float32
+        is_fp32_linear_exact = (
+            force_recurrent
+            and model_dtype == torch.float32
+            and (linear_strict or linear_conv_halo)
+        )
 
         if is_low_precision_sdpa:
             self.assertLessEqual(max_abs_diff.item(), logits_relaxed_max_atol, msg=diagnostics)
             self.assertLessEqual(mean_abs_diff.item(), logits_mean_atol, msg=diagnostics)
             self.assertLessEqual(p99_abs_diff.item(), logits_p99_atol, msg=diagnostics)
+        elif is_fp32_linear_exact:
+            self.assertLessEqual(max_abs_diff.item(), logits_linear_exact_max_atol, msg=diagnostics)
+            self.assertLessEqual(mean_abs_diff.item(), logits_linear_exact_mean_atol, msg=diagnostics)
+            self.assertLessEqual(p99_abs_diff.item(), logits_linear_exact_p99_atol, msg=diagnostics)
         elif is_fp32_sdpa:
             self.assertLessEqual(max_abs_diff.item(), logits_sdpa_fp32_max_atol, msg=diagnostics)
             self.assertLessEqual(mean_abs_diff.item(), logits_sdpa_fp32_mean_atol, msg=diagnostics)
