@@ -934,11 +934,51 @@ class SequenceParallel:
                 query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
                 *args, **kwargs), None
 
+        def local_eager_attn(module: torch.nn.Module, query_states, key_states, value_states, attention_mask, *args,
+                             dist_attn, **kwargs):
+            if self.world_size == 1 or module.__class__ not in [m.__class__ for m in text_model.modules()]:
+                return ALL_ATTENTION_FUNCTIONS['eager_origin'](
+                    module, query_states, key_states, value_states, attention_mask, *args, **kwargs)
+
+            if self.extra_kwargs.get('is_packed', False):
+                raise RuntimeError(
+                    'SequenceParallel: detected packed batch (position_ids contains multiple sequences). '
+                    'eager backend is not supported for packed batches.')
+
+            if dist_attn.local_attn is None:
+
+                def _attention(query, key, value, *inner_args, **inner_kwargs):
+                    query = query.transpose(1, 2)
+                    key = key.transpose(1, 2)
+                    value = value.transpose(1, 2)
+                    return ALL_ATTENTION_FUNCTIONS['eager_origin'](
+                        module, query, key, value, *inner_args, **inner_kwargs)[0]
+
+                dist_attn.local_attn = _attention
+
+            return dist_attn(
+                query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2), attention_mask,
+                *args, **kwargs), None
+
         ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'] = ALL_ATTENTION_FUNCTIONS['flash_attention_2']
         ALL_ATTENTION_FUNCTIONS['sdpa_origin'] = ALL_ATTENTION_FUNCTIONS['sdpa']
+        eager_origin = None
+        if 'eager' in ALL_ATTENTION_FUNCTIONS:
+            eager_origin = ALL_ATTENTION_FUNCTIONS['eager']
+            ALL_ATTENTION_FUNCTIONS['eager_origin'] = eager_origin
+        else:
+            eager_origin = getattr(model_module, 'eager_attention_forward', None)
+            if eager_origin is not None:
+                ALL_ATTENTION_FUNCTIONS['eager_origin'] = eager_origin
         ALL_ATTENTION_FUNCTIONS['flash_attention_2'] = partial(
             local_flash_attn, dist_attn=DistributedAttention(None, self))
         ALL_ATTENTION_FUNCTIONS['sdpa'] = partial(local_sdpa_attn, dist_attn=DistributedAttention(None, self))
+        if 'eager_origin' in ALL_ATTENTION_FUNCTIONS:
+            ALL_ATTENTION_FUNCTIONS['eager'] = partial(local_eager_attn, dist_attn=DistributedAttention(None, self))
+        if eager_origin is not None and hasattr(model_module, 'eager_attention_forward'):
+            if not hasattr(model_module, 'origin_eager_attention_forward'):
+                model_module.origin_eager_attention_forward = model_module.eager_attention_forward
+            model_module.eager_attention_forward = partial(local_eager_attn, dist_attn=DistributedAttention(None, self))
 
     def _wrap_qwen35_chunk_rule(self, module: torch.nn.Module, origin_rule):
 
