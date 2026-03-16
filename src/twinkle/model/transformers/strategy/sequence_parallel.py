@@ -774,6 +774,7 @@ class SequenceParallel:
         self.has_qwen35_linear_attn = False
         self.qwen35_linear_strict_full_seq = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
         self.qwen35_linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
+        self.qwen35_linear_conv_halo_disable_gc = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO_DISABLE_GC', '1') == '1'
         self.extra_kwargs = {}
 
     @property
@@ -1559,6 +1560,16 @@ class SequenceParallel:
 
         # Model-specific patch: Qwen3.5 linear attention state passing for SP.
         self._prepare_qwen35_linear_attn(llm_model)
+        if (
+            self.qwen35_linear_conv_halo
+            and not self.qwen35_linear_strict_full_seq
+            and self.has_qwen35_linear_attn
+            and self.qwen35_linear_conv_halo_disable_gc
+        ):
+            is_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
+            if is_gc_enabled and hasattr(model, 'gradient_checkpointing_disable'):
+                model.gradient_checkpointing_disable()
+                self.extra_kwargs['qwen35_linear_conv_halo_disabled_gradient_checkpointing'] = True
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
