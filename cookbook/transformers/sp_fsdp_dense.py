@@ -238,7 +238,12 @@ def single_batch_diagnostic():
     logger.info(model.get_train_configs(adapter_name='default'))
 
     init_state = _clone_state_dict(model.get_state_dict(adapter_name='default'))
-    checkpoint_root = tempfile.mkdtemp(prefix='twinkle-sp-diag-')
+    run_id = os.environ.get('TWINKLE_DIAG_RUN_ID', 'default')
+    checkpoint_root = os.environ.get(
+        'TWINKLE_DIAG_CHECKPOINT_ROOT',
+        os.path.join(tempfile.gettempdir(), f'twinkle-sp-diag-{run_id}'),
+    )
+    os.makedirs(checkpoint_root, exist_ok=True)
     checkpoint_dir = model.save(
         'single-batch-init',
         output_dir=checkpoint_root,
