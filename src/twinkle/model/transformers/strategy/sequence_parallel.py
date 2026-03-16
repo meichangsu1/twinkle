@@ -1520,6 +1520,106 @@ class SequenceParallel:
         wrapped_forward._twinkle_wrapped_module = module.__class__.__name__
         return wrapped_forward
 
+    def _wrap_qwen35_attention_debug_forward(
+        self,
+        module: torch.nn.Module,
+        origin_forward,
+    ):
+        modeling_module = importlib.import_module(module.__class__.__module__)
+        apply_rotary_pos_emb = getattr(modeling_module, 'apply_rotary_pos_emb')
+        all_attention_functions = getattr(modeling_module, 'ALL_ATTENTION_FUNCTIONS')
+        eager_attention_forward = getattr(modeling_module, 'eager_attention_forward')
+        layer_idx = int(getattr(module, 'layer_idx', 0))
+        debug_label = f'qwen35_attention_layer_{layer_idx}'
+
+        def wrapped_forward(
+            hidden_states: torch.Tensor,
+            position_embeddings,
+            attention_mask: Optional[torch.Tensor],
+            past_key_values=None,
+            cache_position: Optional[torch.Tensor] = None,
+            **kwargs,
+        ):
+            _sp_linear_collective_debug(
+                f'{debug_label}: before qkv_proj hidden_states={tuple(hidden_states.shape)}',
+                self._sp_group,
+            )
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, module.head_dim)
+
+            query_states, gate = torch.chunk(
+                module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2), 2, dim=-1
+            )
+            gate = gate.reshape(*input_shape, -1)
+            key_states = module.k_proj(hidden_states)
+            value_states = module.v_proj(hidden_states)
+            _sp_linear_collective_debug(
+                f'{debug_label}: after qkv_proj q={tuple(query_states.shape)} '
+                f'k={tuple(key_states.shape)} v={tuple(value_states.shape)}',
+                self._sp_group,
+            )
+
+            query_states = module.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+            key_states = module.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
+            value_states = value_states.view(hidden_shape).transpose(1, 2)
+            _sp_linear_collective_debug(
+                f'{debug_label}: after qk_norm q={tuple(query_states.shape)} '
+                f'k={tuple(key_states.shape)} v={tuple(value_states.shape)}',
+                self._sp_group,
+            )
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            _sp_linear_collective_debug(
+                f'{debug_label}: after rotary q={tuple(query_states.shape)} k={tuple(key_states.shape)}',
+                self._sp_group,
+            )
+
+            if past_key_values is not None:
+                cache_kwargs = {'sin': sin, 'cos': cos, 'cache_position': cache_position}
+                key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx, cache_kwargs)
+                _sp_linear_collective_debug(
+                    f'{debug_label}: after cache_update k={tuple(key_states.shape)} v={tuple(value_states.shape)}',
+                    self._sp_group,
+                )
+
+            attention_interface = all_attention_functions.get_interface(
+                module.config._attn_implementation,
+                eager_attention_forward,
+            )
+            _sp_linear_collective_debug(
+                f'{debug_label}: before attention_interface impl={module.config._attn_implementation} '
+                f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
+                self._sp_group,
+            )
+            attn_output, attn_weights = attention_interface(
+                module,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not module.training else module.attention_dropout,
+                scaling=module.scaling,
+                **kwargs,
+            )
+            _sp_linear_collective_debug(
+                f'{debug_label}: after attention_interface attn_output={tuple(attn_output.shape)}',
+                self._sp_group,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn_output * torch.sigmoid(gate)
+            attn_output = module.o_proj(attn_output)
+            _sp_linear_collective_debug(
+                f'{debug_label}: after o_proj attn_output={tuple(attn_output.shape)}',
+                self._sp_group,
+            )
+            return attn_output, attn_weights
+
+        wrapped_forward._twinkle_origin_forward = origin_forward
+        wrapped_forward._twinkle_wrapped_module = module.__class__.__name__
+        return wrapped_forward
+
     def _prepare_qwen35_linear_attn(self, base_model: torch.nn.Module):
         if hasattr(base_model, 'language_model'):
             text_model = base_model.language_model
@@ -1597,6 +1697,9 @@ class SequenceParallel:
                     and full_attn.__class__.__name__ == 'Qwen3_5Attention'
                     and not getattr(full_attn, '_twinkle_sp_attn_debug_hooked', False)
                 ):
+                    origin_attn_forward = getattr(full_attn, 'forward', None)
+                    if origin_attn_forward is not None:
+                        full_attn.forward = self._wrap_qwen35_attention_debug_forward(full_attn, origin_attn_forward)
 
                     def _make_attn_pre_hook(idx):
 
