@@ -1,7 +1,7 @@
-# Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
+import os
 import torch
 import torch.distributed as dist
-import importlib
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
 from transformers import PreTrainedTokenizer
@@ -461,6 +461,78 @@ class GatherLoss(torch.autograd.Function):
         return _grad, None, None, None
 
 
+class _GatherForwardSplitBackward(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        gather_dim: int,
+        sp_world_size: Optional[int],
+        sp_group: Optional[dist.ProcessGroup],
+    ) -> torch.Tensor:
+        ctx.gather_dim = gather_dim
+        ctx.sp_world_size = sp_world_size
+        ctx.sp_group = sp_group
+        if sp_world_size is None or sp_world_size <= 1 or sp_group is None:
+            return tensor
+        return _gather_tensor_along_dim_for_sp(tensor, gather_dim, sp_world_size, sp_group)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.sp_world_size is None or ctx.sp_world_size <= 1 or ctx.sp_group is None:
+            return grad_output, None, None, None
+        rank = dist.get_rank(ctx.sp_group)
+        gather_dim = ctx.gather_dim if ctx.gather_dim >= 0 else grad_output.dim() + ctx.gather_dim
+        dim_size = grad_output.size(gather_dim)
+        if dim_size % ctx.sp_world_size != 0:
+            raise ValueError(
+                f'Cannot split gathered grad_output size {dim_size} on dim {gather_dim} by '
+                f'sp_world_size={ctx.sp_world_size}.'
+            )
+        local_size = dim_size // ctx.sp_world_size
+        grad_input = torch.split(grad_output.contiguous(), local_size, dim=gather_dim)[rank].contiguous()
+        return grad_input, None, None, None
+
+
+class _SplitForwardGatherBackward(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        split_dim: int,
+        sp_world_size: Optional[int],
+        sp_group: Optional[dist.ProcessGroup],
+    ) -> torch.Tensor:
+        ctx.split_dim = split_dim
+        ctx.sp_world_size = sp_world_size
+        ctx.sp_group = sp_group
+        if sp_world_size is None or sp_world_size <= 1 or sp_group is None:
+            return tensor
+        rank = dist.get_rank(sp_group)
+        split_dim = split_dim if split_dim >= 0 else tensor.dim() + split_dim
+        dim_size = tensor.size(split_dim)
+        if dim_size % sp_world_size != 0:
+            raise ValueError(
+                f'Cannot split tensor size {dim_size} on dim {split_dim} by sp_world_size={sp_world_size}.'
+            )
+        local_size = dim_size // sp_world_size
+        return torch.split(tensor.contiguous(), local_size, dim=split_dim)[rank].contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.sp_world_size is None or ctx.sp_world_size <= 1 or ctx.sp_group is None:
+            return grad_output, None, None, None
+        grad_input = _gather_tensor_along_dim_for_sp(
+            grad_output.contiguous(),
+            ctx.split_dim,
+            ctx.sp_world_size,
+            ctx.sp_group,
+        )
+        return grad_input, None, None, None
+
+
 # Code borrowed from deepspeed, here is why:
 # 1. Reduce the dependency
 # 2. The original code is complex
@@ -622,6 +694,7 @@ class SequenceParallel:
         self.num_heads = None
         self.causal_mask_func = None
         self.has_qwen35_linear_attn = False
+        self.qwen35_linear_strict_full_seq = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
         self.extra_kwargs = {}
 
     @property
@@ -1072,6 +1145,103 @@ class SequenceParallel:
         wrapped_chunk_rule._twinkle_wrapped_module = module.__class__.__name__
         return wrapped_chunk_rule
 
+    def _wrap_qwen35_linear_forward(
+        self,
+        module: torch.nn.Module,
+        origin_forward,
+        origin_chunk_rule,
+        origin_recurrent_rule,
+    ):
+
+        def wrapped_forward(
+            hidden_states: torch.Tensor,
+            cache_params=None,
+            cache_position: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+        ):
+            if (
+                not self.qwen35_linear_strict_full_seq
+                or self.sp_world_size is None
+                or self.sp_world_size <= 1
+                or self._sp_group is None
+            ):
+                return origin_forward(
+                    hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                )
+
+            if self.extra_kwargs.get('is_packed', False):
+                raise RuntimeError(
+                    'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP strict '
+                    'full-sequence mode.'
+                )
+
+            use_precomputed_states = (
+                cache_params is not None
+                and getattr(cache_params, 'has_previous_state', False)
+                and hidden_states.shape[1] == 1
+                and cache_position is not None
+            )
+            if use_precomputed_states:
+                # Decode already carries conv/recurrent state through cache_params; strict full-sequence recomputation
+                # is only needed for prefill, where local shards otherwise miss causal-conv left context.
+                return origin_forward(
+                    hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                )
+
+            full_hidden_states = _GatherForwardSplitBackward.apply(
+                hidden_states,
+                1,
+                self.sp_world_size,
+                self._sp_group,
+            )
+            full_attention_mask = _gather_attention_mask_for_sp(
+                attention_mask,
+                local_seq_len=hidden_states.shape[1],
+                sp_world_size=self.sp_world_size,
+                sp_group=self._sp_group,
+            )
+            full_cache_position = cache_position
+            if full_cache_position is not None and torch.is_tensor(full_cache_position):
+                full_cache_position = torch.arange(
+                    0,
+                    full_hidden_states.shape[1],
+                    device=full_cache_position.device,
+                    dtype=full_cache_position.dtype,
+                )
+
+            saved_chunk_rule = module.chunk_gated_delta_rule
+            saved_recurrent_rule = module.recurrent_gated_delta_rule
+            module.chunk_gated_delta_rule = origin_chunk_rule
+            if origin_recurrent_rule is not None:
+                module.recurrent_gated_delta_rule = origin_recurrent_rule
+            try:
+                full_output = origin_forward(
+                    full_hidden_states,
+                    cache_params=cache_params,
+                    cache_position=full_cache_position,
+                    attention_mask=full_attention_mask,
+                )
+            finally:
+                module.chunk_gated_delta_rule = saved_chunk_rule
+                module.recurrent_gated_delta_rule = saved_recurrent_rule
+
+            return _SplitForwardGatherBackward.apply(
+                full_output,
+                1,
+                self.sp_world_size,
+                self._sp_group,
+            )
+
+        wrapped_forward._twinkle_origin_forward = origin_forward
+        wrapped_forward._twinkle_wrapped_module = module.__class__.__name__
+        return wrapped_forward
+
     def _prepare_qwen35_linear_attn(self, base_model: torch.nn.Module):
         if hasattr(base_model, 'language_model'):
             text_model = base_model.language_model
@@ -1085,10 +1255,19 @@ class SequenceParallel:
             origin_rule = getattr(module, 'chunk_gated_delta_rule', None)
             if origin_rule is None:
                 continue
+            origin_recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
+            origin_forward = getattr(module, 'forward', None)
             has_linear_attn = True
             if getattr(module, '_twinkle_sp_linear_chunk_patched', False):
                 continue
             module.chunk_gated_delta_rule = self._wrap_qwen35_chunk_rule(module, origin_rule)
+            if origin_forward is not None:
+                module.forward = self._wrap_qwen35_linear_forward(
+                    module,
+                    origin_forward,
+                    origin_rule,
+                    origin_recurrent_rule,
+                )
             module._twinkle_sp_linear_chunk_patched = True
         self.has_qwen35_linear_attn = has_linear_attn
         self.extra_kwargs['has_qwen35_linear_attn'] = has_linear_attn
