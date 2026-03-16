@@ -303,10 +303,13 @@ class _LeftHaloExchangeFn(torch.autograd.Function):
         halo: int,
         seq_dim: int,
         sp_group: Optional[dist.ProcessGroup],
+        tag_base: int,
     ) -> torch.Tensor:
         ctx.halo = int(halo)
         ctx.seq_dim = seq_dim if seq_dim >= 0 else tensor.dim() + seq_dim
         ctx.sp_group = sp_group
+        ctx.forward_tag = int(tag_base) * 2
+        ctx.backward_tag = ctx.forward_tag + 1
         if ctx.halo <= 0 or sp_group is None or dist.get_world_size(sp_group) <= 1:
             ctx.local_seq_len = tensor.size(ctx.seq_dim)
             ctx.prev_rank = None
@@ -330,10 +333,10 @@ class _LeftHaloExchangeFn(torch.autograd.Function):
         left_halo = tensor.new_zeros(halo_shape)
         ops = []
         if prev_rank is not None:
-            ops.append(dist.P2POp(dist.irecv, left_halo, prev_rank, sp_group))
+            ops.append(dist.P2POp(dist.irecv, left_halo, prev_rank, sp_group, ctx.forward_tag))
         if next_rank is not None:
             tail = tensor.narrow(ctx.seq_dim, ctx.local_seq_len - ctx.halo, ctx.halo).contiguous()
-            ops.append(dist.P2POp(dist.isend, tail, next_rank, sp_group))
+            ops.append(dist.P2POp(dist.isend, tail, next_rank, sp_group, ctx.forward_tag))
         if ops:
             reqs = dist.batch_isend_irecv(ops)
             for req in reqs:
@@ -352,12 +355,12 @@ class _LeftHaloExchangeFn(torch.autograd.Function):
         grad_from_next = None
         ops = []
         if ctx.prev_rank is not None:
-            ops.append(dist.P2POp(dist.isend, grad_left, ctx.prev_rank, ctx.sp_group))
+            ops.append(dist.P2POp(dist.isend, grad_left, ctx.prev_rank, ctx.sp_group, ctx.backward_tag))
         if ctx.next_rank is not None:
             halo_shape = list(grad_local.shape)
             halo_shape[ctx.seq_dim] = ctx.halo
             grad_from_next = grad_local.new_zeros(halo_shape)
-            ops.append(dist.P2POp(dist.irecv, grad_from_next, ctx.next_rank, ctx.sp_group))
+            ops.append(dist.P2POp(dist.irecv, grad_from_next, ctx.next_rank, ctx.sp_group, ctx.backward_tag))
         if ops:
             reqs = dist.batch_isend_irecv(ops)
             for req in reqs:
@@ -366,7 +369,7 @@ class _LeftHaloExchangeFn(torch.autograd.Function):
         if grad_from_next is not None:
             grad_local.narrow(ctx.seq_dim, ctx.local_seq_len - ctx.halo, ctx.halo).add_(grad_from_next)
 
-        return grad_local.contiguous(), None, None, None
+        return grad_local.contiguous(), None, None, None, None
 
 
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
@@ -1279,6 +1282,7 @@ class SequenceParallel:
                 halo,
                 -1,
                 self._sp_group,
+                int(getattr(module, 'layer_idx', 0)),
             )
             extended_output = run_origin(extended_x, weight, bias, activation, seq_idx)
             local_seq_len = x.shape[-1]
