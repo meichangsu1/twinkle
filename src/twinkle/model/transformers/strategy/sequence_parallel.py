@@ -856,6 +856,7 @@ class SequenceParallel:
         self.causal_mask_func = None
         self.has_qwen35_linear_attn = False
         self.qwen35_linear_strict_full_seq = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
+        self.qwen35_linear_strict_barrier = os.environ.get('QWEN35_SP_LINEAR_STRICT_BARRIER', '1') == '1'
         self.qwen35_linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
         self.qwen35_linear_disable_gc = os.environ.get(
             'QWEN35_SP_LINEAR_DISABLE_GC',
@@ -1508,13 +1509,24 @@ class SequenceParallel:
                 module.chunk_gated_delta_rule = saved_chunk_rule
                 module.recurrent_gated_delta_rule = saved_recurrent_rule
 
-            return _SplitForwardGatherBackward.apply(
+            local_output = _SplitForwardGatherBackward.apply(
                 full_output,
                 1,
                 self.sp_world_size,
                 self._sp_group,
                 f'{debug_label}:full_output',
             )
+            if self.qwen35_linear_strict_barrier and dist.is_available() and dist.is_initialized():
+                _sp_linear_collective_debug(
+                    f'{debug_label}: before strict global barrier',
+                    self._sp_group,
+                )
+                dist.barrier()
+                _sp_linear_collective_debug(
+                    f'{debug_label}: after strict global barrier',
+                    self._sp_group,
+                )
+            return local_output
 
         wrapped_forward._twinkle_origin_forward = origin_forward
         wrapped_forward._twinkle_wrapped_module = module.__class__.__name__
