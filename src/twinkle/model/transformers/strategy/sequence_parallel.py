@@ -687,10 +687,11 @@ class SequenceParallel:
 
             def _prepare_full_sequence_mask_inputs(config, inputs_embeds, attention_mask, cache_position=None):
                 if (attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() == 2
-                        and getattr(config, '_attn_implementation', None) == 'sdpa'):
-                    # SDPA materializes a 4D causal mask before attention. If we feed it the per-rank 2D padding mask,
-                    # each rank builds the same local causal block, and later gathering only the KV axis produces an
-                    # incorrect global mask. Gather the 2D padding mask first so HF builds the full causal mask once.
+                        and getattr(config, '_attn_implementation', None) in {'sdpa', 'eager'}):
+                    # SDPA/eager both consume a 4D causal mask built from the 2D padding mask before the attention
+                    # kernel runs. If we feed the per-rank 2D padding mask here, each rank builds a local causal
+                    # block; later gathering only the mask tensor cannot recover the true global mask semantics.
+                    # Gather the 2D padding mask first so HF materializes the full causal mask once.
                     attention_mask = _gather_attention_mask_for_sp(
                         attention_mask,
                         local_seq_len=attention_mask.shape[-1],
