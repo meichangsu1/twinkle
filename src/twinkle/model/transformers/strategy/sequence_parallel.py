@@ -11,6 +11,24 @@ from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
 
 
+def _sp_linear_collective_debug_enabled() -> bool:
+    return os.environ.get('QWEN35_SP_LINEAR_DEBUG_COLLECTIVES', '1') == '1'
+
+
+def _sp_linear_collective_debug(message: str, sp_group: Optional[dist.ProcessGroup] = None) -> None:
+    if not _sp_linear_collective_debug_enabled():
+        return
+    global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    group_rank = None
+    if sp_group is not None and dist.is_available() and dist.is_initialized():
+        group_rank = dist.get_rank(sp_group)
+    prefix = f'[QWEN35_SP_LINEAR_DEBUG][global_rank={global_rank}'
+    if group_rank is not None:
+        prefix += f', sp_rank={group_rank}'
+    prefix += ']'
+    print(f'{prefix} {message}', flush=True)
+
+
 def get_config_attr(config, key, default=None):
     return getattr(config, key, default)
 
@@ -548,18 +566,33 @@ class _GatherForwardSplitBackward(torch.autograd.Function):
         gather_dim: int,
         sp_world_size: Optional[int],
         sp_group: Optional[dist.ProcessGroup],
+        debug_label: Optional[str],
     ) -> torch.Tensor:
         ctx.gather_dim = gather_dim
         ctx.sp_world_size = sp_world_size
         ctx.sp_group = sp_group
+        ctx.debug_label = debug_label or 'gather_forward_split_backward'
         if sp_world_size is None or sp_world_size <= 1 or sp_group is None:
             return tensor
-        return _gather_tensor_along_dim_for_sp(tensor, gather_dim, sp_world_size, sp_group)
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: before forward gather dim={gather_dim}, shape={tuple(tensor.shape)}',
+            sp_group,
+        )
+        output = _gather_tensor_along_dim_for_sp(tensor, gather_dim, sp_world_size, sp_group)
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: after forward gather shape={tuple(output.shape)}',
+            sp_group,
+        )
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         if ctx.sp_world_size is None or ctx.sp_world_size <= 1 or ctx.sp_group is None:
-            return grad_output, None, None, None
+            return grad_output, None, None, None, None
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: before backward split dim={ctx.gather_dim}, shape={tuple(grad_output.shape)}',
+            ctx.sp_group,
+        )
         rank = dist.get_rank(ctx.sp_group)
         gather_dim = ctx.gather_dim if ctx.gather_dim >= 0 else grad_output.dim() + ctx.gather_dim
         dim_size = grad_output.size(gather_dim)
@@ -570,7 +603,11 @@ class _GatherForwardSplitBackward(torch.autograd.Function):
             )
         local_size = dim_size // ctx.sp_world_size
         grad_input = torch.split(grad_output.contiguous(), local_size, dim=gather_dim)[rank].contiguous()
-        return grad_input, None, None, None
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: after backward split shape={tuple(grad_input.shape)}',
+            ctx.sp_group,
+        )
+        return grad_input, None, None, None, None
 
 
 class _SplitForwardGatherBackward(torch.autograd.Function):
@@ -582,12 +619,18 @@ class _SplitForwardGatherBackward(torch.autograd.Function):
         split_dim: int,
         sp_world_size: Optional[int],
         sp_group: Optional[dist.ProcessGroup],
+        debug_label: Optional[str],
     ) -> torch.Tensor:
         ctx.split_dim = split_dim
         ctx.sp_world_size = sp_world_size
         ctx.sp_group = sp_group
+        ctx.debug_label = debug_label or 'split_forward_gather_backward'
         if sp_world_size is None or sp_world_size <= 1 or sp_group is None:
             return tensor
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: before forward split dim={split_dim}, shape={tuple(tensor.shape)}',
+            sp_group,
+        )
         rank = dist.get_rank(sp_group)
         split_dim = split_dim if split_dim >= 0 else tensor.dim() + split_dim
         dim_size = tensor.size(split_dim)
@@ -596,19 +639,32 @@ class _SplitForwardGatherBackward(torch.autograd.Function):
                 f'Cannot split tensor size {dim_size} on dim {split_dim} by sp_world_size={sp_world_size}.'
             )
         local_size = dim_size // sp_world_size
-        return torch.split(tensor.contiguous(), local_size, dim=split_dim)[rank].contiguous()
+        output = torch.split(tensor.contiguous(), local_size, dim=split_dim)[rank].contiguous()
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: after forward split shape={tuple(output.shape)}',
+            sp_group,
+        )
+        return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         if ctx.sp_world_size is None or ctx.sp_world_size <= 1 or ctx.sp_group is None:
-            return grad_output, None, None, None
+            return grad_output, None, None, None, None
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: before backward gather dim={ctx.split_dim}, shape={tuple(grad_output.shape)}',
+            ctx.sp_group,
+        )
         grad_input = _gather_tensor_along_dim_for_sp(
             grad_output.contiguous(),
             ctx.split_dim,
             ctx.sp_world_size,
             ctx.sp_group,
         )
-        return grad_input, None, None, None
+        _sp_linear_collective_debug(
+            f'{ctx.debug_label}: after backward gather shape={tuple(grad_input.shape)}',
+            ctx.sp_group,
+        )
+        return grad_input, None, None, None, None
 
 
 # Code borrowed from deepspeed, here is why:
@@ -774,6 +830,10 @@ class SequenceParallel:
         self.has_qwen35_linear_attn = False
         self.qwen35_linear_strict_full_seq = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
         self.qwen35_linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
+        self.qwen35_linear_disable_gc = os.environ.get(
+            'QWEN35_SP_LINEAR_DISABLE_GC',
+            os.environ.get('QWEN35_SP_LINEAR_CONV_HALO_DISABLE_GC', '1'),
+        ) == '1'
         self.qwen35_linear_conv_halo_disable_gc = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO_DISABLE_GC', '1') == '1'
         self.extra_kwargs = {}
 
@@ -1363,10 +1423,18 @@ class SequenceParallel:
                 finally:
                     module.causal_conv1d_fn = saved_causal_conv1d_fn
 
+            layer_idx = int(getattr(module, 'layer_idx', 0))
+            debug_label = f'qwen35_linear_layer_{layer_idx}'
             full_hidden_states = _GatherForwardSplitBackward.apply(
                 hidden_states,
                 1,
                 self.sp_world_size,
+                self._sp_group,
+                f'{debug_label}:hidden_states',
+            )
+            _sp_linear_collective_debug(
+                f'{debug_label}: before gather attention_mask '
+                f'shape={None if attention_mask is None else tuple(attention_mask.shape)}',
                 self._sp_group,
             )
             full_attention_mask = _gather_attention_mask_for_sp(
@@ -1374,6 +1442,11 @@ class SequenceParallel:
                 local_seq_len=hidden_states.shape[1],
                 sp_world_size=self.sp_world_size,
                 sp_group=self._sp_group,
+            )
+            _sp_linear_collective_debug(
+                f'{debug_label}: after gather attention_mask '
+                f'shape={None if full_attention_mask is None else tuple(full_attention_mask.shape)}',
+                self._sp_group,
             )
             full_cache_position = cache_position
             if full_cache_position is not None and torch.is_tensor(full_cache_position):
@@ -1390,11 +1463,19 @@ class SequenceParallel:
             if origin_recurrent_rule is not None:
                 module.recurrent_gated_delta_rule = origin_recurrent_rule
             try:
+                _sp_linear_collective_debug(
+                    f'{debug_label}: before origin_forward full_hidden_states shape={tuple(full_hidden_states.shape)}',
+                    self._sp_group,
+                )
                 full_output = origin_forward(
                     full_hidden_states,
                     cache_params=cache_params,
                     cache_position=full_cache_position,
                     attention_mask=full_attention_mask,
+                )
+                _sp_linear_collective_debug(
+                    f'{debug_label}: after origin_forward full_output shape={tuple(full_output.shape)}',
+                    self._sp_group,
                 )
             finally:
                 module.chunk_gated_delta_rule = saved_chunk_rule
@@ -1405,6 +1486,7 @@ class SequenceParallel:
                 1,
                 self.sp_world_size,
                 self._sp_group,
+                f'{debug_label}:full_output',
             )
 
         wrapped_forward._twinkle_origin_forward = origin_forward
@@ -1532,13 +1614,21 @@ class SequenceParallel:
         disabled = False
         visited = set()
         candidates = [model]
-        llm_model = get_llm_model(model)
-        if llm_model is not model:
-            candidates.append(llm_model)
+        llm_outer = get_llm_model(model, inner_backbone=False)
+        llm_model = get_llm_model(model, inner_backbone=True)
+        for candidate in (llm_outer, llm_model):
+            if candidate is not None and candidate is not model:
+                candidates.append(candidate)
         for candidate in candidates:
             if candidate is None or id(candidate) in visited:
                 continue
             visited.add(id(candidate))
+            if hasattr(candidate, 'gradient_checkpointing'):
+                try:
+                    candidate.gradient_checkpointing = False
+                    disabled = True
+                except Exception:
+                    pass
             if hasattr(candidate, 'gradient_checkpointing_disable'):
                 try:
                     candidate.gradient_checkpointing_disable()
@@ -1549,6 +1639,11 @@ class SequenceParallel:
             if candidate_config is not None and hasattr(candidate_config, 'use_cache'):
                 try:
                     candidate_config.use_cache = False
+                except Exception:
+                    pass
+            if candidate_config is not None and hasattr(candidate_config, 'gradient_checkpointing'):
+                try:
+                    candidate_config.gradient_checkpointing = False
                 except Exception:
                     pass
             for module in candidate.modules():
@@ -1599,17 +1694,16 @@ class SequenceParallel:
         # Model-specific patch: Qwen3.5 linear attention state passing for SP.
         self._prepare_qwen35_linear_attn(llm_model)
         if (
-            self.qwen35_linear_conv_halo
-            and not self.qwen35_linear_strict_full_seq
+            (self.qwen35_linear_conv_halo or self.qwen35_linear_strict_full_seq)
             and self.has_qwen35_linear_attn
-            and self.qwen35_linear_conv_halo_disable_gc
+            and self.qwen35_linear_disable_gc
         ):
             was_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
             if not was_gc_enabled:
                 was_gc_enabled = bool(getattr(llm_model, 'is_gradient_checkpointing', False))
             if was_gc_enabled:
                 disabled = self._disable_gradient_checkpointing_for_model(model)
-                self.extra_kwargs['qwen35_linear_conv_halo_disabled_gradient_checkpointing'] = disabled
+                self.extra_kwargs['qwen35_linear_disabled_gradient_checkpointing'] = disabled
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
