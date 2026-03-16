@@ -1,9 +1,53 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
 import os
 import unittest
 
 import torch
 import torch.distributed as dist
+
+
+def _force_qwen35_linear_recurrent(model: torch.nn.Module) -> int:
+    patched = 0
+    for module in model.modules():
+        if module.__class__.__name__ != 'Qwen3_5GatedDeltaNet':
+            continue
+        module_impl = importlib.import_module(module.__class__.__module__)
+        recurrent_rule = getattr(module_impl, 'torch_recurrent_gated_delta_rule', None)
+        if recurrent_rule is None:
+            recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
+        if recurrent_rule is None:
+            raise RuntimeError('Qwen3.5 torch_recurrent_gated_delta_rule is unavailable.')
+
+        def recurrent_adapter(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            chunk_size=None,
+            initial_state=None,
+            output_final_state: bool = False,
+            use_qk_l2norm_in_kernel: bool = False,
+            _rule=recurrent_rule,
+        ):
+            return _rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        module.chunk_gated_delta_rule = recurrent_adapter
+        module.recurrent_gated_delta_rule = recurrent_adapter
+        patched += 1
+    if patched == 0:
+        raise RuntimeError('Qwen3.5 linear-attention modules were not found.')
+    return patched
 
 
 class TestQwen35SPFSDPSmoke(unittest.TestCase):
@@ -58,6 +102,7 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
 
         local_files_only = os.environ.get('QWEN35_LOCAL_ONLY', '1') == '1'
         attn_impl = os.environ.get('QWEN35_SP_SMOKE_ATTN_IMPL', 'sdpa')
+        force_recurrent = os.environ.get('QWEN35_SP_FORCE_RECURRENT', '0') == '1'
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=True,
@@ -70,6 +115,8 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
             local_files_only=local_files_only,
             attn_implementation=attn_impl,
         ).to(device)
+        if force_recurrent:
+            _force_qwen35_linear_recurrent(model)
         model.train()
 
         world_size = dist.get_world_size()

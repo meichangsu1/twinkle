@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
 import math
 import os
 import unittest
@@ -55,6 +56,49 @@ def _quantile_via_kthvalue(tensor: torch.Tensor, q: float) -> torch.Tensor:
         return flat[0]
     k = min(flat.numel(), max(1, math.ceil(q * flat.numel())))
     return flat.kthvalue(k).values
+
+
+def _force_qwen35_linear_recurrent(model: torch.nn.Module) -> int:
+    patched = 0
+    for module in model.modules():
+        if module.__class__.__name__ != 'Qwen3_5GatedDeltaNet':
+            continue
+        module_impl = importlib.import_module(module.__class__.__module__)
+        recurrent_rule = getattr(module_impl, 'torch_recurrent_gated_delta_rule', None)
+        if recurrent_rule is None:
+            recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
+        if recurrent_rule is None:
+            raise RuntimeError('Qwen3.5 torch_recurrent_gated_delta_rule is unavailable.')
+
+        def recurrent_adapter(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            chunk_size=None,
+            initial_state=None,
+            output_final_state: bool = False,
+            use_qk_l2norm_in_kernel: bool = False,
+            _rule=recurrent_rule,
+        ):
+            return _rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        module.chunk_gated_delta_rule = recurrent_adapter
+        module.recurrent_gated_delta_rule = recurrent_adapter
+        patched += 1
+    if patched == 0:
+        raise RuntimeError('Qwen3.5 linear-attention modules were not found.')
+    return patched
 
 
 class TestQwen35SPParity(unittest.TestCase):
@@ -127,6 +171,7 @@ class TestQwen35SPParity(unittest.TestCase):
         # or numerical/runtime quirks in the local CUDA environment. Override explicitly to debug FA2.
         attn_impl = os.environ.get('QWEN35_SP_PARITY_ATTN_IMPL', 'sdpa')
         model_dtype = _resolve_torch_dtype(os.environ.get('QWEN35_SP_PARITY_DTYPE', 'bfloat16'))
+        force_recurrent = os.environ.get('QWEN35_SP_FORCE_RECURRENT', '0') == '1'
 
         try:
             import numpy as np
@@ -163,6 +208,9 @@ class TestQwen35SPParity(unittest.TestCase):
             local_files_only=local_files_only,
             attn_implementation=attn_impl,
         ).to(device)
+        forced_recurrent_layers = 0
+        if force_recurrent:
+            forced_recurrent_layers = _force_qwen35_linear_recurrent(base_model)
         base_model.eval()
         base_fsdp = FSDP(base_model, use_orig_params=True, device_id=device)
         base_outputs = base_fsdp(
@@ -194,6 +242,8 @@ class TestQwen35SPParity(unittest.TestCase):
             local_files_only=local_files_only,
             attn_implementation=attn_impl,
         ).to(device)
+        if force_recurrent:
+            forced_recurrent_layers = _force_qwen35_linear_recurrent(sp_model)
         sp_model.eval()
         device_mesh = DeviceMesh(
             device_type='cuda',
@@ -254,7 +304,8 @@ class TestQwen35SPParity(unittest.TestCase):
             f'p99_abs_diff={p99_abs_diff.item():.6f}, '
             f'local_max_abs_diff={local_max_abs_diff.item():.6f}, '
             f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}, '
-            f'dtype={str(model_dtype).replace("torch.", "")}'
+            f'dtype={str(model_dtype).replace("torch.", "")}, '
+            f'force_recurrent={force_recurrent}, forced_recurrent_layers={forced_recurrent_layers}'
         )
 
         if os.environ.get('QWEN35_SP_PARITY_DEBUG', '0') == '1' and rank == 0:
