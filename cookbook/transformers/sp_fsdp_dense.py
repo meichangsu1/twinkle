@@ -10,7 +10,7 @@ from functools import partial
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger, torch_util
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -95,7 +95,11 @@ def _create_model(num_training_steps: int) -> TransformersModel:
 
 
 def _clone_state_dict(state_dict):
-    return {k: v.detach().float().cpu().clone() for k, v in state_dict.items()}
+    cloned = {}
+    for key, value in state_dict.items():
+        value = torch_util.to_local_tensor(value)
+        cloned[key] = value.detach().float().cpu().clone()
+    return cloned
 
 
 def _state_delta_stats(before, after):
