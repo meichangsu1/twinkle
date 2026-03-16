@@ -294,6 +294,81 @@ class _QwenLinearStateParallelFn(torch.autograd.Function):
         return grad_query, grad_key, grad_value, grad_g, grad_beta, None, None, None, None
 
 
+class _LeftHaloExchangeFn(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        halo: int,
+        seq_dim: int,
+        sp_group: Optional[dist.ProcessGroup],
+    ) -> torch.Tensor:
+        ctx.halo = int(halo)
+        ctx.seq_dim = seq_dim if seq_dim >= 0 else tensor.dim() + seq_dim
+        ctx.sp_group = sp_group
+        if ctx.halo <= 0 or sp_group is None or dist.get_world_size(sp_group) <= 1:
+            ctx.local_seq_len = tensor.size(ctx.seq_dim)
+            ctx.prev_rank = None
+            ctx.next_rank = None
+            return tensor
+
+        ctx.local_seq_len = tensor.size(ctx.seq_dim)
+        if ctx.local_seq_len < ctx.halo:
+            raise RuntimeError(
+                'SequenceParallel: local sequence length must be at least halo size for Qwen3.5 conv halo exchange. '
+                f'local_seq_len={ctx.local_seq_len}, halo={ctx.halo}. '
+                'Use QWEN35_SP_LINEAR_STRICT=1 for very short local sequences.'
+            )
+
+        _, _, prev_rank, next_rank = _sp_prev_next_rank(sp_group)
+        ctx.prev_rank = prev_rank
+        ctx.next_rank = next_rank
+
+        halo_shape = list(tensor.shape)
+        halo_shape[ctx.seq_dim] = ctx.halo
+        left_halo = tensor.new_zeros(halo_shape)
+        ops = []
+        if prev_rank is not None:
+            ops.append(dist.P2POp(dist.irecv, left_halo, prev_rank, sp_group))
+        if next_rank is not None:
+            tail = tensor.narrow(ctx.seq_dim, ctx.local_seq_len - ctx.halo, ctx.halo).contiguous()
+            ops.append(dist.P2POp(dist.isend, tail, next_rank, sp_group))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+        return torch.cat([left_halo, tensor], dim=ctx.seq_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.halo <= 0 or ctx.sp_group is None or dist.get_world_size(ctx.sp_group) <= 1:
+            return grad_output, None, None, None
+
+        grad_left = grad_output.narrow(ctx.seq_dim, 0, ctx.halo).contiguous()
+        grad_local = grad_output.narrow(ctx.seq_dim, ctx.halo, ctx.local_seq_len).contiguous()
+
+        grad_from_next = None
+        ops = []
+        if ctx.prev_rank is not None:
+            ops.append(dist.P2POp(dist.isend, grad_left, ctx.prev_rank, ctx.sp_group))
+        if ctx.next_rank is not None:
+            halo_shape = list(grad_local.shape)
+            halo_shape[ctx.seq_dim] = ctx.halo
+            grad_from_next = grad_local.new_zeros(halo_shape)
+            ops.append(dist.P2POp(dist.irecv, grad_from_next, ctx.next_rank, ctx.sp_group))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+        if grad_from_next is not None:
+            grad_local.narrow(ctx.seq_dim, ctx.local_seq_len - ctx.halo, ctx.halo).add_(grad_from_next)
+
+        return grad_local.contiguous(), None, None, None
+
+
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
     dp_world_size = device_mesh.dp_world_size or 1
     fsdp_world_size = device_mesh.fsdp_world_size or 1
@@ -695,6 +770,7 @@ class SequenceParallel:
         self.causal_mask_func = None
         self.has_qwen35_linear_attn = False
         self.qwen35_linear_strict_full_seq = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
+        self.qwen35_linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
         self.extra_kwargs = {}
 
     @property
@@ -1145,13 +1221,83 @@ class SequenceParallel:
         wrapped_chunk_rule._twinkle_wrapped_module = module.__class__.__name__
         return wrapped_chunk_rule
 
+    def _wrap_qwen35_causal_conv1d_fn(
+        self,
+        module: torch.nn.Module,
+        origin_causal_conv1d_fn,
+    ):
+
+        def run_origin(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            activation: str,
+            seq_idx=None,
+        ) -> torch.Tensor:
+            if origin_causal_conv1d_fn is not None:
+                return origin_causal_conv1d_fn(
+                    x=x,
+                    weight=weight,
+                    bias=bias,
+                    activation=activation,
+                    seq_idx=seq_idx,
+                )
+            conv_weight = weight.unsqueeze(1) if weight.dim() == 2 else weight
+            conv_bias = bias if bias is not None else module.conv1d.bias
+            conv_output = torch.nn.functional.conv1d(
+                x,
+                conv_weight,
+                bias=conv_bias,
+                padding=module.conv_kernel_size - 1,
+                groups=module.conv_dim,
+            )
+            conv_output = conv_output[:, :, :x.shape[-1]]
+            return module.act(conv_output)
+
+        def wrapped_causal_conv1d(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor],
+            activation: str,
+            seq_idx=None,
+        ) -> torch.Tensor:
+            if (
+                not self.qwen35_linear_conv_halo
+                or self.qwen35_linear_strict_full_seq
+                or self.sp_world_size is None
+                or self.sp_world_size <= 1
+                or self._sp_group is None
+            ):
+                return run_origin(x, weight, bias, activation, seq_idx)
+
+            halo = int(module.conv_kernel_size) - 1
+            if halo <= 0:
+                return run_origin(x, weight, bias, activation, seq_idx)
+
+            extended_x = _LeftHaloExchangeFn.apply(
+                x.contiguous(),
+                halo,
+                -1,
+                self._sp_group,
+            )
+            extended_output = run_origin(extended_x, weight, bias, activation, seq_idx)
+            local_seq_len = x.shape[-1]
+            return extended_output.narrow(-1, halo, local_seq_len).contiguous()
+
+        wrapped_causal_conv1d._twinkle_origin_causal_conv1d_fn = origin_causal_conv1d_fn
+        wrapped_causal_conv1d._twinkle_wrapped_module = module.__class__.__name__
+        return wrapped_causal_conv1d
+
     def _wrap_qwen35_linear_forward(
         self,
         module: torch.nn.Module,
         origin_forward,
         origin_chunk_rule,
         origin_recurrent_rule,
+        origin_causal_conv1d_fn,
     ):
+
+        halo_causal_conv1d_fn = self._wrap_qwen35_causal_conv1d_fn(module, origin_causal_conv1d_fn)
 
         def wrapped_forward(
             hidden_states: torch.Tensor,
@@ -1159,8 +1305,9 @@ class SequenceParallel:
             cache_position: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
         ):
+            linear_sp_enabled = self.qwen35_linear_strict_full_seq or self.qwen35_linear_conv_halo
             if (
-                not self.qwen35_linear_strict_full_seq
+                not linear_sp_enabled
                 or self.sp_world_size is None
                 or self.sp_world_size <= 1
                 or self._sp_group is None
@@ -1174,8 +1321,8 @@ class SequenceParallel:
 
             if self.extra_kwargs.get('is_packed', False):
                 raise RuntimeError(
-                    'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP strict '
-                    'full-sequence mode.'
+                    'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP '
+                    'strict/halo modes.'
                 )
 
             use_precomputed_states = (
@@ -1193,6 +1340,23 @@ class SequenceParallel:
                     cache_position=cache_position,
                     attention_mask=attention_mask,
                 )
+
+            if (
+                self.qwen35_linear_conv_halo
+                and not self.qwen35_linear_strict_full_seq
+                and not use_precomputed_states
+            ):
+                saved_causal_conv1d_fn = module.causal_conv1d_fn
+                module.causal_conv1d_fn = halo_causal_conv1d_fn
+                try:
+                    return origin_forward(
+                        hidden_states,
+                        cache_params=cache_params,
+                        cache_position=cache_position,
+                        attention_mask=attention_mask,
+                    )
+                finally:
+                    module.causal_conv1d_fn = saved_causal_conv1d_fn
 
             full_hidden_states = _GatherForwardSplitBackward.apply(
                 hidden_states,
@@ -1267,6 +1431,7 @@ class SequenceParallel:
                     origin_forward,
                     origin_rule,
                     origin_recurrent_rule,
+                    getattr(module, 'causal_conv1d_fn', None),
                 )
             module._twinkle_sp_linear_chunk_patched = True
         self.has_qwen35_linear_attn = has_linear_attn
