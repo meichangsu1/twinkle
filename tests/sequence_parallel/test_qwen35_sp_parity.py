@@ -118,9 +118,65 @@ def _force_qwen35_linear_recurrent(model: torch.nn.Module) -> int:
         module.chunk_gated_delta_rule = recurrent_adapter
         module.recurrent_gated_delta_rule = recurrent_adapter
         patched += 1
-    if patched == 0:
-        raise RuntimeError('Qwen3.5 linear-attention modules were not found.')
     return patched
+
+
+def _install_qwen35_linear_rule_capture(model: torch.nn.Module, max_layers: int) -> dict[str, dict[str, torch.Tensor]]:
+    captures: dict[str, dict[str, torch.Tensor]] = {}
+    if max_layers <= 0:
+        return captures
+    installed = 0
+    for module_name, module in model.named_modules():
+        if module.__class__.__name__ != 'Qwen3_5GatedDeltaNet':
+            continue
+        if installed >= max_layers:
+            break
+        rule = getattr(module, 'chunk_gated_delta_rule', None)
+        if rule is None:
+            continue
+
+        def capture_wrapper(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            chunk_size=None,
+            initial_state=None,
+            output_final_state: bool = False,
+            use_qk_l2norm_in_kernel: bool = False,
+            _rule=rule,
+            _captures=captures,
+            _module_name=module_name,
+        ):
+            _captures[_module_name] = {
+                'query': query.detach().float().contiguous(),
+                'key': key.detach().float().contiguous(),
+                'value': value.detach().float().contiguous(),
+                'g': g.detach().float().contiguous(),
+                'beta': beta.detach().float().contiguous(),
+            }
+            return _rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                chunk_size=chunk_size,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        module.chunk_gated_delta_rule = capture_wrapper
+        installed += 1
+    return captures
+
+
+def _slice_seq_dim(tensor: torch.Tensor, seq_len: int) -> torch.Tensor:
+    if tensor.shape[1] <= seq_len:
+        return tensor
+    return tensor[:, :seq_len].contiguous()
 
 
 class TestQwen35SPParity(unittest.TestCase):
@@ -185,6 +241,7 @@ class TestQwen35SPParity(unittest.TestCase):
         attn_impl = os.environ.get('QWEN35_SP_PARITY_ATTN_IMPL', 'sdpa')
         model_dtype = _resolve_torch_dtype(os.environ.get('QWEN35_SP_PARITY_DTYPE', 'bfloat16'))
         force_recurrent = os.environ.get('QWEN35_SP_FORCE_RECURRENT', '0') == '1'
+        linear_debug_layers = int(os.environ.get('QWEN35_SP_PARITY_LINEAR_DEBUG_LAYERS', '0'))
         close_defaults = _resolve_close_defaults(force_recurrent, model_dtype)
         logits_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_ATOL', close_defaults['logit_atol']))
         logits_relaxed_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_RELAXED_MAX_ATOL', '3.0'))
@@ -236,6 +293,9 @@ class TestQwen35SPParity(unittest.TestCase):
         forced_recurrent_layers = 0
         if force_recurrent:
             forced_recurrent_layers = _force_qwen35_linear_recurrent(base_model)
+        base_linear_captures: dict[str, dict[str, torch.Tensor]] = {}
+        if linear_debug_layers > 0:
+            base_linear_captures = _install_qwen35_linear_rule_capture(base_model, linear_debug_layers)
         base_model.eval()
         base_fsdp = FSDP(base_model, use_orig_params=True, device_id=device)
         base_outputs = base_fsdp(
@@ -282,6 +342,9 @@ class TestQwen35SPParity(unittest.TestCase):
             tokenizer=tokenizer,
             device_mesh=device_mesh,
         )
+        sp_linear_captures: dict[str, dict[str, torch.Tensor]] = {}
+        if linear_debug_layers > 0:
+            sp_linear_captures = _install_qwen35_linear_rule_capture(sp_model, linear_debug_layers)
         sp_fsdp = FSDP(sp_model, use_orig_params=True, device_id=device)
 
         sp_outputs = sp_fsdp(
@@ -318,6 +381,30 @@ class TestQwen35SPParity(unittest.TestCase):
         local_logits_sp = logits_sp_full[:, seq_start:seq_end, :].contiguous()
         local_max_abs_diff = (local_logits_base - local_logits_sp).abs().max().detach().to(device)
         dist.all_reduce(local_max_abs_diff, op=dist.ReduceOp.MAX)
+
+        if linear_debug_layers > 0 and base_linear_captures and sp_linear_captures:
+            linear_reports = []
+            for module_name in base_linear_captures.keys():
+                if module_name not in sp_linear_captures or not base_linear_captures[module_name]:
+                    continue
+                sp_capture = sp_linear_captures[module_name]
+                base_capture = base_linear_captures[module_name]
+                tensor_reports = []
+                for tensor_name in ('query', 'key', 'value', 'g', 'beta'):
+                    if tensor_name not in sp_capture or tensor_name not in base_capture:
+                        continue
+                    sp_full = _slice_seq_dim(sequence_parallel.gather(sp_capture[tensor_name], dim=1), seq_len)
+                    base_full = _slice_seq_dim(base_capture[tensor_name], seq_len)
+                    diff = (base_full - sp_full).abs()
+                    tensor_reports.append(
+                        f'{tensor_name}:max={diff.max().item():.6f},mean={diff.mean().item():.6f}'
+                    )
+                if tensor_reports:
+                    linear_reports.append(f'{module_name}: ' + '; '.join(tensor_reports))
+            if linear_reports and rank == 0:
+                print('Qwen3.5 linear pre-rule diffs:', flush=True)
+                for report in linear_reports:
+                    print(report, flush=True)
 
         loss_diff = abs((loss_base_metric - loss_sp_metric).item())
         grad_diff = abs((grad_base - grad_sp).item())

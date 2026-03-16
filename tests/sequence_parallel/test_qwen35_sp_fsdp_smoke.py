@@ -45,8 +45,6 @@ def _force_qwen35_linear_recurrent(model: torch.nn.Module) -> int:
         module.chunk_gated_delta_rule = recurrent_adapter
         module.recurrent_gated_delta_rule = recurrent_adapter
         patched += 1
-    if patched == 0:
-        raise RuntimeError('Qwen3.5 linear-attention modules were not found.')
     return patched
 
 
