@@ -33,6 +33,24 @@ def _sp_qwen35_decoder_debug_enabled() -> bool:
     return os.environ.get('QWEN35_SP_DEBUG_DECODER_LAYERS', '0') == '1'
 
 
+def _sp_runtime_diagnostics_enabled() -> bool:
+    return os.environ.get('QWEN35_SP_RUNTIME_DIAGNOSTICS', '0') == '1'
+
+
+def _sp_runtime_diagnostics(message: str, sp_group: Optional[dist.ProcessGroup] = None) -> None:
+    if not _sp_runtime_diagnostics_enabled():
+        return
+    global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    group_rank = None
+    if sp_group is not None and dist.is_available() and dist.is_initialized():
+        group_rank = dist.get_rank(sp_group)
+    prefix = f'[QWEN35_SP_RUNTIME][global_rank={global_rank}'
+    if group_rank is not None:
+        prefix += f', sp_rank={group_rank}'
+    prefix += ']'
+    print(f'{prefix} {message}', flush=True)
+
+
 def get_config_attr(config, key, default=None):
     return getattr(config, key, default)
 
@@ -864,6 +882,9 @@ class SequenceParallel:
         ) == '1'
         self.qwen35_linear_conv_halo_disable_gc = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO_DISABLE_GC', '1') == '1'
         self.extra_kwargs = {}
+        self._runtime_diag_init_reported = False
+        self._runtime_diag_forward_reported = False
+        self._runtime_diag_linear_mode_reported = False
 
     @property
     def real_position_ids(self) -> torch.Tensor:
@@ -1439,6 +1460,14 @@ class SequenceParallel:
                 and not self.qwen35_linear_strict_full_seq
                 and not use_precomputed_states
             ):
+                if not self._runtime_diag_linear_mode_reported:
+                    self._runtime_diag_linear_mode_reported = True
+                    _sp_runtime_diagnostics(
+                        'qwen35_linear_mode=halo+state_parallel '
+                        f'layer_idx={getattr(module, "layer_idx", -1)} '
+                        f'use_precomputed_states={use_precomputed_states}',
+                        self._sp_group,
+                    )
                 saved_causal_conv1d_fn = module.causal_conv1d_fn
                 module.causal_conv1d_fn = halo_causal_conv1d_fn
                 try:
@@ -1451,6 +1480,14 @@ class SequenceParallel:
                 finally:
                     module.causal_conv1d_fn = saved_causal_conv1d_fn
 
+            if not self._runtime_diag_linear_mode_reported:
+                self._runtime_diag_linear_mode_reported = True
+                _sp_runtime_diagnostics(
+                    'qwen35_linear_mode=strict_full_seq '
+                    f'layer_idx={getattr(module, "layer_idx", -1)} '
+                    f'use_precomputed_states={use_precomputed_states}',
+                    self._sp_group,
+                )
             layer_idx = int(getattr(module, 'layer_idx', 0))
             debug_label = f'qwen35_linear_layer_{layer_idx}'
             full_hidden_states = _GatherForwardSplitBackward.apply(
@@ -1788,6 +1825,17 @@ class SequenceParallel:
             kwargs['attention_mask'] = attention_mask
             for i, name in enumerate(extra_names):
                 kwargs[name] = extra_values[i]
+            if not self._runtime_diag_forward_reported:
+                self._runtime_diag_forward_reported = True
+                _sp_runtime_diagnostics(
+                    'first_forward '
+                    f'input_ids={None if input_ids is None else tuple(input_ids.shape)} '
+                    f'inputs_embeds={None if inputs_embeds is None else tuple(inputs_embeds.shape)} '
+                    f'position_ids={None if position_ids is None else tuple(position_ids.shape)} '
+                    f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)} '
+                    f'is_packed={self.extra_kwargs.get("is_packed", False)}',
+                    self._sp_group,
+                )
             return args, kwargs
 
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
@@ -1930,6 +1978,23 @@ class SequenceParallel:
             if was_gc_enabled:
                 disabled = self._disable_gradient_checkpointing_for_model(model)
                 self.extra_kwargs['qwen35_linear_disabled_gradient_checkpointing'] = disabled
+        if not self._runtime_diag_init_reported:
+            self._runtime_diag_init_reported = True
+            _sp_runtime_diagnostics(
+                'initialized '
+                f'sp_world_size={self.sp_world_size} '
+                f'world_size={self.world_size} '
+                f'attn_impl={getattr(getattr(llm_model, "config", None), "_attn_implementation", "unknown")} '
+                f'has_qwen35_linear_attn={self.has_qwen35_linear_attn} '
+                f'linear_strict={self.qwen35_linear_strict_full_seq} '
+                f'strict_barrier={self.qwen35_linear_strict_barrier} '
+                f'linear_conv_halo={self.qwen35_linear_conv_halo} '
+                f'linear_disable_gc={self.qwen35_linear_disable_gc} '
+                f'disabled_gc={self.extra_kwargs.get("qwen35_linear_disabled_gradient_checkpointing", False)} '
+                f'model_gc={getattr(model, "is_gradient_checkpointing", False)} '
+                f'llm_gc={getattr(llm_model, "is_gradient_checkpointing", False)}',
+                self._sp_group,
+            )
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
