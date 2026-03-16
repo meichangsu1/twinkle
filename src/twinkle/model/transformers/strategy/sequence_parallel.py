@@ -1527,6 +1527,44 @@ class SequenceParallel:
                 return True
         return False
 
+    @staticmethod
+    def _disable_gradient_checkpointing_for_model(model: torch.nn.Module) -> bool:
+        disabled = False
+        visited = set()
+        candidates = [model]
+        llm_model = get_llm_model(model)
+        if llm_model is not model:
+            candidates.append(llm_model)
+        for candidate in candidates:
+            if candidate is None or id(candidate) in visited:
+                continue
+            visited.add(id(candidate))
+            if hasattr(candidate, 'gradient_checkpointing_disable'):
+                try:
+                    candidate.gradient_checkpointing_disable()
+                    disabled = True
+                except Exception:
+                    pass
+            candidate_config = getattr(candidate, 'config', None)
+            if candidate_config is not None and hasattr(candidate_config, 'use_cache'):
+                try:
+                    candidate_config.use_cache = False
+                except Exception:
+                    pass
+            for module in candidate.modules():
+                if hasattr(module, 'gradient_checkpointing'):
+                    try:
+                        module.gradient_checkpointing = False
+                        disabled = True
+                    except Exception:
+                        pass
+                if hasattr(module, '_gradient_checkpointing_func'):
+                    try:
+                        module._gradient_checkpointing_func = None
+                    except Exception:
+                        pass
+        return disabled
+
     def prepare(
         self,
         sp_size: int,
@@ -1566,10 +1604,12 @@ class SequenceParallel:
             and self.has_qwen35_linear_attn
             and self.qwen35_linear_conv_halo_disable_gc
         ):
-            is_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
-            if is_gc_enabled and hasattr(model, 'gradient_checkpointing_disable'):
-                model.gradient_checkpointing_disable()
-                self.extra_kwargs['qwen35_linear_conv_halo_disabled_gradient_checkpointing'] = True
+            was_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
+            if not was_gc_enabled:
+                was_gc_enabled = bool(getattr(llm_model, 'is_gradient_checkpointing', False))
+            if was_gc_enabled:
+                disabled = self._disable_gradient_checkpointing_for_model(model)
+                self.extra_kwargs['qwen35_linear_conv_halo_disabled_gradient_checkpointing'] = disabled
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
