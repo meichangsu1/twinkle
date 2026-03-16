@@ -5,6 +5,7 @@ import tempfile
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from functools import partial
 from peft import LoraConfig
 
@@ -67,6 +68,11 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _maybe_barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 def _create_model(num_training_steps: int) -> TransformersModel:
@@ -251,9 +257,11 @@ def single_batch_diagnostic():
         adapter_name='default',
         save_optimizer=True,
     )
+    _maybe_barrier()
 
     def reset_model_state():
         model.load(checkpoint_dir, adapter_name='default', load_optimizer=True)
+        _maybe_barrier()
         model.zero_grad(adapter_name='default')
 
     experiments = []
