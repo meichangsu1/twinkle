@@ -58,6 +58,28 @@ def _quantile_via_kthvalue(tensor: torch.Tensor, q: float) -> torch.Tensor:
     return flat.kthvalue(k).values
 
 
+def _resolve_close_defaults(force_recurrent: bool, model_dtype: torch.dtype) -> dict[str, str]:
+    low_precision = model_dtype in (torch.bfloat16, torch.float16)
+    if force_recurrent:
+        # In recurrent-only mode both baseline and SP share the same linear-attention algorithm, so the defaults
+        # should reflect a strict parity expectation rather than the looser "training-close" expectation used by the
+        # mixed chunk/recurrent path.
+        return {
+            'logit_atol': '5e-3' if low_precision else '1e-4',
+            'loss_atol': '1e-4' if low_precision else '1e-6',
+            'loss_rtol': '1e-4' if low_precision else '1e-5',
+            'grad_atol': '5e-4' if low_precision else '1e-5',
+            'grad_rtol': '1e-3' if low_precision else '1e-4',
+        }
+    return {
+        'logit_atol': '5e-2',
+        'loss_atol': '5e-2',
+        'loss_rtol': '0.0',
+        'grad_atol': '2e-1',
+        'grad_rtol': '0.0',
+    }
+
+
 def _force_qwen35_linear_recurrent(model: torch.nn.Module) -> int:
     patched = 0
     for module in model.modules():
@@ -158,20 +180,23 @@ class TestQwen35SPParity(unittest.TestCase):
                 f'size ({qwen35_linear_chunk}) for exact parity.')
 
         local_files_only = os.environ.get('QWEN35_LOCAL_ONLY', '1') == '1'
-        logits_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_ATOL', '5e-2'))
+        # Default to SDPA so the parity test exercises SP semantics without depending on FA2 kernel availability
+        # or numerical/runtime quirks in the local CUDA environment. Override explicitly to debug FA2.
+        attn_impl = os.environ.get('QWEN35_SP_PARITY_ATTN_IMPL', 'sdpa')
+        model_dtype = _resolve_torch_dtype(os.environ.get('QWEN35_SP_PARITY_DTYPE', 'bfloat16'))
+        force_recurrent = os.environ.get('QWEN35_SP_FORCE_RECURRENT', '0') == '1'
+        close_defaults = _resolve_close_defaults(force_recurrent, model_dtype)
+        logits_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_ATOL', close_defaults['logit_atol']))
         logits_relaxed_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_RELAXED_MAX_ATOL', '3.0'))
         logits_mean_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_MEAN_ATOL', '1.5e-1'))
         logits_p99_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_P99_ATOL', '1.0'))
         logits_sdpa_fp32_max_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_MAX_ATOL', '3.0'))
         logits_sdpa_fp32_mean_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_MEAN_ATOL', '1.0e-1'))
         logits_sdpa_fp32_p99_atol = float(os.environ.get('QWEN35_SP_PARITY_LOGIT_SDPA_FP32_P99_ATOL', '5.0e-1'))
-        loss_atol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_ATOL', '5e-2'))
-        grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', '2e-1'))
-        # Default to SDPA so the parity test exercises SP semantics without depending on FA2 kernel availability
-        # or numerical/runtime quirks in the local CUDA environment. Override explicitly to debug FA2.
-        attn_impl = os.environ.get('QWEN35_SP_PARITY_ATTN_IMPL', 'sdpa')
-        model_dtype = _resolve_torch_dtype(os.environ.get('QWEN35_SP_PARITY_DTYPE', 'bfloat16'))
-        force_recurrent = os.environ.get('QWEN35_SP_FORCE_RECURRENT', '0') == '1'
+        loss_atol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_ATOL', close_defaults['loss_atol']))
+        loss_rtol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_RTOL', close_defaults['loss_rtol']))
+        grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', close_defaults['grad_atol']))
+        grad_rtol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_RTOL', close_defaults['grad_rtol']))
 
         try:
             import numpy as np
@@ -294,18 +319,22 @@ class TestQwen35SPParity(unittest.TestCase):
         local_max_abs_diff = (local_logits_base - local_logits_sp).abs().max().detach().to(device)
         dist.all_reduce(local_max_abs_diff, op=dist.ReduceOp.MAX)
 
+        loss_diff = abs((loss_base_metric - loss_sp_metric).item())
+        grad_diff = abs((grad_base - grad_sp).item())
         diagnostics = (
             f'world_size={world_size}, rank={rank}, '
             f'loss_base={loss_base_metric.item():.6f}, loss_sp={loss_sp_metric.item():.6f}, '
-            f'loss_diff={abs((loss_base_metric - loss_sp_metric).item()):.6f}, '
+            f'loss_diff={loss_diff:.6f}, '
             f'grad_base={grad_base.item():.6f}, grad_sp={grad_sp.item():.6f}, '
-            f'grad_diff={abs((grad_base - grad_sp).item()):.6f}, '
+            f'grad_diff={grad_diff:.6f}, '
             f'max_abs_diff={max_abs_diff.item():.6f}, mean_abs_diff={mean_abs_diff.item():.6f}, '
             f'p99_abs_diff={p99_abs_diff.item():.6f}, '
             f'local_max_abs_diff={local_max_abs_diff.item():.6f}, '
             f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}, '
             f'dtype={str(model_dtype).replace("torch.", "")}, '
-            f'force_recurrent={force_recurrent}, forced_recurrent_layers={forced_recurrent_layers}'
+            f'force_recurrent={force_recurrent}, forced_recurrent_layers={forced_recurrent_layers}, '
+            f'loss_atol={loss_atol:.2e}, loss_rtol={loss_rtol:.2e}, '
+            f'grad_atol={grad_atol:.2e}, grad_rtol={grad_rtol:.2e}'
         )
 
         if os.environ.get('QWEN35_SP_PARITY_DEBUG', '0') == '1' and rank == 0:
@@ -328,8 +357,16 @@ class TestQwen35SPParity(unittest.TestCase):
             self.assertLessEqual(p99_abs_diff.item(), logits_sdpa_fp32_p99_atol, msg=diagnostics)
         else:
             self.assertLessEqual(max_abs_diff.item(), logits_atol, msg=diagnostics)
-        self.assertLessEqual(abs((loss_base_metric - loss_sp_metric).item()), loss_atol, msg=diagnostics)
-        self.assertLessEqual(abs((grad_base - grad_sp).item()), grad_atol, msg=diagnostics)
+        self.assertLessEqual(
+            loss_diff,
+            max(loss_atol, loss_rtol * max(abs(loss_base_metric.item()), abs(loss_sp_metric.item()))),
+            msg=diagnostics,
+        )
+        self.assertLessEqual(
+            grad_diff,
+            max(grad_atol, grad_rtol * max(abs(grad_base.item()), abs(grad_sp.item()))),
+            msg=diagnostics,
+        )
 
 
 if __name__ == '__main__':
