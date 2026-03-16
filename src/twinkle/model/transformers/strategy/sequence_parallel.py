@@ -747,12 +747,26 @@ class _SeqAllToAll(torch.autograd.Function):
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
+        _sp_linear_collective_debug(
+            f'seq_all_to_all: before forward scatter_idx={scatter_idx}, gather_idx={gather_idx}, '
+            f'shape={tuple(input.shape)}',
+            group,
+        )
         res = single_all_to_all(input, scatter_idx, gather_idx, group)
+        _sp_linear_collective_debug(
+            f'seq_all_to_all: after forward shape={tuple(res.shape)}',
+            group,
+        )
         return res
 
     @staticmethod
     def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
         # Reverse scatter/gather in backward to match forward layout transform.
+        _sp_linear_collective_debug(
+            f'seq_all_to_all: before backward scatter_idx={ctx.gather_idx}, gather_idx={ctx.scatter_idx}, '
+            f'shape={tuple(grad_output[0].shape)}',
+            ctx.group,
+        )
         return None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None
 
 
@@ -776,6 +790,11 @@ class DistributedAttention(torch.nn.Module):
         if self.sequence_parallel.world_size == 1:
             return self.local_attn(query, key, value, attention_mask, *args, **kwargs)
 
+        _sp_linear_collective_debug(
+            f'distributed_attention: enter query={tuple(query.shape)}, key={tuple(key.shape)}, '
+            f'value={tuple(value.shape)}, attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
+            self.sequence_parallel._sp_group,
+        )
         # All-to-all to assemble full sequence for attention, then split back after.
         if self.sequence_parallel.sp_world_size > 1:
             query_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, query, self.scatter_idx, self.gather_idx)
@@ -809,6 +828,10 @@ class DistributedAttention(torch.nn.Module):
         else:
             output = context_layer
 
+        _sp_linear_collective_debug(
+            f'distributed_attention: exit output={tuple(output.shape)}',
+            self.sequence_parallel._sp_group,
+        )
         return output
 
 
