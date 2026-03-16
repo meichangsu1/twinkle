@@ -1590,6 +1590,48 @@ class SequenceParallel:
                 decoder_layer.register_forward_hook(_make_post_hook(layer_idx), with_kwargs=True)
                 decoder_layer._twinkle_sp_decoder_debug_hooked = True
 
+                full_attn = getattr(decoder_layer, 'self_attn', None)
+                if (
+                    _sp_qwen35_decoder_debug_enabled()
+                    and full_attn is not None
+                    and full_attn.__class__.__name__ == 'Qwen3_5Attention'
+                    and not getattr(full_attn, '_twinkle_sp_attn_debug_hooked', False)
+                ):
+
+                    def _make_attn_pre_hook(idx):
+
+                        def _pre_hook(_module, _args, _kwargs):
+                            hidden_states = None
+                            if 'hidden_states' in _kwargs:
+                                hidden_states = _kwargs['hidden_states']
+                            elif _args:
+                                hidden_states = _args[0]
+                            attention_mask = _kwargs.get('attention_mask', None)
+                            _sp_linear_collective_debug(
+                                f'qwen35_attention_layer_{idx}: before forward '
+                                f'hidden_states={None if hidden_states is None else tuple(hidden_states.shape)} '
+                                f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
+                                self._sp_group,
+                            )
+
+                        return _pre_hook
+
+                    def _make_attn_post_hook(idx):
+
+                        def _post_hook(_module, _args, _kwargs, output):
+                            attn_output = output[0] if isinstance(output, (tuple, list)) else output
+                            _sp_linear_collective_debug(
+                                f'qwen35_attention_layer_{idx}: after forward '
+                                f'attn_output={None if attn_output is None else tuple(attn_output.shape)}',
+                                self._sp_group,
+                            )
+
+                        return _post_hook
+
+                    full_attn.register_forward_pre_hook(_make_attn_pre_hook(layer_idx), with_kwargs=True)
+                    full_attn.register_forward_hook(_make_attn_post_hook(layer_idx), with_kwargs=True)
+                    full_attn._twinkle_sp_attn_debug_hooked = True
+
         self.has_qwen35_linear_attn = has_linear_attn
         self.extra_kwargs['has_qwen35_linear_attn'] = has_linear_attn
 
