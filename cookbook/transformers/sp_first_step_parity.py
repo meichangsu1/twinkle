@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from peft import LoraConfig
 from torch.utils.data import DataLoader as TorchDataLoader
 
@@ -171,22 +172,33 @@ def _state_delta_stats(before, after):
 
 
 def _get_global_batch(batch_index: int) -> list[dict[str, Any]]:
-    # Use the raw torch dataloader here. twinkle.DataLoader auto-injects the default
-    # device_mesh in local mode, which would shard the reference batch again.
-    dataset = create_dataset(data_slice=None)
-    dataloader = TorchDataLoader(
-        dataset,
-        batch_size=GLOBAL_BATCH_SIZE,
-        num_workers=0,
-        shuffle=False,
-        collate_fn=lambda x: x,
-    )
-    for idx, batch in enumerate(dataloader):
-        if idx == batch_index:
-            if not isinstance(batch, list):
-                raise TypeError(f'Expected list batch, got: {type(batch)}')
-            return batch
-    raise IndexError(f'Batch index {batch_index} out of range')
+    # Only rank0 loads the reference batch, then broadcast it to all ranks.
+    # This avoids multi-rank dataset cache races and guarantees every rank sees
+    # the exact same global batch before local slicing.
+    batch = None
+    if Platform.get_rank() == 0:
+        dataset = create_dataset(data_slice=None)
+        dataloader = TorchDataLoader(
+            dataset,
+            batch_size=GLOBAL_BATCH_SIZE,
+            num_workers=0,
+            shuffle=False,
+            collate_fn=lambda x: x,
+        )
+        for idx, _batch in enumerate(dataloader):
+            if idx == batch_index:
+                if not isinstance(_batch, list):
+                    raise TypeError(f'Expected list batch, got: {type(_batch)}')
+                batch = _batch
+                break
+        if batch is None:
+            raise IndexError(f'Batch index {batch_index} out of range')
+
+    if dist.is_available() and dist.is_initialized():
+        object_list = [batch]
+        dist.broadcast_object_list(object_list, src=0)
+        batch = object_list[0]
+    return batch
 
 
 def _slice_local_batch(global_batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
