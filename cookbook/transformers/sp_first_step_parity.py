@@ -37,6 +37,7 @@ PARITY_STRICT_DETERMINISM = os.environ.get('TWINKLE_PARITY_STRICT_DETERMINISM', 
 PARITY_MIXED_PRECISION = os.environ.get('TWINKLE_PARITY_MIXED_PRECISION', 'no')
 PARITY_ATTN_IMPL = os.environ.get('TWINKLE_PARITY_ATTN_IMPL', 'eager')
 PARITY_DISABLE_GC = os.environ.get('TWINKLE_PARITY_DISABLE_GC', '1') == '1'
+PARITY_WRAP_MODE = os.environ.get('TWINKLE_PARITY_WRAP_MODE', 'native_fsdp')
 
 
 def _enable_strict_determinism(seed: int) -> None:
@@ -58,12 +59,25 @@ def _enable_strict_determinism(seed: int) -> None:
 if PARITY_STRICT_DETERMINISM:
     _enable_strict_determinism(PARITY_SEED)
 
-device_mesh = DeviceMesh(
-    device_type='cuda',
-    mesh=np.arange(4).reshape(2, 2),
-    mesh_dim_names=('dp', 'fsdp'),
-    ulysses_size=ULYSSES_SIZE,
-)
+def _build_device_mesh() -> DeviceMesh:
+    if PARITY_WRAP_MODE == 'native_fsdp':
+        return DeviceMesh(
+            device_type='cuda',
+            mesh=np.arange(4).reshape(2, 2),
+            mesh_dim_names=('dp', 'fsdp'),
+            ulysses_size=ULYSSES_SIZE,
+        )
+    if PARITY_WRAP_MODE == 'ddp':
+        return DeviceMesh(
+            device_type='cuda',
+            mesh=np.arange(4),
+            mesh_dim_names=('dp',),
+            ulysses_size=ULYSSES_SIZE,
+        )
+    raise ValueError(f'Unsupported TWINKLE_PARITY_WRAP_MODE={PARITY_WRAP_MODE}')
+
+
+device_mesh = _build_device_mesh()
 
 twinkle.initialize(
     mode='local',
@@ -91,10 +105,11 @@ def _set_seed(seed: int) -> None:
 
 def _create_model(num_training_steps: int) -> TransformersModel:
     warmup_steps = int(os.environ.get('TWINKLE_PARITY_WARMUP_STEPS', '0'))
+    strategy = 'native_fsdp' if PARITY_WRAP_MODE == 'native_fsdp' else 'accelerate'
     model = TransformersModel(
         model_id=MODEL_ID,
         device_mesh=device_mesh,
-        strategy='native_fsdp',
+        strategy=strategy,
         mixed_precision=PARITY_MIXED_PRECISION,
         attn_implementation=PARITY_ATTN_IMPL,
     )
@@ -305,6 +320,7 @@ def main():
         'batch_index': int(batch_index),
         'global_batch_size': int(GLOBAL_BATCH_SIZE),
         'ulysses_size': int(ULYSSES_SIZE),
+        'wrap_mode': PARITY_WRAP_MODE,
         'data_world_size': int(device_mesh.data_world_size),
         'data_rank': int(device_mesh.data_rank),
         'rank': int(Platform.get_rank()),
@@ -317,6 +333,7 @@ def main():
             'TWINKLE_PARITY_MIXED_PRECISION': PARITY_MIXED_PRECISION,
             'TWINKLE_PARITY_ATTN_IMPL': PARITY_ATTN_IMPL,
             'TWINKLE_PARITY_DISABLE_GC': os.environ.get('TWINKLE_PARITY_DISABLE_GC', '1'),
+            'TWINKLE_PARITY_WRAP_MODE': PARITY_WRAP_MODE,
         },
         'global_batch_digest': global_batch_digest,
         'result': result,
