@@ -290,9 +290,7 @@ def single_batch_diagnostic():
         'batch_index': batch_index,
         'batch_size': batch_size,
         'env': {
-            'QWEN35_SP_LINEAR_STRICT': os.environ.get('QWEN35_SP_LINEAR_STRICT', '0'),
-            'QWEN35_SP_LINEAR_CONV_HALO': os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0'),
-            'QWEN35_SP_LINEAR_STRICT_BARRIER': os.environ.get('QWEN35_SP_LINEAR_STRICT_BARRIER', '0'),
+            'TWINKLE_DIAG_WARMUP_STEPS': os.environ.get('TWINKLE_DIAG_WARMUP_STEPS', '5'),
             'QWEN35_SP_PARITY_ATTN_IMPL': os.environ.get('QWEN35_SP_PARITY_ATTN_IMPL'),
         },
         'experiments': experiments,

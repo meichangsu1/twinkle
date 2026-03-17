@@ -22,7 +22,6 @@ from twinkle.preprocessor import SelfCognitionProcessor
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
 
 # TWINKLE_PARITY_ULYSSES_SIZE=2 \
-# QWEN35_SP_LINEAR_CONV_HALO=1 \
 # TWINKLE_PARITY_OUTPUT=/tmp/sp2_first_step.json \
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
 
@@ -325,9 +324,6 @@ def main():
         'data_rank': int(device_mesh.data_rank),
         'rank': int(Platform.get_rank()),
         'env': {
-            'QWEN35_SP_LINEAR_STRICT': os.environ.get('QWEN35_SP_LINEAR_STRICT', '0'),
-            'QWEN35_SP_LINEAR_CONV_HALO': os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0'),
-            'QWEN35_SP_LINEAR_STRICT_BARRIER': os.environ.get('QWEN35_SP_LINEAR_STRICT_BARRIER', '0'),
             'TWINKLE_PARITY_WARMUP_STEPS': os.environ.get('TWINKLE_PARITY_WARMUP_STEPS', '0'),
             'TWINKLE_PARITY_STRICT_DETERMINISM': os.environ.get('TWINKLE_PARITY_STRICT_DETERMINISM', '1'),
             'TWINKLE_PARITY_MIXED_PRECISION': PARITY_MIXED_PRECISION,

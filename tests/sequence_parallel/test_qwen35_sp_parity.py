@@ -257,9 +257,6 @@ class TestQwen35SPParity(unittest.TestCase):
         loss_rtol = float(os.environ.get('QWEN35_SP_PARITY_LOSS_RTOL', close_defaults['loss_rtol']))
         grad_atol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_ATOL', close_defaults['grad_atol']))
         grad_rtol = float(os.environ.get('QWEN35_SP_PARITY_GRAD_RTOL', close_defaults['grad_rtol']))
-        linear_strict = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
-        linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
-
         try:
             import numpy as np
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -347,6 +344,7 @@ class TestQwen35SPParity(unittest.TestCase):
             tokenizer=tokenizer,
             device_mesh=device_mesh,
         )
+        self.assertEqual(sequence_parallel.linear_attention_provider_name, 'qwen35')
         sp_linear_captures: dict[str, dict[str, torch.Tensor]] = {}
         if linear_debug_layers > 0:
             sp_linear_captures = _install_qwen35_linear_rule_capture(sp_model, linear_debug_layers)
@@ -425,7 +423,7 @@ class TestQwen35SPParity(unittest.TestCase):
             f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}, '
             f'dtype={str(model_dtype).replace("torch.", "")}, '
             f'force_recurrent={force_recurrent}, forced_recurrent_layers={forced_recurrent_layers}, '
-            f'linear_strict={linear_strict}, linear_conv_halo={linear_conv_halo}, '
+            f'linear_attention_provider={sequence_parallel.linear_attention_provider_name}, '
             f'loss_atol={loss_atol:.2e}, loss_rtol={loss_rtol:.2e}, '
             f'grad_atol={grad_atol:.2e}, grad_rtol={grad_rtol:.2e}'
         )
@@ -442,7 +440,7 @@ class TestQwen35SPParity(unittest.TestCase):
         is_fp32_linear_exact = (
             force_recurrent
             and model_dtype == torch.float32
-            and (linear_strict or linear_conv_halo)
+            and sequence_parallel.linear_attention_provider_name == 'qwen35'
         )
 
         if is_low_precision_sdpa:

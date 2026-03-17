@@ -1,5 +1,3 @@
-import importlib
-import os
 import torch
 import torch.distributed as dist
 from dataclasses import asdict, dataclass, is_dataclass
@@ -9,46 +7,6 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 from twinkle.utils import DeviceMesh
 from twinkle.utils.transformers_utils import get_llm_model
-
-
-def _sp_linear_collective_debug_enabled() -> bool:
-    return os.environ.get('QWEN35_SP_LINEAR_DEBUG_COLLECTIVES', '1') == '1'
-
-
-def _sp_linear_collective_debug(message: str, sp_group: Optional[dist.ProcessGroup] = None) -> None:
-    if not _sp_linear_collective_debug_enabled():
-        return
-    global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    group_rank = None
-    if sp_group is not None and dist.is_available() and dist.is_initialized():
-        group_rank = dist.get_rank(sp_group)
-    prefix = f'[QWEN35_SP_LINEAR_DEBUG][global_rank={global_rank}'
-    if group_rank is not None:
-        prefix += f', sp_rank={group_rank}'
-    prefix += ']'
-    print(f'{prefix} {message}', flush=True)
-
-
-def _sp_qwen35_decoder_debug_enabled() -> bool:
-    return os.environ.get('QWEN35_SP_DEBUG_DECODER_LAYERS', '0') == '1'
-
-
-def _sp_runtime_diagnostics_enabled() -> bool:
-    return os.environ.get('QWEN35_SP_RUNTIME_DIAGNOSTICS', '0') == '1'
-
-
-def _sp_runtime_diagnostics(message: str, sp_group: Optional[dist.ProcessGroup] = None) -> None:
-    if not _sp_runtime_diagnostics_enabled():
-        return
-    global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    group_rank = None
-    if sp_group is not None and dist.is_available() and dist.is_initialized():
-        group_rank = dist.get_rank(sp_group)
-    prefix = f'[QWEN35_SP_RUNTIME][global_rank={global_rank}'
-    if group_rank is not None:
-        prefix += f', sp_rank={group_rank}'
-    prefix += ']'
-    print(f'{prefix} {message}', flush=True)
 
 
 def get_config_attr(config, key, default=None):
@@ -201,215 +159,6 @@ def _normalize_flash_position_ids(position_ids: Optional[torch.Tensor]) -> Optio
     if position_ids is None or not torch.is_tensor(position_ids):
         return position_ids
     return _extract_text_position_ids(position_ids)
-
-
-def _sp_prev_next_rank(
-    sp_group: Optional[dist.ProcessGroup],
-) -> Tuple[int, int, Optional[int], Optional[int]]:
-    """Return (group_rank, group_world_size, prev_global_rank, next_global_rank)."""
-    if sp_group is None:
-        return 0, 1, None, None
-    sp_rank = dist.get_rank(sp_group)
-    sp_world_size = dist.get_world_size(sp_group)
-    prev_rank = dist.get_global_rank(sp_group, sp_rank - 1) if sp_rank > 0 else None
-    next_rank = dist.get_global_rank(sp_group, sp_rank + 1) if sp_rank + 1 < sp_world_size else None
-    return sp_rank, sp_world_size, prev_rank, next_rank
-
-
-class _QwenLinearStateParallelFn(torch.autograd.Function):
-    """State-parallel autograd for Qwen3.5 linear attention chunk rule.
-
-    Forward: recv previous recurrent state -> run local chunk rule -> send final recurrent state.
-    Backward: recv grad(final_state) -> recompute local chunk rule -> send grad(initial_state).
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        sp_group: Optional[dist.ProcessGroup],
-        chunk_rule,
-        chunk_size: Optional[int],
-        use_qk_l2norm_in_kernel: bool,
-    ) -> torch.Tensor:
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        g = g.contiguous()
-        beta = beta.contiguous()
-
-        ctx.sp_group = sp_group
-        ctx.chunk_rule = chunk_rule
-        ctx.chunk_size = int(chunk_size) if chunk_size is not None else None
-        ctx.use_qk_l2norm_in_kernel = bool(use_qk_l2norm_in_kernel)
-
-        sp_rank, sp_world_size, prev_rank, next_rank = _sp_prev_next_rank(sp_group)
-        ctx.sp_rank = sp_rank
-        ctx.sp_world_size = sp_world_size
-        ctx.prev_rank = prev_rank
-        ctx.next_rank = next_rank
-
-        state_shape = (query.shape[0], query.shape[2], query.shape[3], value.shape[3])
-        initial_state = torch.zeros(state_shape, dtype=torch.float32, device=query.device)
-        if sp_group is not None and sp_world_size > 1 and prev_rank is not None:
-            dist.recv(initial_state, src=prev_rank, group=sp_group)
-        initial_state = initial_state.contiguous()
-
-        chunk_kwargs = {
-            'g': g,
-            'beta': beta,
-            'initial_state': (initial_state if prev_rank is not None else None),
-            'output_final_state': True,
-            'use_qk_l2norm_in_kernel': ctx.use_qk_l2norm_in_kernel,
-        }
-        if ctx.chunk_size is not None:
-            chunk_kwargs['chunk_size'] = ctx.chunk_size
-        local_output, final_state = chunk_rule(query, key, value, **chunk_kwargs)
-        local_output = local_output.contiguous()
-        if sp_group is not None and sp_world_size > 1 and next_rank is not None:
-            dist.send(final_state.contiguous().to(torch.float32), dst=next_rank, group=sp_group)
-
-        # Always save a tensor initial_state so backward can re-run deterministically.
-        ctx.save_for_backward(query, key, value, g, beta, initial_state)
-        return local_output
-
-    @staticmethod
-    def backward(
-        ctx,
-        grad_output: torch.Tensor,
-    ):
-        query, key, value, g, beta, initial_state = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-
-        grad_final_state = torch.zeros_like(initial_state, dtype=torch.float32, device=grad_output.device)
-        if ctx.sp_group is not None and ctx.sp_world_size > 1 and ctx.next_rank is not None:
-            dist.recv(grad_final_state, src=ctx.next_rank, group=ctx.sp_group)
-        grad_final_state = grad_final_state.contiguous()
-
-        query_ = query.detach().requires_grad_(True)
-        key_ = key.detach().requires_grad_(True)
-        value_ = value.detach().requires_grad_(True)
-        g_ = g.detach().requires_grad_(True)
-        beta_ = beta.detach().requires_grad_(True)
-        initial_state_ = initial_state.detach().requires_grad_(True)
-
-        with torch.enable_grad():
-            chunk_kwargs = {
-                'g': g_,
-                'beta': beta_,
-                'initial_state': (initial_state_ if ctx.prev_rank is not None else None),
-                'output_final_state': True,
-                'use_qk_l2norm_in_kernel': ctx.use_qk_l2norm_in_kernel,
-            }
-            if ctx.chunk_size is not None:
-                chunk_kwargs['chunk_size'] = ctx.chunk_size
-            local_output, final_state = ctx.chunk_rule(query_, key_, value_, **chunk_kwargs)
-        local_output = local_output.contiguous()
-        final_state = final_state.contiguous()
-
-        grad_args = [query_, key_, value_, g_, beta_]
-        if ctx.prev_rank is not None:
-            grad_args.append(initial_state_)
-
-        grad_outputs = [grad_output, grad_final_state.to(final_state.dtype)]
-        grads = torch.autograd.grad(
-            outputs=(local_output, final_state),
-            inputs=tuple(grad_args),
-            grad_outputs=tuple(grad_outputs),
-            allow_unused=True,
-        )
-
-        grad_query, grad_key, grad_value, grad_g, grad_beta = grads[:5]
-        grad_initial_state = grads[5] if len(grads) > 5 else None
-
-        if ctx.sp_group is not None and ctx.sp_world_size > 1 and ctx.prev_rank is not None:
-            if grad_initial_state is None:
-                grad_initial_state = torch.zeros_like(initial_state, dtype=torch.float32, device=grad_output.device)
-            dist.send(grad_initial_state.contiguous().to(torch.float32), dst=ctx.prev_rank, group=ctx.sp_group)
-
-        return grad_query, grad_key, grad_value, grad_g, grad_beta, None, None, None, None
-
-
-class _LeftHaloExchangeFn(torch.autograd.Function):
-
-    @staticmethod
-    def forward(
-        ctx,
-        tensor: torch.Tensor,
-        halo: int,
-        seq_dim: int,
-        sp_group: Optional[dist.ProcessGroup],
-        tag_base: int,
-    ) -> torch.Tensor:
-        ctx.halo = int(halo)
-        ctx.seq_dim = seq_dim if seq_dim >= 0 else tensor.dim() + seq_dim
-        ctx.sp_group = sp_group
-        ctx.forward_tag = int(tag_base) * 2
-        ctx.backward_tag = ctx.forward_tag + 1
-        if ctx.halo <= 0 or sp_group is None or dist.get_world_size(sp_group) <= 1:
-            ctx.local_seq_len = tensor.size(ctx.seq_dim)
-            ctx.prev_rank = None
-            ctx.next_rank = None
-            return tensor
-
-        ctx.local_seq_len = tensor.size(ctx.seq_dim)
-        if ctx.local_seq_len < ctx.halo:
-            raise RuntimeError(
-                'SequenceParallel: local sequence length must be at least halo size for Qwen3.5 conv halo exchange. '
-                f'local_seq_len={ctx.local_seq_len}, halo={ctx.halo}. '
-                'Use QWEN35_SP_LINEAR_STRICT=1 for very short local sequences.'
-            )
-
-        _, _, prev_rank, next_rank = _sp_prev_next_rank(sp_group)
-        ctx.prev_rank = prev_rank
-        ctx.next_rank = next_rank
-
-        halo_shape = list(tensor.shape)
-        halo_shape[ctx.seq_dim] = ctx.halo
-        left_halo = tensor.new_zeros(halo_shape)
-        ops = []
-        if prev_rank is not None:
-            ops.append(dist.P2POp(dist.irecv, left_halo, prev_rank, sp_group, ctx.forward_tag))
-        if next_rank is not None:
-            tail = tensor.narrow(ctx.seq_dim, ctx.local_seq_len - ctx.halo, ctx.halo).contiguous()
-            ops.append(dist.P2POp(dist.isend, tail, next_rank, sp_group, ctx.forward_tag))
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-
-        return torch.cat([left_halo, tensor], dim=ctx.seq_dim).contiguous()
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if ctx.halo <= 0 or ctx.sp_group is None or dist.get_world_size(ctx.sp_group) <= 1:
-            return grad_output, None, None, None
-
-        grad_left = grad_output.narrow(ctx.seq_dim, 0, ctx.halo).contiguous()
-        grad_local = grad_output.narrow(ctx.seq_dim, ctx.halo, ctx.local_seq_len).contiguous()
-
-        grad_from_next = None
-        ops = []
-        if ctx.prev_rank is not None:
-            ops.append(dist.P2POp(dist.isend, grad_left, ctx.prev_rank, ctx.sp_group, ctx.backward_tag))
-        if ctx.next_rank is not None:
-            halo_shape = list(grad_local.shape)
-            halo_shape[ctx.seq_dim] = ctx.halo
-            grad_from_next = grad_local.new_zeros(halo_shape)
-            ops.append(dist.P2POp(dist.irecv, grad_from_next, ctx.next_rank, ctx.sp_group, ctx.backward_tag))
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-
-        if grad_from_next is not None:
-            grad_local.narrow(ctx.seq_dim, ctx.local_seq_len - ctx.halo, ctx.halo).add_(grad_from_next)
-
-        return grad_local.contiguous(), None, None, None, None
 
 
 def _get_raw_data_world_size(device_mesh: DeviceMesh) -> int:
@@ -579,116 +328,6 @@ class GatherLoss(torch.autograd.Function):
         return _grad, None, None, None
 
 
-class _GatherForwardSplitBackward(torch.autograd.Function):
-
-    @staticmethod
-    def forward(
-        ctx,
-        tensor: torch.Tensor,
-        gather_dim: int,
-        sp_world_size: Optional[int],
-        sp_group: Optional[dist.ProcessGroup],
-        debug_label: Optional[str],
-    ) -> torch.Tensor:
-        ctx.gather_dim = gather_dim
-        ctx.sp_world_size = sp_world_size
-        ctx.sp_group = sp_group
-        ctx.debug_label = debug_label or 'gather_forward_split_backward'
-        if sp_world_size is None or sp_world_size <= 1 or sp_group is None:
-            return tensor
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: before forward gather dim={gather_dim}, shape={tuple(tensor.shape)}',
-            sp_group,
-        )
-        output = _gather_tensor_along_dim_for_sp(tensor, gather_dim, sp_world_size, sp_group)
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: after forward gather shape={tuple(output.shape)}',
-            sp_group,
-        )
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if ctx.sp_world_size is None or ctx.sp_world_size <= 1 or ctx.sp_group is None:
-            return grad_output, None, None, None, None
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: before backward split dim={ctx.gather_dim}, shape={tuple(grad_output.shape)}',
-            ctx.sp_group,
-        )
-        rank = dist.get_rank(ctx.sp_group)
-        gather_dim = ctx.gather_dim if ctx.gather_dim >= 0 else grad_output.dim() + ctx.gather_dim
-        dim_size = grad_output.size(gather_dim)
-        if dim_size % ctx.sp_world_size != 0:
-            raise ValueError(
-                f'Cannot split gathered grad_output size {dim_size} on dim {gather_dim} by '
-                f'sp_world_size={ctx.sp_world_size}.'
-            )
-        local_size = dim_size // ctx.sp_world_size
-        grad_input = torch.split(grad_output.contiguous(), local_size, dim=gather_dim)[rank].contiguous()
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: after backward split shape={tuple(grad_input.shape)}',
-            ctx.sp_group,
-        )
-        return grad_input, None, None, None, None
-
-
-class _SplitForwardGatherBackward(torch.autograd.Function):
-
-    @staticmethod
-    def forward(
-        ctx,
-        tensor: torch.Tensor,
-        split_dim: int,
-        sp_world_size: Optional[int],
-        sp_group: Optional[dist.ProcessGroup],
-        debug_label: Optional[str],
-    ) -> torch.Tensor:
-        ctx.split_dim = split_dim
-        ctx.sp_world_size = sp_world_size
-        ctx.sp_group = sp_group
-        ctx.debug_label = debug_label or 'split_forward_gather_backward'
-        if sp_world_size is None or sp_world_size <= 1 or sp_group is None:
-            return tensor
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: before forward split dim={split_dim}, shape={tuple(tensor.shape)}',
-            sp_group,
-        )
-        rank = dist.get_rank(sp_group)
-        split_dim = split_dim if split_dim >= 0 else tensor.dim() + split_dim
-        dim_size = tensor.size(split_dim)
-        if dim_size % sp_world_size != 0:
-            raise ValueError(
-                f'Cannot split tensor size {dim_size} on dim {split_dim} by sp_world_size={sp_world_size}.'
-            )
-        local_size = dim_size // sp_world_size
-        output = torch.split(tensor.contiguous(), local_size, dim=split_dim)[rank].contiguous()
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: after forward split shape={tuple(output.shape)}',
-            sp_group,
-        )
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if ctx.sp_world_size is None or ctx.sp_world_size <= 1 or ctx.sp_group is None:
-            return grad_output, None, None, None, None
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: before backward gather dim={ctx.split_dim}, shape={tuple(grad_output.shape)}',
-            ctx.sp_group,
-        )
-        grad_input = _gather_tensor_along_dim_for_sp(
-            grad_output.contiguous(),
-            ctx.split_dim,
-            ctx.sp_world_size,
-            ctx.sp_group,
-        )
-        _sp_linear_collective_debug(
-            f'{ctx.debug_label}: after backward gather shape={tuple(grad_input.shape)}',
-            ctx.sp_group,
-        )
-        return grad_input, None, None, None, None
-
-
 # Code borrowed from deepspeed, here is why:
 # 1. Reduce the dependency
 # 2. The original code is complex
@@ -769,26 +408,12 @@ class _SeqAllToAll(torch.autograd.Function):
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
-        _sp_linear_collective_debug(
-            f'seq_all_to_all: before forward scatter_idx={scatter_idx}, gather_idx={gather_idx}, '
-            f'shape={tuple(input.shape)}',
-            group,
-        )
         res = single_all_to_all(input, scatter_idx, gather_idx, group)
-        _sp_linear_collective_debug(
-            f'seq_all_to_all: after forward shape={tuple(res.shape)}',
-            group,
-        )
         return res
 
     @staticmethod
     def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
         # Reverse scatter/gather in backward to match forward layout transform.
-        _sp_linear_collective_debug(
-            f'seq_all_to_all: before backward scatter_idx={ctx.gather_idx}, gather_idx={ctx.scatter_idx}, '
-            f'shape={tuple(grad_output[0].shape)}',
-            ctx.group,
-        )
         return None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None
 
 
@@ -811,12 +436,6 @@ class DistributedAttention(torch.nn.Module):
                 Any, **kwargs) -> torch.Tensor:
         if self.sequence_parallel.world_size == 1:
             return self.local_attn(query, key, value, attention_mask, *args, **kwargs)
-
-        _sp_linear_collective_debug(
-            f'distributed_attention: enter query={tuple(query.shape)}, key={tuple(key.shape)}, '
-            f'value={tuple(value.shape)}, attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
-            self.sequence_parallel._sp_group,
-        )
         # All-to-all to assemble full sequence for attention, then split back after.
         if self.sequence_parallel.sp_world_size > 1:
             query_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, query, self.scatter_idx, self.gather_idx)
@@ -849,11 +468,6 @@ class DistributedAttention(torch.nn.Module):
                                         self.scatter_idx)
         else:
             output = context_layer
-
-        _sp_linear_collective_debug(
-            f'distributed_attention: exit output={tuple(output.shape)}',
-            self.sequence_parallel._sp_group,
-        )
         return output
 
 
@@ -872,19 +486,9 @@ class SequenceParallel:
         self._sp_group = None
         self.num_heads = None
         self.causal_mask_func = None
-        self.has_qwen35_linear_attn = False
-        self.qwen35_linear_strict_full_seq = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
-        self.qwen35_linear_strict_barrier = os.environ.get('QWEN35_SP_LINEAR_STRICT_BARRIER', '1') == '1'
-        self.qwen35_linear_conv_halo = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0') == '1'
-        self.qwen35_linear_disable_gc = os.environ.get(
-            'QWEN35_SP_LINEAR_DISABLE_GC',
-            os.environ.get('QWEN35_SP_LINEAR_CONV_HALO_DISABLE_GC', '1'),
-        ) == '1'
-        self.qwen35_linear_conv_halo_disable_gc = os.environ.get('QWEN35_SP_LINEAR_CONV_HALO_DISABLE_GC', '1') == '1'
+        self.linear_attention_provider = None
+        self.linear_attention_provider_name = None
         self.extra_kwargs = {}
-        self._runtime_diag_init_reported = False
-        self._runtime_diag_forward_reported = False
-        self._runtime_diag_linear_mode_reported = False
 
     @property
     def real_position_ids(self) -> torch.Tensor:
@@ -895,6 +499,45 @@ class SequenceParallel:
     def text_position_ids(self) -> Optional[torch.Tensor]:
         """Text-aligned position ids with shape [B, S]."""
         return self.extra_kwargs.get('text_position_ids')
+
+    def _resolve_linear_attention_provider(self, base_model: torch.nn.Module):
+        from .linear_attention import LINEAR_ATTENTION_PROVIDERS
+
+        for provider in LINEAR_ATTENTION_PROVIDERS:
+            if provider.match(base_model):
+                return provider
+        return None
+
+    def _activate_linear_attention_provider(self, llm_model: torch.nn.Module, model: torch.nn.Module) -> None:
+        self.linear_attention_provider = None
+        self.linear_attention_provider_name = None
+        self.extra_kwargs.pop('linear_attention_provider', None)
+        self.extra_kwargs.pop('linear_attention_disabled_gradient_checkpointing', None)
+
+        if self.world_size is None or self.world_size <= 1:
+            return
+
+        provider = self._resolve_linear_attention_provider(llm_model)
+        if provider is None:
+            return
+        if not provider.patch(llm_model, self):
+            return
+
+        self.linear_attention_provider = provider
+        self.linear_attention_provider_name = provider.name
+        self.extra_kwargs['linear_attention_provider'] = provider.name
+        disabled = provider.maybe_disable_gc(model, self)
+        self.extra_kwargs['linear_attention_disabled_gradient_checkpointing'] = disabled
+
+    def _validate_linear_attention_inputs(self) -> None:
+        if self.linear_attention_provider is None:
+            return
+        self.linear_attention_provider.validate_inputs(self)
+
+    def _should_build_causal_mask(self) -> bool:
+        if self.linear_attention_provider is None:
+            return True
+        return bool(self.linear_attention_provider.should_build_causal_mask())
 
     def _prepare_flash_attn(self, base_model: torch.nn.Module):
         try:
@@ -1243,550 +886,6 @@ class SequenceParallel:
                 model_module.origin_eager_attention_forward = model_module.eager_attention_forward
             model_module.eager_attention_forward = partial(local_eager_attn, dist_attn=DistributedAttention(None, self))
 
-    def _wrap_qwen35_chunk_rule(self, module: torch.nn.Module, origin_rule):
-
-        recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
-        module_impl = importlib.import_module(module.__class__.__module__)
-        torch_recurrent_rule = getattr(module_impl, 'torch_recurrent_gated_delta_rule', None)
-
-        def recurrent_rule_wrapper(
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            g: torch.Tensor,
-            beta: torch.Tensor,
-            chunk_size: Optional[int] = None,
-            initial_state: Optional[torch.Tensor] = None,
-            output_final_state: bool = False,
-            use_qk_l2norm_in_kernel: bool = False,
-        ):
-            rule = torch_recurrent_rule or recurrent_rule
-            if rule is None:
-                raise RuntimeError('SequenceParallel: Qwen3.5 recurrent_gated_delta_rule is unavailable.')
-            return rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            )
-
-        def wrapped_chunk_rule(
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            g: torch.Tensor,
-            beta: torch.Tensor,
-            chunk_size: Optional[int] = None,
-            initial_state: Optional[torch.Tensor] = None,
-            output_final_state: bool = False,
-            use_qk_l2norm_in_kernel: bool = False,
-        ):
-            call_kwargs = {
-                'g': g,
-                'beta': beta,
-                'initial_state': initial_state,
-                'output_final_state': output_final_state,
-                'use_qk_l2norm_in_kernel': use_qk_l2norm_in_kernel,
-            }
-            if chunk_size is not None:
-                call_kwargs['chunk_size'] = chunk_size
-
-            if self.sp_world_size is None or self.sp_world_size <= 1 or self._sp_group is None:
-                return origin_rule(query, key, value, **call_kwargs)
-            # Respect cache/incremental path semantics.
-            if initial_state is not None or output_final_state:
-                return origin_rule(query, key, value, **call_kwargs)
-
-            if self.extra_kwargs.get('is_packed', False):
-                raise RuntimeError(
-                    'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
-                    'Packed reset semantics for recurrent states are not implemented.')
-
-            sp_rule = origin_rule
-            sp_chunk_size = int(chunk_size) if chunk_size is not None else None
-            effective_chunk_size = sp_chunk_size or 64
-            if recurrent_rule is not None and query.shape[1] % effective_chunk_size != 0:
-                # Qwen3.5's chunk rule is only exact when split points align with chunk boundaries. If SP splits a
-                # sequence inside a chunk (e.g. seq_len=32, sp=2, local_seq=16, default chunk_size=64), carrying only
-                # the final recurrent state is not enough to reproduce the monolithic chunked prefill path. Fall back
-                # to the recurrent rule for exact state hand-off across SP ranks.
-                sp_rule = recurrent_rule_wrapper
-                sp_chunk_size = None
-
-            output = _QwenLinearStateParallelFn.apply(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                self._sp_group,
-                sp_rule,
-                sp_chunk_size,
-                bool(use_qk_l2norm_in_kernel),
-            )
-            return output, None
-
-        wrapped_chunk_rule._twinkle_origin_rule = origin_rule
-        wrapped_chunk_rule._twinkle_wrapped_module = module.__class__.__name__
-        return wrapped_chunk_rule
-
-    def _wrap_qwen35_causal_conv1d_fn(
-        self,
-        module: torch.nn.Module,
-        origin_causal_conv1d_fn,
-    ):
-
-        def run_origin(
-            x: torch.Tensor,
-            weight: torch.Tensor,
-            bias: Optional[torch.Tensor],
-            activation: str,
-            seq_idx=None,
-        ) -> torch.Tensor:
-            if origin_causal_conv1d_fn is not None:
-                return origin_causal_conv1d_fn(
-                    x=x,
-                    weight=weight,
-                    bias=bias,
-                    activation=activation,
-                    seq_idx=seq_idx,
-                )
-            conv_weight = weight.unsqueeze(1) if weight.dim() == 2 else weight
-            conv_bias = bias if bias is not None else module.conv1d.bias
-            conv_output = torch.nn.functional.conv1d(
-                x,
-                conv_weight,
-                bias=conv_bias,
-                padding=module.conv_kernel_size - 1,
-                groups=module.conv_dim,
-            )
-            conv_output = conv_output[:, :, :x.shape[-1]]
-            return module.act(conv_output)
-
-        def wrapped_causal_conv1d(
-            x: torch.Tensor,
-            weight: torch.Tensor,
-            bias: Optional[torch.Tensor],
-            activation: str,
-            seq_idx=None,
-        ) -> torch.Tensor:
-            if (
-                not self.qwen35_linear_conv_halo
-                or self.qwen35_linear_strict_full_seq
-                or self.sp_world_size is None
-                or self.sp_world_size <= 1
-                or self._sp_group is None
-            ):
-                return run_origin(x, weight, bias, activation, seq_idx)
-
-            halo = int(module.conv_kernel_size) - 1
-            if halo <= 0:
-                return run_origin(x, weight, bias, activation, seq_idx)
-
-            extended_x = _LeftHaloExchangeFn.apply(
-                x.contiguous(),
-                halo,
-                -1,
-                self._sp_group,
-                int(getattr(module, 'layer_idx', 0)),
-            )
-            extended_output = run_origin(extended_x, weight, bias, activation, seq_idx)
-            local_seq_len = x.shape[-1]
-            return extended_output.narrow(-1, halo, local_seq_len).contiguous()
-
-        wrapped_causal_conv1d._twinkle_origin_causal_conv1d_fn = origin_causal_conv1d_fn
-        wrapped_causal_conv1d._twinkle_wrapped_module = module.__class__.__name__
-        return wrapped_causal_conv1d
-
-    def _wrap_qwen35_linear_forward(
-        self,
-        module: torch.nn.Module,
-        origin_forward,
-        origin_chunk_rule,
-        origin_recurrent_rule,
-        origin_causal_conv1d_fn,
-    ):
-
-        halo_causal_conv1d_fn = self._wrap_qwen35_causal_conv1d_fn(module, origin_causal_conv1d_fn)
-
-        def wrapped_forward(
-            hidden_states: torch.Tensor,
-            cache_params=None,
-            cache_position: Optional[torch.Tensor] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-        ):
-            linear_sp_enabled = self.qwen35_linear_strict_full_seq or self.qwen35_linear_conv_halo
-            if (
-                not linear_sp_enabled
-                or self.sp_world_size is None
-                or self.sp_world_size <= 1
-                or self._sp_group is None
-            ):
-                return origin_forward(
-                    hidden_states,
-                    cache_params=cache_params,
-                    cache_position=cache_position,
-                    attention_mask=attention_mask,
-                )
-
-            if self.extra_kwargs.get('is_packed', False):
-                raise RuntimeError(
-                    'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP '
-                    'strict/halo modes.'
-                )
-
-            use_precomputed_states = (
-                cache_params is not None
-                and getattr(cache_params, 'has_previous_state', False)
-                and hidden_states.shape[1] == 1
-                and cache_position is not None
-            )
-            if use_precomputed_states:
-                # Decode already carries conv/recurrent state through cache_params; strict full-sequence recomputation
-                # is only needed for prefill, where local shards otherwise miss causal-conv left context.
-                return origin_forward(
-                    hidden_states,
-                    cache_params=cache_params,
-                    cache_position=cache_position,
-                    attention_mask=attention_mask,
-                )
-
-            if (
-                self.qwen35_linear_conv_halo
-                and not self.qwen35_linear_strict_full_seq
-                and not use_precomputed_states
-            ):
-                if not self._runtime_diag_linear_mode_reported:
-                    self._runtime_diag_linear_mode_reported = True
-                    _sp_runtime_diagnostics(
-                        'qwen35_linear_mode=halo+state_parallel '
-                        f'layer_idx={getattr(module, "layer_idx", -1)} '
-                        f'use_precomputed_states={use_precomputed_states}',
-                        self._sp_group,
-                    )
-                saved_causal_conv1d_fn = module.causal_conv1d_fn
-                module.causal_conv1d_fn = halo_causal_conv1d_fn
-                try:
-                    return origin_forward(
-                        hidden_states,
-                        cache_params=cache_params,
-                        cache_position=cache_position,
-                        attention_mask=attention_mask,
-                    )
-                finally:
-                    module.causal_conv1d_fn = saved_causal_conv1d_fn
-
-            if not self._runtime_diag_linear_mode_reported:
-                self._runtime_diag_linear_mode_reported = True
-                _sp_runtime_diagnostics(
-                    'qwen35_linear_mode=strict_full_seq '
-                    f'layer_idx={getattr(module, "layer_idx", -1)} '
-                    f'use_precomputed_states={use_precomputed_states}',
-                    self._sp_group,
-                )
-            layer_idx = int(getattr(module, 'layer_idx', 0))
-            debug_label = f'qwen35_linear_layer_{layer_idx}'
-            full_hidden_states = _GatherForwardSplitBackward.apply(
-                hidden_states,
-                1,
-                self.sp_world_size,
-                self._sp_group,
-                f'{debug_label}:hidden_states',
-            )
-            _sp_linear_collective_debug(
-                f'{debug_label}: before gather attention_mask '
-                f'shape={None if attention_mask is None else tuple(attention_mask.shape)}',
-                self._sp_group,
-            )
-            full_attention_mask = _gather_attention_mask_for_sp(
-                attention_mask,
-                local_seq_len=hidden_states.shape[1],
-                sp_world_size=self.sp_world_size,
-                sp_group=self._sp_group,
-            )
-            _sp_linear_collective_debug(
-                f'{debug_label}: after gather attention_mask '
-                f'shape={None if full_attention_mask is None else tuple(full_attention_mask.shape)}',
-                self._sp_group,
-            )
-            full_cache_position = cache_position
-            if full_cache_position is not None and torch.is_tensor(full_cache_position):
-                full_cache_position = torch.arange(
-                    0,
-                    full_hidden_states.shape[1],
-                    device=full_cache_position.device,
-                    dtype=full_cache_position.dtype,
-                )
-
-            saved_chunk_rule = module.chunk_gated_delta_rule
-            saved_recurrent_rule = module.recurrent_gated_delta_rule
-            module.chunk_gated_delta_rule = origin_chunk_rule
-            if origin_recurrent_rule is not None:
-                module.recurrent_gated_delta_rule = origin_recurrent_rule
-            try:
-                _sp_linear_collective_debug(
-                    f'{debug_label}: before origin_forward full_hidden_states shape={tuple(full_hidden_states.shape)}',
-                    self._sp_group,
-                )
-                full_output = origin_forward(
-                    full_hidden_states,
-                    cache_params=cache_params,
-                    cache_position=full_cache_position,
-                    attention_mask=full_attention_mask,
-                )
-                _sp_linear_collective_debug(
-                    f'{debug_label}: after origin_forward full_output shape={tuple(full_output.shape)}',
-                    self._sp_group,
-                )
-            finally:
-                module.chunk_gated_delta_rule = saved_chunk_rule
-                module.recurrent_gated_delta_rule = saved_recurrent_rule
-
-            local_output = _SplitForwardGatherBackward.apply(
-                full_output,
-                1,
-                self.sp_world_size,
-                self._sp_group,
-                f'{debug_label}:full_output',
-            )
-            if self.qwen35_linear_strict_barrier and dist.is_available() and dist.is_initialized():
-                _sp_linear_collective_debug(
-                    f'{debug_label}: before strict global barrier',
-                    self._sp_group,
-                )
-                dist.barrier()
-                _sp_linear_collective_debug(
-                    f'{debug_label}: after strict global barrier',
-                    self._sp_group,
-                )
-            return local_output
-
-        wrapped_forward._twinkle_origin_forward = origin_forward
-        wrapped_forward._twinkle_wrapped_module = module.__class__.__name__
-        return wrapped_forward
-
-    def _wrap_qwen35_attention_debug_forward(
-        self,
-        module: torch.nn.Module,
-        origin_forward,
-    ):
-        modeling_module = importlib.import_module(module.__class__.__module__)
-        apply_rotary_pos_emb = getattr(modeling_module, 'apply_rotary_pos_emb')
-        all_attention_functions = getattr(modeling_module, 'ALL_ATTENTION_FUNCTIONS')
-        eager_attention_forward = getattr(modeling_module, 'eager_attention_forward')
-        layer_idx = int(getattr(module, 'layer_idx', 0))
-        debug_label = f'qwen35_attention_layer_{layer_idx}'
-
-        def wrapped_forward(
-            hidden_states: torch.Tensor,
-            position_embeddings,
-            attention_mask: Optional[torch.Tensor],
-            past_key_values=None,
-            cache_position: Optional[torch.Tensor] = None,
-            **kwargs,
-        ):
-            _sp_linear_collective_debug(
-                f'{debug_label}: before qkv_proj hidden_states={tuple(hidden_states.shape)}',
-                self._sp_group,
-            )
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, module.head_dim)
-
-            query_states, gate = torch.chunk(
-                module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2), 2, dim=-1
-            )
-            gate = gate.reshape(*input_shape, -1)
-            key_states = module.k_proj(hidden_states)
-            value_states = module.v_proj(hidden_states)
-            _sp_linear_collective_debug(
-                f'{debug_label}: after qkv_proj q={tuple(query_states.shape)} '
-                f'k={tuple(key_states.shape)} v={tuple(value_states.shape)}',
-                self._sp_group,
-            )
-
-            query_states = module.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-            key_states = module.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
-            value_states = value_states.view(hidden_shape).transpose(1, 2)
-            _sp_linear_collective_debug(
-                f'{debug_label}: after qk_norm q={tuple(query_states.shape)} '
-                f'k={tuple(key_states.shape)} v={tuple(value_states.shape)}',
-                self._sp_group,
-            )
-
-            cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            _sp_linear_collective_debug(
-                f'{debug_label}: after rotary q={tuple(query_states.shape)} k={tuple(key_states.shape)}',
-                self._sp_group,
-            )
-
-            if past_key_values is not None:
-                cache_kwargs = {'sin': sin, 'cos': cos, 'cache_position': cache_position}
-                key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx, cache_kwargs)
-                _sp_linear_collective_debug(
-                    f'{debug_label}: after cache_update k={tuple(key_states.shape)} v={tuple(value_states.shape)}',
-                    self._sp_group,
-                )
-
-            attention_interface = all_attention_functions.get_interface(
-                module.config._attn_implementation,
-                eager_attention_forward,
-            )
-            _sp_linear_collective_debug(
-                f'{debug_label}: before attention_interface impl={module.config._attn_implementation} '
-                f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
-                self._sp_group,
-            )
-            attn_output, attn_weights = attention_interface(
-                module,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not module.training else module.attention_dropout,
-                scaling=module.scaling,
-                **kwargs,
-            )
-            _sp_linear_collective_debug(
-                f'{debug_label}: after attention_interface attn_output={tuple(attn_output.shape)}',
-                self._sp_group,
-            )
-
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = attn_output * torch.sigmoid(gate)
-            attn_output = module.o_proj(attn_output)
-            _sp_linear_collective_debug(
-                f'{debug_label}: after o_proj attn_output={tuple(attn_output.shape)}',
-                self._sp_group,
-            )
-            return attn_output, attn_weights
-
-        wrapped_forward._twinkle_origin_forward = origin_forward
-        wrapped_forward._twinkle_wrapped_module = module.__class__.__name__
-        return wrapped_forward
-
-    def _prepare_qwen35_linear_attn(self, base_model: torch.nn.Module):
-        if hasattr(base_model, 'language_model'):
-            text_model = base_model.language_model
-        else:
-            text_model = base_model
-
-        has_linear_attn = False
-        for module in text_model.modules():
-            if module.__class__.__name__ != 'Qwen3_5GatedDeltaNet':
-                continue
-            origin_rule = getattr(module, 'chunk_gated_delta_rule', None)
-            if origin_rule is None:
-                continue
-            origin_recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)
-            origin_forward = getattr(module, 'forward', None)
-            has_linear_attn = True
-            if getattr(module, '_twinkle_sp_linear_chunk_patched', False):
-                continue
-            module.chunk_gated_delta_rule = self._wrap_qwen35_chunk_rule(module, origin_rule)
-            if origin_forward is not None:
-                module.forward = self._wrap_qwen35_linear_forward(
-                    module,
-                    origin_forward,
-                    origin_rule,
-                    origin_recurrent_rule,
-                    getattr(module, 'causal_conv1d_fn', None),
-                )
-            module._twinkle_sp_linear_chunk_patched = True
-
-        if _sp_qwen35_decoder_debug_enabled() and hasattr(text_model, 'layers'):
-            for layer_idx, decoder_layer in enumerate(text_model.layers):
-                if decoder_layer.__class__.__name__ != 'Qwen3_5DecoderLayer':
-                    continue
-                if getattr(decoder_layer, '_twinkle_sp_decoder_debug_hooked', False):
-                    continue
-
-                def _make_pre_hook(idx):
-
-                    def _pre_hook(_module, _args, _kwargs):
-                        hidden_states = None
-                        if 'hidden_states' in _kwargs:
-                            hidden_states = _kwargs['hidden_states']
-                        elif _args:
-                            hidden_states = _args[0]
-                        _sp_linear_collective_debug(
-                            f'qwen35_decoder_layer_{idx}: before forward '
-                            f'layer_type={getattr(_module, "layer_type", "unknown")} '
-                            f'hidden_states={None if hidden_states is None else tuple(hidden_states.shape)}',
-                            self._sp_group,
-                        )
-
-                    return _pre_hook
-
-                def _make_post_hook(idx):
-
-                    def _post_hook(_module, _args, _kwargs, output):
-                        hidden_states = output[0] if isinstance(output, (tuple, list)) else output
-                        _sp_linear_collective_debug(
-                            f'qwen35_decoder_layer_{idx}: after forward '
-                            f'layer_type={getattr(_module, "layer_type", "unknown")} '
-                            f'hidden_states={None if hidden_states is None else tuple(hidden_states.shape)}',
-                            self._sp_group,
-                        )
-
-                    return _post_hook
-
-                decoder_layer.register_forward_pre_hook(_make_pre_hook(layer_idx), with_kwargs=True)
-                decoder_layer.register_forward_hook(_make_post_hook(layer_idx), with_kwargs=True)
-                decoder_layer._twinkle_sp_decoder_debug_hooked = True
-
-                full_attn = getattr(decoder_layer, 'self_attn', None)
-                if (
-                    _sp_qwen35_decoder_debug_enabled()
-                    and full_attn is not None
-                    and full_attn.__class__.__name__ == 'Qwen3_5Attention'
-                    and not getattr(full_attn, '_twinkle_sp_attn_debug_hooked', False)
-                ):
-                    origin_attn_forward = getattr(full_attn, 'forward', None)
-                    if origin_attn_forward is not None:
-                        full_attn.forward = self._wrap_qwen35_attention_debug_forward(full_attn, origin_attn_forward)
-
-                    def _make_attn_pre_hook(idx):
-
-                        def _pre_hook(_module, _args, _kwargs):
-                            hidden_states = None
-                            if 'hidden_states' in _kwargs:
-                                hidden_states = _kwargs['hidden_states']
-                            elif _args:
-                                hidden_states = _args[0]
-                            attention_mask = _kwargs.get('attention_mask', None)
-                            _sp_linear_collective_debug(
-                                f'qwen35_attention_layer_{idx}: before forward '
-                                f'hidden_states={None if hidden_states is None else tuple(hidden_states.shape)} '
-                                f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)}',
-                                self._sp_group,
-                            )
-
-                        return _pre_hook
-
-                    def _make_attn_post_hook(idx):
-
-                        def _post_hook(_module, _args, _kwargs, output):
-                            attn_output = output[0] if isinstance(output, (tuple, list)) else output
-                            _sp_linear_collective_debug(
-                                f'qwen35_attention_layer_{idx}: after forward '
-                                f'attn_output={None if attn_output is None else tuple(attn_output.shape)}',
-                                self._sp_group,
-                            )
-
-                        return _post_hook
-
-                    full_attn.register_forward_pre_hook(_make_attn_pre_hook(layer_idx), with_kwargs=True)
-                    full_attn.register_forward_hook(_make_attn_post_hook(layer_idx), with_kwargs=True)
-                    full_attn._twinkle_sp_attn_debug_hooked = True
-
-        self.has_qwen35_linear_attn = has_linear_attn
-        self.extra_kwargs['has_qwen35_linear_attn'] = has_linear_attn
-
     def _prepare_forward_hook(self, base_model: torch.nn.Module):
 
         def pre_forward_split_hook(_self, args, kwargs):
@@ -1825,17 +924,6 @@ class SequenceParallel:
             kwargs['attention_mask'] = attention_mask
             for i, name in enumerate(extra_names):
                 kwargs[name] = extra_values[i]
-            if not self._runtime_diag_forward_reported:
-                self._runtime_diag_forward_reported = True
-                _sp_runtime_diagnostics(
-                    'first_forward '
-                    f'input_ids={None if input_ids is None else tuple(input_ids.shape)} '
-                    f'inputs_embeds={None if inputs_embeds is None else tuple(inputs_embeds.shape)} '
-                    f'position_ids={None if position_ids is None else tuple(position_ids.shape)} '
-                    f'attention_mask={None if attention_mask is None else tuple(attention_mask.shape)} '
-                    f'is_packed={self.extra_kwargs.get("is_packed", False)}',
-                    self._sp_group,
-                )
             return args, kwargs
 
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
@@ -1965,36 +1053,7 @@ class SequenceParallel:
             self._prepare_flash_attn(llm_model)
             SequenceParallel._global_inited = True
 
-        # Model-specific patch: Qwen3.5 linear attention state passing for SP.
-        self._prepare_qwen35_linear_attn(llm_model)
-        if (
-            (self.qwen35_linear_conv_halo or self.qwen35_linear_strict_full_seq)
-            and self.has_qwen35_linear_attn
-            and self.qwen35_linear_disable_gc
-        ):
-            was_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
-            if not was_gc_enabled:
-                was_gc_enabled = bool(getattr(llm_model, 'is_gradient_checkpointing', False))
-            if was_gc_enabled:
-                disabled = self._disable_gradient_checkpointing_for_model(model)
-                self.extra_kwargs['qwen35_linear_disabled_gradient_checkpointing'] = disabled
-        if not self._runtime_diag_init_reported:
-            self._runtime_diag_init_reported = True
-            _sp_runtime_diagnostics(
-                'initialized '
-                f'sp_world_size={self.sp_world_size} '
-                f'world_size={self.world_size} '
-                f'attn_impl={getattr(getattr(llm_model, "config", None), "_attn_implementation", "unknown")} '
-                f'has_qwen35_linear_attn={self.has_qwen35_linear_attn} '
-                f'linear_strict={self.qwen35_linear_strict_full_seq} '
-                f'strict_barrier={self.qwen35_linear_strict_barrier} '
-                f'linear_conv_halo={self.qwen35_linear_conv_halo} '
-                f'linear_disable_gc={self.qwen35_linear_disable_gc} '
-                f'disabled_gc={self.extra_kwargs.get("qwen35_linear_disabled_gradient_checkpointing", False)} '
-                f'model_gc={getattr(model, "is_gradient_checkpointing", False)} '
-                f'llm_gc={getattr(llm_model, "is_gradient_checkpointing", False)}',
-                self._sp_group,
-            )
+        self._activate_linear_attention_provider(llm_model, model)
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
@@ -2112,12 +1171,7 @@ class SequenceParallel:
         text_position_ids = _extract_text_position_ids(real_position_ids)
         # Track packed batches to drive attention backend behavior (packed => require flash_attention_2 varlen).
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(text_position_ids)
-        self.extra_kwargs['has_qwen35_linear_attn'] = self.has_qwen35_linear_attn
-        if self.world_size is not None and self.world_size > 1 and self.has_qwen35_linear_attn and self.extra_kwargs[
-                'is_packed']:
-            raise RuntimeError(
-                'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
-                'Packed reset semantics for recurrent states are not implemented.')
+        self._validate_linear_attention_inputs()
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
@@ -2165,7 +1219,7 @@ class SequenceParallel:
             # For SP>1 keep 2D masks and let full-attention gather to global mask later.
             # Prebuilding 4D causal masks before split can break full-sequence semantics.
             if (self.world_size == 1 and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None
-                    and not self.has_qwen35_linear_attn):
+                    and self._should_build_causal_mask()):
                 attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
                                                        None, None)
         if extra_split_values is not None:
@@ -2258,12 +1312,7 @@ class SequenceParallel:
         if text_position_ids is not None:
             self.extra_kwargs['text_position_ids'] = text_position_ids.clone()
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(text_position_ids)
-        self.extra_kwargs['has_qwen35_linear_attn'] = self.has_qwen35_linear_attn
-        if self.world_size is not None and self.world_size > 1 and self.has_qwen35_linear_attn and self.extra_kwargs[
-                'is_packed']:
-            raise RuntimeError(
-                'SequenceParallel: packed batches are not supported for Qwen3.5 linear attention under SP. '
-                'Packed reset semantics for recurrent states are not implemented.')
+        self._validate_linear_attention_inputs()
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
