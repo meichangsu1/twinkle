@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 from peft import LoraConfig
+from torch.utils.data import DataLoader as TorchDataLoader
 
 import twinkle
 from twinkle import DeviceMesh, Platform, get_logger, torch_util
@@ -170,13 +171,15 @@ def _state_delta_stats(before, after):
 
 
 def _get_global_batch(batch_index: int) -> list[dict[str, Any]]:
-    # Build the reference batch without device_mesh sharding so SP=0/SP=2 read the same global samples.
-    dataloader = DataLoader(
-        dataset=partial(create_dataset, data_slice=None),
+    # Use the raw torch dataloader here. twinkle.DataLoader auto-injects the default
+    # device_mesh in local mode, which would shard the reference batch again.
+    dataset = create_dataset(data_slice=None)
+    dataloader = TorchDataLoader(
+        dataset,
         batch_size=GLOBAL_BATCH_SIZE,
-        device_mesh=None,
         num_workers=0,
         shuffle=False,
+        collate_fn=lambda x: x,
     )
     for idx, batch in enumerate(dataloader):
         if idx == batch_index:
