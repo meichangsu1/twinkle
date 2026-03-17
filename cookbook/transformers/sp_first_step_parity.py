@@ -112,7 +112,7 @@ def _batch_digest(batch: list[dict[str, Any]]) -> dict[str, Any]:
     _update_hash(hasher, batch)
 
     digest = {
-        'num_samples': len(batch),
+        'num_samples': int(len(batch)),
         'sha256': hasher.hexdigest(),
     }
     if batch and isinstance(batch[0], dict):
@@ -123,7 +123,7 @@ def _batch_digest(batch: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(value, torch.Tensor):
                 value = torch_util.to_local_tensor(value)
                 sample_summary[key] = {
-                    'shape': list(value.shape),
+                    'shape': [int(x) for x in value.shape],
                     'dtype': str(value.dtype),
                     'sum': float(value.detach().float().sum().item()),
                     'hash': _tensor_hash(value),
@@ -235,13 +235,13 @@ def main():
         'mode': 'first_step_parity',
         'model_id': MODEL_ID,
         'datasets': DATASETS,
-        'seed': seed,
-        'batch_index': batch_index,
-        'global_batch_size': GLOBAL_BATCH_SIZE,
-        'ulysses_size': ULYSSES_SIZE,
-        'data_world_size': device_mesh.data_world_size,
-        'data_rank': device_mesh.data_rank,
-        'rank': Platform.get_rank(),
+        'seed': int(seed),
+        'batch_index': int(batch_index),
+        'global_batch_size': int(GLOBAL_BATCH_SIZE),
+        'ulysses_size': int(ULYSSES_SIZE),
+        'data_world_size': int(device_mesh.data_world_size),
+        'data_rank': int(device_mesh.data_rank),
+        'rank': int(Platform.get_rank()),
         'env': {
             'QWEN35_SP_LINEAR_STRICT': os.environ.get('QWEN35_SP_LINEAR_STRICT', '0'),
             'QWEN35_SP_LINEAR_CONV_HALO': os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0'),
