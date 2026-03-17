@@ -32,6 +32,31 @@ MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
 DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://swift/self-cognition')
 ULYSSES_SIZE = int(os.environ.get('TWINKLE_PARITY_ULYSSES_SIZE', '1'))
 GLOBAL_BATCH_SIZE = int(os.environ.get('TWINKLE_PARITY_GLOBAL_BATCH_SIZE', '8'))
+PARITY_SEED = int(os.environ.get('TWINKLE_PARITY_SEED', '42'))
+PARITY_STRICT_DETERMINISM = os.environ.get('TWINKLE_PARITY_STRICT_DETERMINISM', '1') == '1'
+PARITY_MIXED_PRECISION = os.environ.get('TWINKLE_PARITY_MIXED_PRECISION', 'no')
+PARITY_ATTN_IMPL = os.environ.get('TWINKLE_PARITY_ATTN_IMPL', 'eager')
+PARITY_DISABLE_GC = os.environ.get('TWINKLE_PARITY_DISABLE_GC', '1') == '1'
+
+
+def _enable_strict_determinism(seed: int) -> None:
+    os.environ.setdefault('PYTHONHASHSEED', str(seed))
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
+    os.environ.setdefault('NCCL_DETERMINISTIC', '1')
+    os.environ.setdefault('FLASH_ATTENTION_DETERMINISTIC', '1')
+    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = False
+    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+if PARITY_STRICT_DETERMINISM:
+    _enable_strict_determinism(PARITY_SEED)
 
 device_mesh = DeviceMesh(
     device_type='cuda',
@@ -70,7 +95,17 @@ def _create_model(num_training_steps: int) -> TransformersModel:
         model_id=MODEL_ID,
         device_mesh=device_mesh,
         strategy='native_fsdp',
+        mixed_precision=PARITY_MIXED_PRECISION,
+        attn_implementation=PARITY_ATTN_IMPL,
     )
+    if hasattr(model.model, 'config') and model.model.config is not None:
+        for attr in ('_attn_implementation', '_attn_implementation_internal'):
+            if hasattr(model.model.config, attr):
+                setattr(model.model.config, attr, PARITY_ATTN_IMPL)
+    if PARITY_DISABLE_GC and hasattr(model.model, 'gradient_checkpointing_disable'):
+        model.model.gradient_checkpointing_disable()
+        if hasattr(model.model, 'config') and model.model.config is not None and hasattr(model.model.config, 'use_cache'):
+            model.model.config.use_cache = False
     lora_config = LoraConfig(target_modules='all-linear', lora_dropout=0.0)
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
     model.set_optimizer('AdamW', lr=1e-4, adapter_name='default')
@@ -81,6 +116,24 @@ def _create_model(num_training_steps: int) -> TransformersModel:
         adapter_name='default',
     )
     return model
+
+
+def _ensure_process_group() -> None:
+    if dist.is_available() and dist.is_initialized():
+        return
+    if Platform.get_world_size() <= 1:
+        return
+    torch_util.set_device()
+    backend = Platform.device_backend()
+    init_kwargs = {
+        'backend': backend,
+        'init_method': 'env://',
+        'rank': Platform.get_rank(),
+        'world_size': Platform.get_world_size(),
+    }
+    if backend in ('nccl', 'hccl'):
+        init_kwargs['device_id'] = torch.device(Platform.get_local_device())
+    dist.init_process_group(**init_kwargs)
 
 
 def _tensor_hash(tensor: torch.Tensor) -> str:
@@ -228,9 +281,10 @@ def _run_first_train_step(model: TransformersModel, local_batch, init_state):
 
 def main():
     batch_index = int(os.environ.get('TWINKLE_PARITY_BATCH_INDEX', '0'))
-    seed = int(os.environ.get('TWINKLE_PARITY_SEED', '42'))
+    seed = PARITY_SEED
     output_path = os.environ.get('TWINKLE_PARITY_OUTPUT')
 
+    _ensure_process_group()
     _set_seed(seed)
     global_batch = _get_global_batch(batch_index)
     global_batch_digest = _batch_digest(global_batch)
@@ -259,6 +313,10 @@ def main():
             'QWEN35_SP_LINEAR_CONV_HALO': os.environ.get('QWEN35_SP_LINEAR_CONV_HALO', '0'),
             'QWEN35_SP_LINEAR_STRICT_BARRIER': os.environ.get('QWEN35_SP_LINEAR_STRICT_BARRIER', '0'),
             'TWINKLE_PARITY_WARMUP_STEPS': os.environ.get('TWINKLE_PARITY_WARMUP_STEPS', '0'),
+            'TWINKLE_PARITY_STRICT_DETERMINISM': os.environ.get('TWINKLE_PARITY_STRICT_DETERMINISM', '1'),
+            'TWINKLE_PARITY_MIXED_PRECISION': PARITY_MIXED_PRECISION,
+            'TWINKLE_PARITY_ATTN_IMPL': PARITY_ATTN_IMPL,
+            'TWINKLE_PARITY_DISABLE_GC': os.environ.get('TWINKLE_PARITY_DISABLE_GC', '1'),
         },
         'global_batch_digest': global_batch_digest,
         'result': result,
