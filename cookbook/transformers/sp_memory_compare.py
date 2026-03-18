@@ -17,15 +17,26 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import AlpacaProcessor, SelfCognitionProcessor
 
-# SP off
+# 2-card SP off
 # TWINKLE_MEMORY_ULYSSES_SIZE=1 \
 # TWINKLE_MEMORY_OUTPUT=/tmp/sp0_memory.json \
-# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_memory_compare
+# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_memory_compare
 
-# SP on
+# 2-card SP on
 # TWINKLE_MEMORY_ULYSSES_SIZE=2 \
 # TWINKLE_MEMORY_OUTPUT=/tmp/sp2_memory.json \
 # TWINKLE_MEMORY_COMPARE_TO=/tmp/sp0_memory.json \
+# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_memory_compare
+
+# 4-card SP off
+# TWINKLE_MEMORY_ULYSSES_SIZE=1 \
+# TWINKLE_MEMORY_OUTPUT=/tmp/sp0_memory_4g.json \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_memory_compare
+
+# 4-card SP on
+# TWINKLE_MEMORY_ULYSSES_SIZE=2 \
+# TWINKLE_MEMORY_OUTPUT=/tmp/sp2_memory_4g.json \
+# TWINKLE_MEMORY_COMPARE_TO=/tmp/sp0_memory_4g.json \
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_memory_compare
 
 logger = get_logger()
@@ -33,6 +44,8 @@ logger = get_logger()
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
 DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://swift/self-cognition')
 ULYSSES_SIZE = int(os.environ.get('TWINKLE_MEMORY_ULYSSES_SIZE', '1'))
+WORLD_SIZE = int(os.environ.get('WORLD_SIZE', os.environ.get('TWINKLE_MEMORY_WORLD_SIZE', '4')))
+LOCAL_WORLD_SIZE = int(os.environ.get('LOCAL_WORLD_SIZE', os.environ.get('TWINKLE_MEMORY_LOCAL_WORLD_SIZE', str(WORLD_SIZE))))
 GLOBAL_BATCH_SIZE = int(os.environ.get('TWINKLE_MEMORY_GLOBAL_BATCH_SIZE', '8'))
 MEMORY_SEED = int(os.environ.get('TWINKLE_MEMORY_SEED', '42'))
 MEMORY_MIXED_PRECISION = os.environ.get('TWINKLE_MEMORY_MIXED_PRECISION', 'bf16')
@@ -70,16 +83,18 @@ if MEMORY_STRICT_DETERMINISM:
 
 def _build_device_mesh() -> DeviceMesh:
     if MEMORY_WRAP_MODE == 'native_fsdp':
+        if WORLD_SIZE < 2 or WORLD_SIZE % 2 != 0:
+            raise ValueError('TWINKLE_MEMORY_WRAP_MODE=native_fsdp requires an even WORLD_SIZE >= 2.')
         return DeviceMesh(
             device_type='cuda',
-            mesh=np.arange(4).reshape(2, 2),
+            mesh=np.arange(WORLD_SIZE).reshape(WORLD_SIZE // 2, 2),
             mesh_dim_names=('dp', 'fsdp'),
             ulysses_size=ULYSSES_SIZE,
         )
     if MEMORY_WRAP_MODE == 'ddp':
         return DeviceMesh(
             device_type='cuda',
-            mesh=np.arange(4),
+            mesh=np.arange(WORLD_SIZE),
             mesh_dim_names=('dp',),
             ulysses_size=ULYSSES_SIZE,
         )
@@ -90,7 +105,7 @@ device_mesh = _build_device_mesh()
 
 twinkle.initialize(
     mode='local',
-    nproc_per_node=4,
+    nproc_per_node=LOCAL_WORLD_SIZE,
     global_device_mesh=device_mesh,
     lazy_collect=False,
 )
