@@ -70,18 +70,21 @@ class AccelerateStrategy:
         return parallelism_config
 
     def _fsdp_config_from_device_mesh(self, device_mesh: DeviceMesh, fsdp_config: Dict[str, Any]):
-        from accelerate import FullyShardedDataParallelPlugin
-        from torch.distributed.fsdp import BackwardPrefetch
-        from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
-
         if device_mesh is None:
             return None
 
         fsdp_size = device_mesh.get_dim_size('fsdp') if device_mesh.has_dim('fsdp') else 1
-        dp_size = device_mesh.get_dim_size('dp') if device_mesh.has_dim('dp') else 1
 
-        if fsdp_size == 1 and dp_size == 1:
+        # Pure DDP should not build an FSDP plugin at all. Passing a NO_SHARD FSDP plugin
+        # still routes accelerate through the FSDP codepath and breaks mixed_precision='no'.
+        if fsdp_size == 1:
             return None
+
+        from accelerate import FullyShardedDataParallelPlugin
+        from torch.distributed.fsdp import BackwardPrefetch
+        from torch.distributed.fsdp import ShardingStrategy as FSDPShardingStrategy
+
+        dp_size = device_mesh.get_dim_size('dp') if device_mesh.has_dim('dp') else 1
 
         fsdp_config = fsdp_config or {}
 
@@ -93,8 +96,6 @@ class AccelerateStrategy:
         elif fsdp_size > 1:
             # FSDP
             sharding_strategy = FSDPShardingStrategy.FULL_SHARD
-        elif sharding_strategy is None:
-            sharding_strategy = FSDPShardingStrategy.NO_SHARD
 
         fsdp_version = fsdp_config.pop('fsdp_config', 2)
         assert fsdp_version == 2, 'Currently only support fsdp_version = 2'
