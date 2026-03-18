@@ -34,6 +34,9 @@ logger = get_logger()
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
 DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://swift/self-cognition')
 ULYSSES_SIZE = int(os.environ.get('TWINKLE_PARITY_ULYSSES_SIZE', '1'))
+WORLD_SIZE = int(os.environ.get('WORLD_SIZE', os.environ.get('TWINKLE_PARITY_WORLD_SIZE', '4')))
+LOCAL_WORLD_SIZE = int(
+    os.environ.get('LOCAL_WORLD_SIZE', os.environ.get('TWINKLE_PARITY_LOCAL_WORLD_SIZE', str(WORLD_SIZE))))
 GLOBAL_BATCH_SIZE = int(os.environ.get('TWINKLE_PARITY_GLOBAL_BATCH_SIZE', '8'))
 PARITY_SEED = int(os.environ.get('TWINKLE_PARITY_SEED', '42'))
 PARITY_STRICT_DETERMINISM = os.environ.get('TWINKLE_PARITY_STRICT_DETERMINISM', '1') == '1'
@@ -43,19 +46,35 @@ PARITY_DISABLE_GC = os.environ.get('TWINKLE_PARITY_DISABLE_GC', '1') == '1'
 PARITY_WRAP_MODE = os.environ.get('TWINKLE_PARITY_WRAP_MODE', 'native_fsdp')
 
 
+def _device_backend_prefix() -> str:
+    return Platform.device_prefix()
+
+
+def _cuda_available() -> bool:
+    return _device_backend_prefix() == 'cuda' and hasattr(torch, 'cuda') and torch.cuda.is_available()
+
+
+def _npu_available() -> bool:
+    return _device_backend_prefix() == 'npu' and hasattr(torch, 'npu') and torch.npu.is_available()
+
+
 def _enable_strict_determinism(seed: int) -> None:
     os.environ.setdefault('PYTHONHASHSEED', str(seed))
-    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
-    os.environ.setdefault('NCCL_DETERMINISTIC', '1')
-    os.environ.setdefault('FLASH_ATTENTION_DETERMINISTIC', '1')
-    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    if _cuda_available():
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
+        os.environ.setdefault('NCCL_DETERMINISTIC', '1')
+        os.environ.setdefault('FLASH_ATTENTION_DETERMINISTIC', '1')
+        os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
 
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = False
-    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = False
+        if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    elif _npu_available():
+        os.environ.setdefault('HCCL_DETERMINISTIC', '1')
+        os.environ.setdefault('ASCEND_LAUNCH_BLOCKING', '1')
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
@@ -64,16 +83,18 @@ if PARITY_STRICT_DETERMINISM:
 
 def _build_device_mesh() -> DeviceMesh:
     if PARITY_WRAP_MODE == 'native_fsdp':
+        if WORLD_SIZE < 2 or WORLD_SIZE % 2 != 0:
+            raise ValueError('TWINKLE_PARITY_WRAP_MODE=native_fsdp requires an even WORLD_SIZE >= 2.')
         return DeviceMesh(
-            device_type='cuda',
-            mesh=np.arange(4).reshape(2, 2),
+            device_type=_device_backend_prefix(),
+            mesh=np.arange(WORLD_SIZE).reshape(WORLD_SIZE // 2, 2),
             mesh_dim_names=('dp', 'fsdp'),
             ulysses_size=ULYSSES_SIZE,
         )
     if PARITY_WRAP_MODE == 'ddp':
         return DeviceMesh(
-            device_type='cuda',
-            mesh=np.arange(4),
+            device_type=_device_backend_prefix(),
+            mesh=np.arange(WORLD_SIZE),
             mesh_dim_names=('dp',),
             ulysses_size=ULYSSES_SIZE,
         )
@@ -84,7 +105,7 @@ device_mesh = _build_device_mesh()
 
 twinkle.initialize(
     mode='local',
-    nproc_per_node=4,
+    nproc_per_node=LOCAL_WORLD_SIZE,
     global_device_mesh=device_mesh,
     lazy_collect=False,
 )
@@ -102,8 +123,10 @@ def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if _cuda_available():
         torch.cuda.manual_seed_all(seed)
+    elif _npu_available():
+        torch.npu.manual_seed_all(seed)
 
 
 def _create_model(num_training_steps: int) -> TransformersModel:
