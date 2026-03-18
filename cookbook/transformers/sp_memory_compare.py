@@ -99,7 +99,7 @@ def _enable_strict_determinism(seed: int) -> None:
         if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     elif _npu_available():
-        os.environ.setdefault('HCCL_DETERMINISTIC', '1')
+        os.environ.setdefault('HCCL_DETERMINISTIC', 'true')
         os.environ.setdefault('ASCEND_LAUNCH_BLOCKING', '1')
 
     torch.use_deterministic_algorithms(True, warn_only=True)

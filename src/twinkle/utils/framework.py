@@ -170,7 +170,7 @@ class Torch(Framework):
 
                 if Torch.is_npu_available():
                     os.environ['ASCEND_LAUNCH_BLOCKING'] = '1'
-                    os.environ['HCCL_DETERMINISTIC'] = '1'
+                    os.environ['HCCL_DETERMINISTIC'] = 'true'
 
     @staticmethod
     def to_local_tensor(tensor: 'torch.Tensor') -> 'torch.Tensor':
