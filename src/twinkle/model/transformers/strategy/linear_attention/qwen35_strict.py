@@ -1,88 +1,58 @@
 import os
+import sys
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 
-
-class _GatherForwardSplitBackward(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, sequence_parallel, dim: int):
-        ctx.sequence_parallel = sequence_parallel
-        ctx.dim = dim
-        return sequence_parallel.gather(
-            tensor.contiguous(),
-            dim=dim,
-            position_ids=sequence_parallel.real_position_ids,
-        )
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        grad_input = ctx.sequence_parallel.split(
-            grad_output.contiguous(),
-            dim=ctx.dim,
-            position_ids=ctx.sequence_parallel.real_position_ids,
-        )
-        return grad_input.contiguous(), None, None
-
-
-class _SplitForwardGatherBackward(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, tensor: torch.Tensor, sequence_parallel, dim: int):
-        ctx.sequence_parallel = sequence_parallel
-        ctx.dim = dim
-        return sequence_parallel.split(
-            tensor.contiguous(),
-            dim=dim,
-            position_ids=sequence_parallel.real_position_ids,
-        )
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        grad_input = ctx.sequence_parallel.gather(
-            grad_output.contiguous(),
-            dim=ctx.dim,
-            position_ids=ctx.sequence_parallel.real_position_ids,
-        )
-        return grad_input.contiguous(), None, None
-
-
-def _gather_optional_tensor(
-    tensor: Optional[torch.Tensor],
-    sequence_parallel,
-    local_seq_len: int,
-) -> Optional[torch.Tensor]:
-    if tensor is None or not torch.is_tensor(tensor):
-        return tensor
-
-    gather_dims = []
-    if tensor.dim() == 1:
-        if tensor.shape[0] == local_seq_len:
-            gather_dims.append(0)
-    else:
-        if tensor.shape[-1] == local_seq_len:
-            gather_dims.append(tensor.dim() - 1)
-        if tensor.dim() >= 3 and tensor.shape[-2] == local_seq_len:
-            gather_dims.append(tensor.dim() - 2)
-        elif tensor.dim() == 2 and tensor.shape[0] == local_seq_len:
-            gather_dims.append(0)
-
-    dedup_dims = []
-    for dim in gather_dims:
-        if dim not in dedup_dims:
-            dedup_dims.append(dim)
-
-    output = tensor.contiguous()
-    for dim in dedup_dims:
-        output = sequence_parallel.gather(output, dim=dim, position_ids=sequence_parallel.real_position_ids)
-    return output.contiguous()
+from .sp_collectives import (gather_attention_mask_from_sequence_parallel_region,
+                             gather_cache_position_from_sequence_parallel_region,
+                             gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region)
 
 
 class Qwen35StrictFullSeqHelper:
 
     def __init__(self):
         self.enabled = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
+        self.trace_enabled = os.environ.get('QWEN35_SP_LINEAR_STRICT_TRACE', '0') == '1'
+        self._trace_seq = 0
+
+    @staticmethod
+    def _rank() -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return int(os.environ.get('RANK', '-1'))
+
+    @staticmethod
+    def _sp_rank(sequence_parallel) -> int:
+        sp_group = getattr(sequence_parallel, '_sp_group', None)
+        if sp_group is not None and dist.is_available() and dist.is_initialized():
+            return dist.get_rank(sp_group)
+        return 0
+
+    def _trace(self, sequence_parallel, module: torch.nn.Module, event: str, tensor: Optional[torch.Tensor] = None, **kwargs):
+        if not self.trace_enabled:
+            return
+
+        layer_idx = getattr(module, 'layer_idx', None)
+        rank = self._rank()
+        sp_rank = self._sp_rank(sequence_parallel)
+        payload = {
+            'seq': self._trace_seq,
+            'rank': rank,
+            'sp_rank': sp_rank,
+            'layer_idx': layer_idx,
+            'event': event,
+        }
+        if tensor is not None:
+            payload['shape'] = tuple(int(x) for x in tensor.shape)
+            payload['dtype'] = str(tensor.dtype)
+            payload['device'] = str(tensor.device)
+        for key, value in kwargs.items():
+            payload[key] = value
+        self._trace_seq += 1
+        text = ' '.join(f'{key}={value}' for key, value in payload.items())
+        print(f'[qwen35_strict] {text}', file=sys.stderr, flush=True)
 
     def validate_runtime(self, sequence_parallel) -> None:
         if not self.enabled:
@@ -108,25 +78,49 @@ class Qwen35StrictFullSeqHelper:
         attention_mask: Optional[torch.Tensor] = None,
     ):
         self.validate_runtime(sequence_parallel)
+        self._trace(sequence_parallel, module, 'run:enter', tensor=hidden_states)
 
-        full_hidden_states = _GatherForwardSplitBackward.apply(hidden_states.contiguous(), sequence_parallel, 1)
+        self._trace(sequence_parallel, module, 'hidden_states:gather:before', tensor=hidden_states, dim=1)
+        full_hidden_states = gather_from_sequence_parallel_region(
+            hidden_states.contiguous(),
+            sequence_parallel,
+            1,
+            output_grad_mode='split',
+        )
+        self._trace(sequence_parallel, module, 'hidden_states:gather:after', tensor=full_hidden_states, dim=1)
         local_seq_len = hidden_states.shape[1]
-        full_attention_mask = _gather_optional_tensor(attention_mask, sequence_parallel, local_seq_len)
-        full_cache_position = _gather_optional_tensor(cache_position, sequence_parallel, local_seq_len)
+        self._trace(sequence_parallel, module, 'attention_mask:gather:before', tensor=attention_mask)
+        full_attention_mask = gather_attention_mask_from_sequence_parallel_region(
+            attention_mask,
+            sequence_parallel,
+            local_seq_len,
+        )
+        self._trace(sequence_parallel, module, 'attention_mask:gather:after', tensor=full_attention_mask)
+        self._trace(sequence_parallel, module, 'cache_position:gather:before', tensor=cache_position)
+        full_cache_position = gather_cache_position_from_sequence_parallel_region(
+            cache_position,
+            sequence_parallel,
+        )
+        self._trace(sequence_parallel, module, 'cache_position:gather:after', tensor=full_cache_position)
 
         saved_rule = module.chunk_gated_delta_rule
         saved_causal_conv1d_fn = module.causal_conv1d_fn
         module.chunk_gated_delta_rule = origin_rule
         module.causal_conv1d_fn = origin_causal_conv1d_fn
         try:
+            self._trace(sequence_parallel, module, 'origin_forward:before', tensor=full_hidden_states)
             full_output = origin_forward(
                 full_hidden_states,
                 cache_params=cache_params,
                 cache_position=full_cache_position,
                 attention_mask=full_attention_mask,
             )
+            self._trace(sequence_parallel, module, 'origin_forward:after', tensor=full_output)
         finally:
             module.chunk_gated_delta_rule = saved_rule
             module.causal_conv1d_fn = saved_causal_conv1d_fn
 
-        return _SplitForwardGatherBackward.apply(full_output.contiguous(), sequence_parallel, 1)
+        self._trace(sequence_parallel, module, 'output:split:before', tensor=full_output, dim=1)
+        local_output = scatter_to_sequence_parallel_region(full_output.contiguous(), sequence_parallel, 1)
+        self._trace(sequence_parallel, module, 'output:split:after', tensor=local_output, dim=1)
+        return local_output
