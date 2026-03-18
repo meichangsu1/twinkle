@@ -1199,6 +1199,8 @@ class SequenceParallel:
             self.extra_kwargs['position_ids'] = real_position_ids.clone()
         if text_position_ids is not None and batch_size is not None and text_position_ids.shape[0] == batch_size:
             self.extra_kwargs['text_position_ids'] = text_position_ids.clone()
+        self.extra_kwargs.pop('strict_full_attention_mask', None)
+        self.extra_kwargs.pop('strict_full_cache_position', None)
         # Build a 2D attention_mask whenever we padded for SP alignment so FlashAttention2 can unpad correctly.
         # For packed batches (batch_size==1 with multiple position_id resets), relying on position_ids alone is
         # unsafe if we also appended SP-alignment padding (position_ids=-1), because HF's FA2 varlen path will
@@ -1218,6 +1220,8 @@ class SequenceParallel:
             # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
             cache_position = torch.arange(0, attn_shape, device=inputs.device)
+            self.extra_kwargs['strict_full_attention_mask'] = attention_mask.clone()
+            self.extra_kwargs['strict_full_cache_position'] = cache_position.clone()
             # For SP>1 keep 2D masks and let full-attention gather to global mask later.
             # Prebuilding 4D causal masks before split can break full-sequence semantics.
             if (self.world_size == 1 and hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None

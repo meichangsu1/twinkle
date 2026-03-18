@@ -90,19 +90,30 @@ class Qwen35StrictFullSeqHelper:
         )
         self._trace(sequence_parallel, module, 'hidden_states:gather:after', tensor=full_hidden_states, dim=1)
         local_seq_len = hidden_states.shape[1]
-        self._trace(sequence_parallel, module, 'attention_mask:gather:before', tensor=attention_mask)
-        full_attention_mask = gather_attention_mask_from_sequence_parallel_region(
-            attention_mask,
-            sequence_parallel,
-            local_seq_len,
-        )
-        self._trace(sequence_parallel, module, 'attention_mask:gather:after', tensor=full_attention_mask)
-        self._trace(sequence_parallel, module, 'cache_position:gather:before', tensor=cache_position)
-        full_cache_position = gather_cache_position_from_sequence_parallel_region(
-            cache_position,
-            sequence_parallel,
-        )
-        self._trace(sequence_parallel, module, 'cache_position:gather:after', tensor=full_cache_position)
+        cached_attention_mask = sequence_parallel.extra_kwargs.get('strict_full_attention_mask')
+        if cached_attention_mask is not None:
+            full_attention_mask = cached_attention_mask
+            self._trace(sequence_parallel, module, 'attention_mask:cached', tensor=full_attention_mask)
+        else:
+            self._trace(sequence_parallel, module, 'attention_mask:gather:before', tensor=attention_mask)
+            full_attention_mask = gather_attention_mask_from_sequence_parallel_region(
+                attention_mask,
+                sequence_parallel,
+                local_seq_len,
+            )
+            self._trace(sequence_parallel, module, 'attention_mask:gather:after', tensor=full_attention_mask)
+
+        cached_cache_position = sequence_parallel.extra_kwargs.get('strict_full_cache_position')
+        if cached_cache_position is not None:
+            full_cache_position = cached_cache_position
+            self._trace(sequence_parallel, module, 'cache_position:cached', tensor=full_cache_position)
+        else:
+            self._trace(sequence_parallel, module, 'cache_position:gather:before', tensor=cache_position)
+            full_cache_position = gather_cache_position_from_sequence_parallel_region(
+                cache_position,
+                sequence_parallel,
+            )
+            self._trace(sequence_parallel, module, 'cache_position:gather:after', tensor=full_cache_position)
 
         saved_rule = module.chunk_gated_delta_rule
         saved_causal_conv1d_fn = module.causal_conv1d_fn
