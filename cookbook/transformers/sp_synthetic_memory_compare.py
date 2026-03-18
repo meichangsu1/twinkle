@@ -8,60 +8,45 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from peft import LoraConfig
-from torch.utils.data import DataLoader as TorchDataLoader
 
 import twinkle
 from twinkle import DeviceMesh, Platform, get_logger, torch_util
-from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
-from twinkle.preprocessor import AlpacaProcessor, SelfCognitionProcessor
 
 # 2-card SP off
+# TWINKLE_SYNTHETIC_BATCH_SIZE=8 \
+# TWINKLE_SYNTHETIC_SEQ_LEN=4096 \
+# TWINKLE_SYNTHETIC_NUM_STEPS=3 \
 # TWINKLE_MEMORY_ULYSSES_SIZE=1 \
-# TWINKLE_MEMORY_OUTPUT=/tmp/sp0_memory.json \
-# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_memory_compare
+# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_synthetic_memory_compare
 
 # 2-card SP on
+# TWINKLE_SYNTHETIC_BATCH_SIZE=8 \
+# TWINKLE_SYNTHETIC_SEQ_LEN=4096 \
+# TWINKLE_SYNTHETIC_NUM_STEPS=3 \
 # TWINKLE_MEMORY_ULYSSES_SIZE=2 \
-# TWINKLE_MEMORY_OUTPUT=/tmp/sp2_memory.json \
-# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_memory_compare
-
-# 4-card SP off
-# TWINKLE_MEMORY_ULYSSES_SIZE=1 \
-# TWINKLE_MEMORY_OUTPUT=/tmp/sp0_memory_4g.json \
-# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_memory_compare
-
-# 4-card SP on
-# TWINKLE_MEMORY_ULYSSES_SIZE=2 \
-# TWINKLE_MEMORY_OUTPUT=/tmp/sp2_memory_4g.json \
-# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_memory_compare
-#
-# Note: this script defaults to truncation_strategy='right' so oversized samples
-# do not abort a memory-only profiling run. Override with
-# TWINKLE_MEMORY_TRUNCATION_STRATEGY if needed.
+# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_synthetic_memory_compare
 
 logger = get_logger()
 
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
-DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://swift/self-cognition')
 ULYSSES_SIZE = int(os.environ.get('TWINKLE_MEMORY_ULYSSES_SIZE', '1'))
 WORLD_SIZE = int(os.environ.get('WORLD_SIZE', os.environ.get('TWINKLE_MEMORY_WORLD_SIZE', '4')))
 LOCAL_WORLD_SIZE = int(os.environ.get('LOCAL_WORLD_SIZE', os.environ.get('TWINKLE_MEMORY_LOCAL_WORLD_SIZE', str(WORLD_SIZE))))
-GLOBAL_BATCH_SIZE = int(os.environ.get('TWINKLE_MEMORY_GLOBAL_BATCH_SIZE', '8'))
-NUM_STEPS = int(os.environ.get('TWINKLE_MEMORY_NUM_STEPS', '3'))
-MEMORY_SEED = int(os.environ.get('TWINKLE_MEMORY_SEED', '42'))
+SYNTHETIC_BATCH_SIZE = int(os.environ.get('TWINKLE_SYNTHETIC_BATCH_SIZE', '8'))
+SYNTHETIC_SEQ_LEN = int(os.environ.get('TWINKLE_SYNTHETIC_SEQ_LEN', '4096'))
+SYNTHETIC_NUM_STEPS = int(os.environ.get('TWINKLE_SYNTHETIC_NUM_STEPS', '3'))
+SYNTHETIC_SEED = int(os.environ.get('TWINKLE_SYNTHETIC_SEED', '42'))
+SYNTHETIC_LABEL_MODE = os.environ.get('TWINKLE_SYNTHETIC_LABEL_MODE', 'copy_input')
+SYNTHETIC_MASK_LAST_LABEL = os.environ.get('TWINKLE_SYNTHETIC_MASK_LAST_LABEL', '1') == '1'
+SYNTHETIC_VOCAB_SIZE_OVERRIDE = os.environ.get('TWINKLE_SYNTHETIC_VOCAB_SIZE')
 MEMORY_MIXED_PRECISION = os.environ.get('TWINKLE_MEMORY_MIXED_PRECISION', 'bf16')
 MEMORY_ATTN_IMPL = os.environ.get('TWINKLE_MEMORY_ATTN_IMPL', '')
 MEMORY_WRAP_MODE = os.environ.get('TWINKLE_MEMORY_WRAP_MODE', 'native_fsdp')
 MEMORY_DISABLE_GC = os.environ.get('TWINKLE_MEMORY_DISABLE_GC', '0') == '1'
 MEMORY_STRICT_DETERMINISM = os.environ.get('TWINKLE_MEMORY_STRICT_DETERMINISM', '0') == '1'
 MEMORY_EMPTY_CACHE = os.environ.get('TWINKLE_MEMORY_EMPTY_CACHE', '1') == '1'
-MEMORY_PROCESSOR = os.environ.get('TWINKLE_MEMORY_PROCESSOR', '').strip().lower()
-MEMORY_BATCH_SYNC_MODE = os.environ.get('TWINKLE_MEMORY_BATCH_SYNC_MODE', 'auto').strip().lower()
-TEMPLATE_MAX_LENGTH = os.environ.get('TWINKLE_MEMORY_TEMPLATE_MAX_LENGTH')
-TRUNCATION_STRATEGY = os.environ.get('TWINKLE_MEMORY_TRUNCATION_STRATEGY', 'right')
-SELF_COGNITION_NAME = os.environ.get('TWINKLE_MEMORY_SELF_NAME', 'twinkle模型')
-SELF_COGNITION_AUTHOR = os.environ.get('TWINKLE_MEMORY_SELF_AUTHOR', 'twinkle团队')
+OUTPUT_PATH = os.environ.get('TWINKLE_MEMORY_OUTPUT')
 
 
 def _device_backend_prefix() -> str:
@@ -101,12 +86,11 @@ def _enable_strict_determinism(seed: int) -> None:
     elif _npu_available():
         os.environ.setdefault('HCCL_DETERMINISTIC', '1')
         os.environ.setdefault('ASCEND_LAUNCH_BLOCKING', '1')
-
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 if MEMORY_STRICT_DETERMINISM:
-    _enable_strict_determinism(MEMORY_SEED)
+    _enable_strict_determinism(SYNTHETIC_SEED)
 
 
 def _build_device_mesh() -> DeviceMesh:
@@ -137,35 +121,6 @@ twinkle.initialize(
     global_device_mesh=device_mesh,
     lazy_collect=False,
 )
-
-
-def _infer_processor_kind() -> str:
-    if MEMORY_PROCESSOR:
-        return MEMORY_PROCESSOR
-    if 'alpaca' in DATASETS.lower():
-        return 'alpaca'
-    return 'self_cognition'
-
-
-def create_dataset(data_slice=None):
-    dataset = Dataset(dataset_meta=DatasetMeta(DATASETS, data_slice=data_slice or range(500)))
-    template_kwargs = {}
-    if TEMPLATE_MAX_LENGTH is not None:
-        template_kwargs['max_length'] = int(TEMPLATE_MAX_LENGTH)
-    if TRUNCATION_STRATEGY:
-        template_kwargs['truncation_strategy'] = TRUNCATION_STRATEGY
-    dataset.set_template('Template', model_id=MODEL_ID, **template_kwargs)
-
-    processor_kind = _infer_processor_kind()
-    if processor_kind == 'alpaca':
-        dataset.map(AlpacaProcessor())
-    elif processor_kind == 'self_cognition':
-        dataset.map(SelfCognitionProcessor(SELF_COGNITION_NAME, SELF_COGNITION_AUTHOR))
-    else:
-        raise ValueError(f'Unsupported TWINKLE_MEMORY_PROCESSOR={processor_kind}')
-
-    dataset.encode(batched=True)
-    return dataset
 
 
 def _set_seed(seed: int) -> None:
@@ -225,55 +180,6 @@ def _cleanup_device_memory() -> None:
             memory_module.ipc_collect()
 
 
-def _load_global_batch_locally(batch_index: int) -> List[Dict[str, Any]]:
-    dataset = create_dataset(data_slice=None)
-    dataloader = TorchDataLoader(
-        dataset,
-        batch_size=GLOBAL_BATCH_SIZE,
-        num_workers=0,
-        shuffle=False,
-        collate_fn=lambda x: x,
-    )
-    for idx, current_batch in enumerate(dataloader):
-        if idx == batch_index:
-            if not isinstance(current_batch, list):
-                raise TypeError(f'Expected list batch, got: {type(current_batch)}')
-            return current_batch
-    raise IndexError(f'Batch index {batch_index} out of range')
-
-
-def _resolve_batch_sync_mode() -> str:
-    if MEMORY_BATCH_SYNC_MODE in ('broadcast', 'local'):
-        return MEMORY_BATCH_SYNC_MODE
-    if _npu_available():
-        return 'local'
-    return 'broadcast'
-
-
-def _get_global_batch(batch_index: int) -> List[Dict[str, Any]]:
-    sync_mode = _resolve_batch_sync_mode()
-    if not dist.is_available() or not dist.is_initialized():
-        return _load_global_batch_locally(batch_index)
-
-    if sync_mode == 'local':
-        if Platform.get_rank() == 0:
-            _load_global_batch_locally(batch_index)
-        _maybe_barrier()
-        return _load_global_batch_locally(batch_index)
-
-    batch = None
-    if Platform.get_rank() == 0:
-        batch = _load_global_batch_locally(batch_index)
-    object_list = [batch]
-    dist.broadcast_object_list(object_list, src=0)
-    return object_list[0]
-
-
-def _slice_local_batch(global_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    batch_slice = device_mesh.get_slice(len(global_batch))
-    return global_batch[batch_slice]
-
-
 def _create_model(num_training_steps: int) -> TransformersModel:
     warmup_steps = int(os.environ.get('TWINKLE_MEMORY_WARMUP_STEPS', '0'))
     strategy = 'native_fsdp' if MEMORY_WRAP_MODE == 'native_fsdp' else 'accelerate'
@@ -305,6 +211,45 @@ def _create_model(num_training_steps: int) -> TransformersModel:
         adapter_name='default',
     )
     return model
+
+
+def _resolve_vocab_size(model: TransformersModel) -> int:
+    if SYNTHETIC_VOCAB_SIZE_OVERRIDE is not None:
+        return int(SYNTHETIC_VOCAB_SIZE_OVERRIDE)
+    config = getattr(model.model, 'config', None)
+    vocab_size = getattr(config, 'vocab_size', None)
+    if vocab_size is None:
+        raise RuntimeError('Could not infer vocab_size from model.config; set TWINKLE_SYNTHETIC_VOCAB_SIZE.')
+    return int(vocab_size)
+
+
+def _build_synthetic_global_batch(vocab_size: int, step_idx: int) -> List[Dict[str, Any]]:
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(SYNTHETIC_SEED + step_idx)
+    base_position_ids = torch.arange(SYNTHETIC_SEQ_LEN, dtype=torch.long)
+    batch = []
+    for _ in range(SYNTHETIC_BATCH_SIZE):
+        input_ids = torch.randint(0, vocab_size, (SYNTHETIC_SEQ_LEN,), dtype=torch.long, generator=generator)
+        if SYNTHETIC_LABEL_MODE == 'copy_input':
+            labels = input_ids.clone()
+        elif SYNTHETIC_LABEL_MODE == 'random':
+            labels = torch.randint(0, vocab_size, (SYNTHETIC_SEQ_LEN,), dtype=torch.long, generator=generator)
+        else:
+            raise ValueError(f'Unsupported TWINKLE_SYNTHETIC_LABEL_MODE={SYNTHETIC_LABEL_MODE}')
+        if SYNTHETIC_MASK_LAST_LABEL:
+            labels[-1] = -100
+        batch.append({
+            'input_ids': input_ids,
+            'attention_mask': torch.ones(SYNTHETIC_SEQ_LEN, dtype=torch.long),
+            'position_ids': base_position_ids.clone(),
+            'labels': labels,
+        })
+    return batch
+
+
+def _slice_local_batch(global_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    batch_slice = device_mesh.get_slice(len(global_batch))
+    return global_batch[batch_slice]
 
 
 def _local_memory_snapshot(stage: str) -> Dict[str, Any]:
@@ -402,16 +347,6 @@ def _summarize_stage_snapshots(rank_stage_snapshots: List[Dict[str, Dict[str, An
     return summary
 
 
-def _run_memory_stage(stage_name: str, fn, stage_snapshots: Dict[str, Dict[str, Any]]):
-    _maybe_barrier()
-    _reset_memory_peaks()
-    result = fn()
-    _sync_device()
-    _maybe_barrier()
-    stage_snapshots[stage_name] = _local_memory_snapshot(stage_name)
-    return result
-
-
 def _summarize_phase_memory(stage_memory: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     phase_buckets: Dict[str, List[Dict[str, Any]]] = {}
     for stage, stats in stage_memory.items():
@@ -434,8 +369,18 @@ def _summarize_phase_memory(stage_memory: Dict[str, Dict[str, Any]]) -> Dict[str
     return phase_summary
 
 
+def _run_memory_stage(stage_name: str, fn, stage_snapshots: Dict[str, Dict[str, Any]]):
+    _maybe_barrier()
+    _reset_memory_peaks()
+    result = fn()
+    _sync_device()
+    _maybe_barrier()
+    stage_snapshots[stage_name] = _local_memory_snapshot(stage_name)
+    return result
+
+
 def _log_phase_memory_summary(phase_memory: Dict[str, Dict[str, Any]]) -> None:
-    lines = ['SP memory summary (MiB):']
+    lines = ['Synthetic SP memory summary (MiB):']
     for phase, stats in phase_memory.items():
         lines.append(
             f"{phase}: "
@@ -446,28 +391,28 @@ def _log_phase_memory_summary(phase_memory: Dict[str, Dict[str, Any]]) -> None:
 
 
 def main():
-    batch_index = int(os.environ.get('TWINKLE_MEMORY_BATCH_INDEX', '0'))
-    output_path = os.environ.get('TWINKLE_MEMORY_OUTPUT')
-    run_label = os.environ.get('TWINKLE_MEMORY_RUN_LABEL', f'sp{ULYSSES_SIZE}')
-    if NUM_STEPS < 1:
-        raise ValueError(f'TWINKLE_MEMORY_NUM_STEPS must be >= 1, got {NUM_STEPS}.')
+    if SYNTHETIC_NUM_STEPS < 1:
+        raise ValueError(f'TWINKLE_SYNTHETIC_NUM_STEPS must be >= 1, got {SYNTHETIC_NUM_STEPS}.')
+    if SYNTHETIC_BATCH_SIZE < 1:
+        raise ValueError(f'TWINKLE_SYNTHETIC_BATCH_SIZE must be >= 1, got {SYNTHETIC_BATCH_SIZE}.')
+    if SYNTHETIC_SEQ_LEN < 1:
+        raise ValueError(f'TWINKLE_SYNTHETIC_SEQ_LEN must be >= 1, got {SYNTHETIC_SEQ_LEN}.')
 
     _ensure_process_group()
-    _set_seed(MEMORY_SEED)
+    _set_seed(SYNTHETIC_SEED)
     _cleanup_device_memory()
     _maybe_barrier()
-    baseline_snapshot = {'baseline': _local_memory_snapshot('baseline')}
+    stage_snapshots = {'baseline': _local_memory_snapshot('baseline')}
 
-    stage_snapshots = dict(baseline_snapshot)
-
-    _set_seed(MEMORY_SEED)
-    model = _run_memory_stage('model_init', lambda: _create_model(num_training_steps=NUM_STEPS), stage_snapshots)
+    _set_seed(SYNTHETIC_SEED)
+    model = _run_memory_stage('model_init', lambda: _create_model(num_training_steps=SYNTHETIC_NUM_STEPS), stage_snapshots)
     logger.info(model.get_train_configs(adapter_name='default'))
     _run_memory_stage('wrap_model', lambda: model._lazy_wrap_model(), stage_snapshots)
 
-    for step_idx in range(NUM_STEPS):
-        current_batch_index = batch_index + step_idx
-        global_batch = _get_global_batch(current_batch_index)
+    vocab_size = _resolve_vocab_size(model)
+
+    for step_idx in range(SYNTHETIC_NUM_STEPS):
+        global_batch = _build_synthetic_global_batch(vocab_size, step_idx)
         local_batch = _slice_local_batch(global_batch)
         stage_prefix = f'step_{step_idx:03d}'
 
@@ -478,22 +423,14 @@ def main():
             stage_snapshots,
         )
         _run_memory_stage(f'{stage_prefix}:loss', lambda: model.calculate_loss(adapter_name='default'), stage_snapshots)
-        _run_memory_stage(
-            f'{stage_prefix}:backward',
-            lambda: model.backward(adapter_name='default'),
-            stage_snapshots,
-        )
+        _run_memory_stage(f'{stage_prefix}:backward', lambda: model.backward(adapter_name='default'), stage_snapshots)
         _run_memory_stage(
             f'{stage_prefix}:clip_grad',
             lambda: model.clip_grad_norm(adapter_name='default'),
             stage_snapshots,
         )
         _run_memory_stage(f'{stage_prefix}:step', lambda: model.step(adapter_name='default'), stage_snapshots)
-        _run_memory_stage(
-            f'{stage_prefix}:zero_grad',
-            lambda: model.zero_grad(adapter_name='default'),
-            stage_snapshots,
-        )
+        _run_memory_stage(f'{stage_prefix}:zero_grad', lambda: model.zero_grad(adapter_name='default'), stage_snapshots)
         _run_memory_stage(f'{stage_prefix}:lr_step', lambda: model.lr_step(adapter_name='default'), stage_snapshots)
 
     rank_stage_snapshots = _gather_objects(stage_snapshots)
@@ -503,44 +440,26 @@ def main():
         _log_phase_memory_summary(phase_memory)
 
     payload = {
-        'mode': 'sp_memory_compare',
-        'run_label': run_label,
+        'mode': 'sp_synthetic_memory_compare',
         'model_id': MODEL_ID,
-        'datasets': DATASETS,
-        'processor': _infer_processor_kind(),
-        'seed': int(MEMORY_SEED),
-        'batch_index': int(batch_index),
-        'num_steps': int(NUM_STEPS),
-        'global_batch_size': int(GLOBAL_BATCH_SIZE),
+        'seed': int(SYNTHETIC_SEED),
+        'synthetic_batch_size': int(SYNTHETIC_BATCH_SIZE),
+        'synthetic_seq_len': int(SYNTHETIC_SEQ_LEN),
+        'synthetic_num_steps': int(SYNTHETIC_NUM_STEPS),
+        'synthetic_label_mode': SYNTHETIC_LABEL_MODE,
+        'synthetic_mask_last_label': bool(SYNTHETIC_MASK_LAST_LABEL),
         'ulysses_size': int(ULYSSES_SIZE),
         'wrap_mode': MEMORY_WRAP_MODE,
         'mixed_precision': MEMORY_MIXED_PRECISION,
         'attn_implementation': MEMORY_ATTN_IMPL or None,
         'data_world_size': int(device_mesh.data_world_size),
-        'rank': int(Platform.get_rank()),
-        'env': {
-            'TWINKLE_MEMORY_ULYSSES_SIZE': str(ULYSSES_SIZE),
-            'TWINKLE_MEMORY_NUM_STEPS': str(NUM_STEPS),
-            'TWINKLE_MEMORY_WRAP_MODE': MEMORY_WRAP_MODE,
-            'TWINKLE_MEMORY_MIXED_PRECISION': MEMORY_MIXED_PRECISION,
-            'TWINKLE_MEMORY_ATTN_IMPL': MEMORY_ATTN_IMPL or None,
-            'TWINKLE_MEMORY_DISABLE_GC': os.environ.get('TWINKLE_MEMORY_DISABLE_GC', '0'),
-            'TWINKLE_MEMORY_STRICT_DETERMINISM': os.environ.get('TWINKLE_MEMORY_STRICT_DETERMINISM', '0'),
-            'TWINKLE_MEMORY_EMPTY_CACHE': os.environ.get('TWINKLE_MEMORY_EMPTY_CACHE', '1'),
-            'TWINKLE_MEMORY_PROCESSOR': MEMORY_PROCESSOR or None,
-            'TWINKLE_MEMORY_BATCH_SYNC_MODE': MEMORY_BATCH_SYNC_MODE,
-            'resolved_batch_sync_mode': _resolve_batch_sync_mode(),
-            'TWINKLE_MEMORY_TEMPLATE_MAX_LENGTH': TEMPLATE_MAX_LENGTH,
-            'TWINKLE_MEMORY_TRUNCATION_STRATEGY': TRUNCATION_STRATEGY,
-        },
         'phase_memory': phase_memory,
         'stage_memory': stage_memory,
     }
-    if output_path and Platform.get_rank() == 0:
-        payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(payload_text)
-        logger.info(f'SP memory compare result saved to {output_path}')
+    if OUTPUT_PATH and Platform.get_rank() == 0:
+        with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info(f'Synthetic SP memory result saved to {OUTPUT_PATH}')
 
 
 if __name__ == '__main__':
