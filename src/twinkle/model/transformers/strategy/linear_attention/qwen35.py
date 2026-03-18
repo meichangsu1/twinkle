@@ -6,6 +6,8 @@ import torch.distributed as dist
 
 from twinkle.utils.transformers_utils import get_llm_model
 
+from .qwen35_strict import Qwen35StrictFullSeqHelper
+
 
 def _get_text_model(base_model: torch.nn.Module) -> torch.nn.Module:
     if hasattr(base_model, 'language_model'):
@@ -218,6 +220,7 @@ class Qwen35LinearAttentionSPModelPatch:
 
     def __init__(self):
         self.patched_linear_layer_indices = set()
+        self.strict_full_seq = Qwen35StrictFullSeqHelper()
 
     def match(self, base_model: torch.nn.Module) -> bool:
         text_model = _get_text_model(base_model)
@@ -272,6 +275,7 @@ class Qwen35LinearAttentionSPModelPatch:
                     sequence_parallel,
                     module,
                     origin_forward,
+                    origin_rule,
                     getattr(module, 'causal_conv1d_fn', None),
                 )
             module._twinkle_qwen35_linear_sp_patched = True
@@ -446,7 +450,14 @@ class Qwen35LinearAttentionSPModelPatch:
         wrapped_causal_conv1d._twinkle_wrapped_module = module.__class__.__name__
         return wrapped_causal_conv1d
 
-    def _wrap_linear_forward(self, sequence_parallel, module: torch.nn.Module, origin_forward, origin_causal_conv1d_fn):
+    def _wrap_linear_forward(
+        self,
+        sequence_parallel,
+        module: torch.nn.Module,
+        origin_forward,
+        origin_rule,
+        origin_causal_conv1d_fn,
+    ):
         halo_causal_conv1d_fn = self._wrap_causal_conv1d_fn(sequence_parallel, module, origin_causal_conv1d_fn)
 
         def wrapped_forward(
@@ -474,6 +485,19 @@ class Qwen35LinearAttentionSPModelPatch:
             if use_precomputed_states:
                 return origin_forward(
                     hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                )
+
+            if self.strict_full_seq.enabled:
+                return self.strict_full_seq.run(
+                    sequence_parallel=sequence_parallel,
+                    module=module,
+                    origin_forward=origin_forward,
+                    origin_rule=origin_rule,
+                    origin_causal_conv1d_fn=origin_causal_conv1d_fn,
+                    hidden_states=hidden_states,
                     cache_params=cache_params,
                     cache_position=cache_position,
                     attention_mask=attention_mask,

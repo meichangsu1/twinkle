@@ -1,7 +1,10 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from twinkle.model.transformers.strategy.linear_attention.qwen35_strict import Qwen35StrictFullSeqHelper
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel
 
 
@@ -92,6 +95,15 @@ class TestLinearAttentionModelPatch(unittest.TestCase):
         self.assertIsNone(model.layers[0]._gradient_checkpointing_func)
         self.assertTrue(model.layers[1].gradient_checkpointing)
         self.assertIsNotNone(model.layers[1]._gradient_checkpointing_func)
+
+    def test_qwen35_strict_helper_is_opt_in_and_rejects_fsdp(self):
+        with mock.patch.dict('os.environ', {'QWEN35_SP_LINEAR_STRICT': '1'}):
+            helper = Qwen35StrictFullSeqHelper()
+        self.assertTrue(helper.enabled)
+
+        sequence_parallel = SimpleNamespace(device_mesh=SimpleNamespace(fsdp_world_size=2))
+        with self.assertRaisesRegex(RuntimeError, 'only supported without FSDP sharding'):
+            helper.validate_runtime(sequence_parallel)
 
 
 if __name__ == '__main__':

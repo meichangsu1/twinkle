@@ -24,6 +24,10 @@ from twinkle.preprocessor import SelfCognitionProcessor
 # TWINKLE_PARITY_ULYSSES_SIZE=2 \
 # TWINKLE_PARITY_OUTPUT=/tmp/sp2_first_step.json \
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
+# QWEN35_SP_LINEAR_STRICT=1 \
+# TWINKLE_PARITY_WRAP_MODE=ddp \
+# TWINKLE_PARITY_ULYSSES_SIZE=2 \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
 
 logger = get_logger()
 
