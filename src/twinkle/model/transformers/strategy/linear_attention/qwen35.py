@@ -216,6 +216,9 @@ class Qwen35LinearAttentionSPModelPatch:
 
     name = 'qwen35'
 
+    def __init__(self):
+        self.patched_linear_layer_indices = set()
+
     def match(self, base_model: torch.nn.Module) -> bool:
         text_model = _get_text_model(base_model)
         for module in text_model.modules():
@@ -237,18 +240,19 @@ class Qwen35LinearAttentionSPModelPatch:
                 'Packed reset semantics for recurrent states are not implemented.'
             )
 
-    def maybe_disable_gc(self, model: torch.nn.Module, sequence_parallel) -> bool:
+    def maybe_disable_gc(self, model: torch.nn.Module, sequence_parallel) -> list[int]:
         llm_model = get_llm_model(model)
         was_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
         if not was_gc_enabled:
             was_gc_enabled = bool(getattr(llm_model, 'is_gradient_checkpointing', False))
         if not was_gc_enabled:
-            return False
-        return bool(sequence_parallel._disable_gradient_checkpointing_for_model(model))
+            return []
+        return self._disable_gc_for_patched_layers(model)
 
     def patch(self, base_model: torch.nn.Module, sequence_parallel) -> bool:
         text_model = _get_text_model(base_model)
         has_linear_attn = False
+        self.patched_linear_layer_indices = set()
         for module in text_model.modules():
             if module.__class__.__name__ != 'Qwen3_5GatedDeltaNet':
                 continue
@@ -256,6 +260,9 @@ class Qwen35LinearAttentionSPModelPatch:
             if origin_rule is None:
                 continue
             has_linear_attn = True
+            layer_idx = getattr(module, 'layer_idx', None)
+            if isinstance(layer_idx, int) and layer_idx >= 0:
+                self.patched_linear_layer_indices.add(layer_idx)
             if getattr(module, '_twinkle_qwen35_linear_sp_patched', False):
                 continue
             origin_forward = getattr(module, 'forward', None)
@@ -269,6 +276,35 @@ class Qwen35LinearAttentionSPModelPatch:
                 )
             module._twinkle_qwen35_linear_sp_patched = True
         return has_linear_attn
+
+    def _disable_gc_for_patched_layers(self, model: torch.nn.Module) -> list[int]:
+        text_model = _get_text_model(get_llm_model(model))
+        layers = getattr(text_model, 'layers', None)
+        if layers is None:
+            return []
+
+        disabled_layers = []
+        for layer_idx, layer in enumerate(layers):
+            if layer_idx not in self.patched_linear_layer_indices:
+                continue
+            if getattr(layer, 'layer_type', None) != 'linear_attention':
+                continue
+
+            was_enabled = bool(getattr(layer, 'gradient_checkpointing', False))
+            if hasattr(layer, 'gradient_checkpointing'):
+                try:
+                    layer.gradient_checkpointing = False
+                except Exception:
+                    pass
+            if hasattr(layer, '_gradient_checkpointing_func'):
+                try:
+                    layer._gradient_checkpointing_func = None
+                except Exception:
+                    pass
+            if was_enabled:
+                disabled_layers.append(layer_idx)
+
+        return disabled_layers
 
     def _wrap_chunk_rule(self, sequence_parallel, module: torch.nn.Module, origin_rule):
         recurrent_rule = getattr(module, 'recurrent_gated_delta_rule', None)

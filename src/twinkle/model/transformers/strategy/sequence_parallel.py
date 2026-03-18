@@ -514,6 +514,7 @@ class SequenceParallel:
         self.linear_attention_model_patch_name = None
         self.extra_kwargs.pop('linear_attention_model_patch', None)
         self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing', None)
+        self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing_layers', None)
 
         if self.world_size is None or self.world_size <= 1:
             return
@@ -528,7 +529,7 @@ class SequenceParallel:
         self.linear_attention_model_patch_name = model_patch.name
         self.extra_kwargs['linear_attention_model_patch'] = model_patch.name
         disabled = model_patch.maybe_disable_gc(model, self)
-        self.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing'] = disabled
+        self.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing_layers'] = list(disabled)
 
     def _validate_linear_attention_inputs(self) -> None:
         if self.linear_attention_model_patch is None:
