@@ -61,19 +61,44 @@ SELF_COGNITION_NAME = os.environ.get('TWINKLE_MEMORY_SELF_NAME', 'twinkle模型'
 SELF_COGNITION_AUTHOR = os.environ.get('TWINKLE_MEMORY_SELF_AUTHOR', 'twinkle团队')
 
 
+def _device_backend_prefix() -> str:
+    return Platform.device_prefix()
+
+
+def _cuda_available() -> bool:
+    return _device_backend_prefix() == 'cuda' and hasattr(torch, 'cuda') and torch.cuda.is_available()
+
+
+def _npu_available() -> bool:
+    return _device_backend_prefix() == 'npu' and hasattr(torch, 'npu') and torch.npu.is_available()
+
+
+def _device_memory_module():
+    if _cuda_available():
+        return torch.cuda
+    if _npu_available():
+        return torch.npu
+    return None
+
+
 def _enable_strict_determinism(seed: int) -> None:
     os.environ.setdefault('PYTHONHASHSEED', str(seed))
-    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
-    os.environ.setdefault('NCCL_DETERMINISTIC', '1')
-    os.environ.setdefault('FLASH_ATTENTION_DETERMINISTIC', '1')
-    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    if _cuda_available():
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':16:8')
+        os.environ.setdefault('NCCL_DETERMINISTIC', '1')
+        os.environ.setdefault('FLASH_ATTENTION_DETERMINISTIC', '1')
+        os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
 
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = False
-    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = False
+        if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    elif _npu_available():
+        os.environ.setdefault('HCCL_DETERMINISTIC', '1')
+        os.environ.setdefault('ASCEND_LAUNCH_BLOCKING', '1')
+
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
@@ -86,14 +111,14 @@ def _build_device_mesh() -> DeviceMesh:
         if WORLD_SIZE < 2 or WORLD_SIZE % 2 != 0:
             raise ValueError('TWINKLE_MEMORY_WRAP_MODE=native_fsdp requires an even WORLD_SIZE >= 2.')
         return DeviceMesh(
-            device_type='cuda',
+            device_type=_device_backend_prefix(),
             mesh=np.arange(WORLD_SIZE).reshape(WORLD_SIZE // 2, 2),
             mesh_dim_names=('dp', 'fsdp'),
             ulysses_size=ULYSSES_SIZE,
         )
     if MEMORY_WRAP_MODE == 'ddp':
         return DeviceMesh(
-            device_type='cuda',
+            device_type=_device_backend_prefix(),
             mesh=np.arange(WORLD_SIZE),
             mesh_dim_names=('dp',),
             ulysses_size=ULYSSES_SIZE,
@@ -144,8 +169,10 @@ def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if _cuda_available():
         torch.cuda.manual_seed_all(seed)
+    elif _npu_available():
+        torch.npu.manual_seed_all(seed)
 
 
 def _ensure_process_group() -> None:
@@ -172,23 +199,27 @@ def _maybe_barrier() -> None:
 
 
 def _sync_device() -> None:
-    if torch.cuda.is_available():
+    if _cuda_available():
         torch.cuda.synchronize()
+    elif _npu_available():
+        torch.npu.synchronize()
 
 
 def _reset_memory_peaks() -> None:
-    if not torch.cuda.is_available():
+    memory_module = _device_memory_module()
+    if memory_module is None:
         return
     _sync_device()
-    torch.cuda.reset_peak_memory_stats()
+    memory_module.reset_peak_memory_stats()
 
 
 def _cleanup_device_memory() -> None:
     gc.collect()
-    if MEMORY_EMPTY_CACHE and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        if hasattr(torch.cuda, 'ipc_collect'):
-            torch.cuda.ipc_collect()
+    memory_module = _device_memory_module()
+    if MEMORY_EMPTY_CACHE and memory_module is not None:
+        memory_module.empty_cache()
+        if hasattr(memory_module, 'ipc_collect'):
+            memory_module.ipc_collect()
 
 
 def _tensor_hash(tensor: torch.Tensor) -> str:
@@ -312,39 +343,47 @@ def _local_memory_snapshot(stage: str) -> Dict[str, Any]:
         'stage': stage,
         'rank': int(Platform.get_rank()),
         'device': str(Platform.get_local_device()),
+        'device_backend': _device_backend_prefix(),
     }
-    if not torch.cuda.is_available():
+    memory_module = _device_memory_module()
+    if memory_module is None:
         snapshot.update({
             'allocated_bytes': 0,
             'reserved_bytes': 0,
             'peak_allocated_bytes': 0,
             'peak_reserved_bytes': 0,
-            'free_bytes': 0,
-            'total_bytes': 0,
+            'free_bytes': None,
+            'total_bytes': None,
         })
         return snapshot
 
     _sync_device()
-    device_index = torch.cuda.current_device()
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
-    allocated_bytes = torch.cuda.memory_allocated(device_index)
-    reserved_bytes = torch.cuda.memory_reserved(device_index)
-    peak_allocated_bytes = torch.cuda.max_memory_allocated(device_index)
-    peak_reserved_bytes = torch.cuda.max_memory_reserved(device_index)
+    device_index = memory_module.current_device()
+    mem_get_info = getattr(memory_module, 'mem_get_info', None)
+    if callable(mem_get_info):
+        free_bytes, total_bytes = mem_get_info(device_index)
+        free_bytes = int(free_bytes)
+        total_bytes = int(total_bytes)
+    else:
+        free_bytes, total_bytes = None, None
+    allocated_bytes = int(memory_module.memory_allocated(device_index))
+    reserved_bytes = int(memory_module.memory_reserved(device_index))
+    peak_allocated_bytes = int(memory_module.max_memory_allocated(device_index))
+    peak_reserved_bytes = int(memory_module.max_memory_reserved(device_index))
     mib = 1024**2
     snapshot.update({
-        'allocated_bytes': int(allocated_bytes),
-        'reserved_bytes': int(reserved_bytes),
-        'peak_allocated_bytes': int(peak_allocated_bytes),
-        'peak_reserved_bytes': int(peak_reserved_bytes),
-        'free_bytes': int(free_bytes),
-        'total_bytes': int(total_bytes),
+        'allocated_bytes': allocated_bytes,
+        'reserved_bytes': reserved_bytes,
+        'peak_allocated_bytes': peak_allocated_bytes,
+        'peak_reserved_bytes': peak_reserved_bytes,
+        'free_bytes': free_bytes,
+        'total_bytes': total_bytes,
         'allocated_mib': round(float(allocated_bytes / mib), 3),
         'reserved_mib': round(float(reserved_bytes / mib), 3),
         'peak_allocated_mib': round(float(peak_allocated_bytes / mib), 3),
         'peak_reserved_mib': round(float(peak_reserved_bytes / mib), 3),
-        'free_mib': round(float(free_bytes / mib), 3),
-        'total_mib': round(float(total_bytes / mib), 3),
+        'free_mib': round(float(free_bytes / mib), 3) if free_bytes is not None else None,
+        'total_mib': round(float(total_bytes / mib), 3) if total_bytes is not None else None,
     })
     return snapshot
 
