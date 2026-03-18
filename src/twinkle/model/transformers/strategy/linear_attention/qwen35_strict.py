@@ -86,6 +86,7 @@ class Qwen35StrictFullSeqHelper:
             sequence_parallel,
             1,
             output_grad_mode='split',
+            trace_label=f'layer{getattr(module, "layer_idx", "na")}:hidden_states',
         )
         self._trace(sequence_parallel, module, 'hidden_states:gather:after', tensor=full_hidden_states, dim=1)
         local_seq_len = hidden_states.shape[1]
@@ -121,6 +122,11 @@ class Qwen35StrictFullSeqHelper:
             module.causal_conv1d_fn = saved_causal_conv1d_fn
 
         self._trace(sequence_parallel, module, 'output:split:before', tensor=full_output, dim=1)
-        local_output = scatter_to_sequence_parallel_region(full_output.contiguous(), sequence_parallel, 1)
+        local_output = scatter_to_sequence_parallel_region(
+            full_output.contiguous(),
+            sequence_parallel,
+            1,
+            trace_label=f'layer{getattr(module, "layer_idx", "na")}:output',
+        )
         self._trace(sequence_parallel, module, 'output:split:after', tensor=local_output, dim=1)
         return local_output

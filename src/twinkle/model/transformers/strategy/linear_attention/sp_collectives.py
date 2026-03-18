@@ -1,9 +1,44 @@
 from typing import Literal, Optional
 
+import os
 import torch
 import torch.distributed as dist
 
 from ..sequence_parallel import _gather_attention_mask_for_sp, _gather_position_ids_for_sp
+
+
+def _trace_collective(
+    event: str,
+    sequence_parallel,
+    tensor: Optional[torch.Tensor] = None,
+    *,
+    label: Optional[str] = None,
+    dim: Optional[int] = None,
+    grad_mode: Optional[str] = None,
+) -> None:
+    if os.environ.get('QWEN35_SP_LINEAR_STRICT_TRACE', '0') != '1':
+        return
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get('RANK', '-1'))
+    sp_group = getattr(sequence_parallel, '_sp_group', None)
+    sp_rank = dist.get_rank(sp_group) if sp_group is not None and dist.is_available() and dist.is_initialized() else 0
+    payload = {
+        'rank': rank,
+        'sp_rank': sp_rank,
+        'event': event,
+    }
+    if label is not None:
+        payload['label'] = label
+    if dim is not None:
+        payload['dim'] = dim
+    if grad_mode is not None:
+        payload['grad_mode'] = grad_mode
+    if tensor is not None:
+        payload['shape'] = tuple(int(x) for x in tensor.shape)
+        payload['dtype'] = str(tensor.dtype)
+        payload['device'] = str(tensor.device)
+    text = ' '.join(f'{key}={value}' for key, value in payload.items())
+    print(f'[qwen35_strict_collective] {text}', flush=True)
 
 
 def _reduce_scatter_along_dim(
@@ -44,10 +79,20 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         sequence_parallel,
         dim: int,
         output_grad_mode: Literal['split', 'reduce_scatter'],
+        trace_label: Optional[str],
     ):
         ctx.sequence_parallel = sequence_parallel
         ctx.dim = dim
         ctx.output_grad_mode = output_grad_mode
+        ctx.trace_label = trace_label
+        _trace_collective(
+            'gather_forward',
+            sequence_parallel,
+            input_,
+            label=trace_label,
+            dim=dim,
+            grad_mode=output_grad_mode,
+        )
         return sequence_parallel.gather(
             input_.contiguous(),
             dim=dim,
@@ -56,6 +101,14 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        _trace_collective(
+            'gather_backward:before',
+            ctx.sequence_parallel,
+            grad_output,
+            label=ctx.trace_label,
+            dim=ctx.dim,
+            grad_mode=ctx.output_grad_mode,
+        )
         if ctx.output_grad_mode == 'reduce_scatter':
             grad_input = _reduce_scatter_along_dim(grad_output.contiguous(), ctx.dim, ctx.sequence_parallel)
         else:
@@ -64,15 +117,25 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
                 dim=ctx.dim,
                 position_ids=ctx.sequence_parallel.real_position_ids,
             )
-        return grad_input.contiguous(), None, None, None
+        _trace_collective(
+            'gather_backward:after',
+            ctx.sequence_parallel,
+            grad_input,
+            label=ctx.trace_label,
+            dim=ctx.dim,
+            grad_mode=ctx.output_grad_mode,
+        )
+        return grad_input.contiguous(), None, None, None, None
 
 
 class _ScatterToSequenceParallelRegion(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, input_: torch.Tensor, sequence_parallel, dim: int):
+    def forward(ctx, input_: torch.Tensor, sequence_parallel, dim: int, trace_label: Optional[str]):
         ctx.sequence_parallel = sequence_parallel
         ctx.dim = dim
+        ctx.trace_label = trace_label
+        _trace_collective('scatter_forward', sequence_parallel, input_, label=trace_label, dim=dim)
         return sequence_parallel.split(
             input_.contiguous(),
             dim=dim,
@@ -81,12 +144,14 @@ class _ScatterToSequenceParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        _trace_collective('scatter_backward:before', ctx.sequence_parallel, grad_output, label=ctx.trace_label, dim=ctx.dim)
         grad_input = ctx.sequence_parallel.gather(
             grad_output.contiguous(),
             dim=ctx.dim,
             position_ids=ctx.sequence_parallel.real_position_ids,
         )
-        return grad_input.contiguous(), None, None
+        _trace_collective('scatter_backward:after', ctx.sequence_parallel, grad_input, label=ctx.trace_label, dim=ctx.dim)
+        return grad_input.contiguous(), None, None, None
 
 
 def gather_from_sequence_parallel_region(
@@ -94,16 +159,18 @@ def gather_from_sequence_parallel_region(
     sequence_parallel,
     dim: int,
     output_grad_mode: Literal['split', 'reduce_scatter'] = 'split',
+    trace_label: Optional[str] = None,
 ) -> torch.Tensor:
-    return _GatherFromSequenceParallelRegion.apply(input_, sequence_parallel, dim, output_grad_mode)
+    return _GatherFromSequenceParallelRegion.apply(input_, sequence_parallel, dim, output_grad_mode, trace_label)
 
 
 def scatter_to_sequence_parallel_region(
     input_: torch.Tensor,
     sequence_parallel,
     dim: int,
+    trace_label: Optional[str] = None,
 ) -> torch.Tensor:
-    return _ScatterToSequenceParallelRegion.apply(input_, sequence_parallel, dim)
+    return _ScatterToSequenceParallelRegion.apply(input_, sequence_parallel, dim, trace_label)
 
 
 def gather_attention_mask_from_sequence_parallel_region(
