@@ -28,6 +28,12 @@ from twinkle.preprocessor import SelfCognitionProcessor
 # TWINKLE_PARITY_WRAP_MODE=ddp \
 # TWINKLE_PARITY_ULYSSES_SIZE=2 \
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
+# QWEN35_SP_LINEAR_STRICT=1 \
+# QWEN35_SP_LINEAR_STRICT_TRACE=1 \
+# TWINKLE_PARITY_WRAP_MODE=ddp \
+# TWINKLE_PARITY_ULYSSES_SIZE=2 \
+# TWINKLE_PARITY_BATCH_SYNC_MODE=local \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
 
 logger = get_logger()
 
@@ -44,6 +50,7 @@ PARITY_MIXED_PRECISION = os.environ.get('TWINKLE_PARITY_MIXED_PRECISION', 'no')
 PARITY_ATTN_IMPL = os.environ.get('TWINKLE_PARITY_ATTN_IMPL', 'eager')
 PARITY_DISABLE_GC = os.environ.get('TWINKLE_PARITY_DISABLE_GC', '1') == '1'
 PARITY_WRAP_MODE = os.environ.get('TWINKLE_PARITY_WRAP_MODE', 'native_fsdp')
+PARITY_BATCH_SYNC_MODE = os.environ.get('TWINKLE_PARITY_BATCH_SYNC_MODE', 'auto').strip().lower()
 
 
 def _device_backend_prefix() -> str:
@@ -177,6 +184,11 @@ def _ensure_process_group() -> None:
     dist.init_process_group(**init_kwargs)
 
 
+def _maybe_barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
 def _tensor_hash(tensor: torch.Tensor) -> str:
     tensor = torch_util.to_local_tensor(tensor).detach().cpu().contiguous()
     return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
@@ -265,34 +277,48 @@ def _state_delta_stats(before, after):
     }
 
 
+def _resolve_batch_sync_mode() -> str:
+    if PARITY_BATCH_SYNC_MODE in ('broadcast', 'local'):
+        return PARITY_BATCH_SYNC_MODE
+    if _npu_available():
+        return 'local'
+    return 'broadcast'
+
+
+def _load_global_batch_locally(batch_index: int) -> list[dict[str, Any]]:
+    dataset = create_dataset(data_slice=None)
+    dataloader = TorchDataLoader(
+        dataset,
+        batch_size=GLOBAL_BATCH_SIZE,
+        num_workers=0,
+        shuffle=False,
+        collate_fn=lambda x: x,
+    )
+    for idx, _batch in enumerate(dataloader):
+        if idx == batch_index:
+            if not isinstance(_batch, list):
+                raise TypeError(f'Expected list batch, got: {type(_batch)}')
+            return _batch
+    raise IndexError(f'Batch index {batch_index} out of range')
+
+
 def _get_global_batch(batch_index: int) -> list[dict[str, Any]]:
-    # Only rank0 loads the reference batch, then broadcast it to all ranks.
-    # This avoids multi-rank dataset cache races and guarantees every rank sees
-    # the exact same global batch before local slicing.
+    sync_mode = _resolve_batch_sync_mode()
+    if not dist.is_available() or not dist.is_initialized():
+        return _load_global_batch_locally(batch_index)
+
+    if sync_mode == 'local':
+        if Platform.get_rank() == 0:
+            _load_global_batch_locally(batch_index)
+        _maybe_barrier()
+        return _load_global_batch_locally(batch_index)
+
     batch = None
     if Platform.get_rank() == 0:
-        dataset = create_dataset(data_slice=None)
-        dataloader = TorchDataLoader(
-            dataset,
-            batch_size=GLOBAL_BATCH_SIZE,
-            num_workers=0,
-            shuffle=False,
-            collate_fn=lambda x: x,
-        )
-        for idx, _batch in enumerate(dataloader):
-            if idx == batch_index:
-                if not isinstance(_batch, list):
-                    raise TypeError(f'Expected list batch, got: {type(_batch)}')
-                batch = _batch
-                break
-        if batch is None:
-            raise IndexError(f'Batch index {batch_index} out of range')
-
-    if dist.is_available() and dist.is_initialized():
-        object_list = [batch]
-        dist.broadcast_object_list(object_list, src=0)
-        batch = object_list[0]
-    return batch
+        batch = _load_global_batch_locally(batch_index)
+    object_list = [batch]
+    dist.broadcast_object_list(object_list, src=0)
+    return object_list[0]
 
 
 def _slice_local_batch(global_batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
