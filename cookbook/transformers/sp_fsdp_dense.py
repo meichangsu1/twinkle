@@ -14,11 +14,13 @@ from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger, torch_util
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
-from twinkle.preprocessor import SelfCognitionProcessor
+from twinkle.preprocessor import AlpacaProcessor
 
 logger = get_logger()
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
-DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://swift/self-cognition')
+# DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://swift/self-cognition')
+DATASETS = os.environ.get('TWINKLE_DATASETS', 'ms://AI-ModelScope/LongAlpaca-12k')
+
 
 device_group = [DeviceGroup(
     name='default',
@@ -55,9 +57,9 @@ def eval(model):
 
 
 def create_dataset(data_slice=None):
-    dataset = Dataset(dataset_meta=DatasetMeta(DATASETS, data_slice=range(500)))
+    dataset = Dataset(dataset_meta=DatasetMeta(DATASETS, data_slice=data_slice or range(500)))
     dataset.set_template('Template', model_id=MODEL_ID)
-    dataset.map(SelfCognitionProcessor('twinkle模型', 'twinkle团队'))
+    dataset.map(AlpacaProcessor())
     dataset.encode(batched=True)
     return dataset
 
