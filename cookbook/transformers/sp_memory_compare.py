@@ -38,6 +38,15 @@ from twinkle.preprocessor import AlpacaProcessor, SelfCognitionProcessor
 # TWINKLE_MEMORY_OUTPUT=/tmp/sp2_memory_4g.json \
 # TWINKLE_MEMORY_COMPARE_TO=/tmp/sp0_memory_4g.json \
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_memory_compare
+# TWINKLE_MEMORY_ULYSSES_SIZE=1 \
+# TWINKLE_MEMORY_BATCH_SYNC_MODE=local \
+# TWINKLE_MEMORY_OUTPUT=/tmp/sp0_memory.json \
+# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_memory_compare
+# TWINKLE_MEMORY_ULYSSES_SIZE=2 \
+# TWINKLE_MEMORY_BATCH_SYNC_MODE=local \
+# TWINKLE_MEMORY_OUTPUT=/tmp/sp2_memory.json \
+# TWINKLE_MEMORY_COMPARE_TO=/tmp/sp0_memory.json \
+# torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_memory_compare
 
 logger = get_logger()
 
@@ -55,6 +64,7 @@ MEMORY_DISABLE_GC = os.environ.get('TWINKLE_MEMORY_DISABLE_GC', '0') == '1'
 MEMORY_STRICT_DETERMINISM = os.environ.get('TWINKLE_MEMORY_STRICT_DETERMINISM', '0') == '1'
 MEMORY_EMPTY_CACHE = os.environ.get('TWINKLE_MEMORY_EMPTY_CACHE', '1') == '1'
 MEMORY_PROCESSOR = os.environ.get('TWINKLE_MEMORY_PROCESSOR', '').strip().lower()
+MEMORY_BATCH_SYNC_MODE = os.environ.get('TWINKLE_MEMORY_BATCH_SYNC_MODE', 'auto').strip().lower()
 TEMPLATE_MAX_LENGTH = os.environ.get('TWINKLE_MEMORY_TEMPLATE_MAX_LENGTH')
 TRUNCATION_STRATEGY = os.environ.get('TWINKLE_MEMORY_TRUNCATION_STRATEGY')
 SELF_COGNITION_NAME = os.environ.get('TWINKLE_MEMORY_SELF_NAME', 'twinkle模型')
@@ -273,31 +283,48 @@ def _batch_digest(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     return digest
 
 
+def _load_global_batch_locally(batch_index: int) -> List[Dict[str, Any]]:
+    dataset = create_dataset(data_slice=None)
+    dataloader = TorchDataLoader(
+        dataset,
+        batch_size=GLOBAL_BATCH_SIZE,
+        num_workers=0,
+        shuffle=False,
+        collate_fn=lambda x: x,
+    )
+    for idx, current_batch in enumerate(dataloader):
+        if idx == batch_index:
+            if not isinstance(current_batch, list):
+                raise TypeError(f'Expected list batch, got: {type(current_batch)}')
+            return current_batch
+    raise IndexError(f'Batch index {batch_index} out of range')
+
+
+def _resolve_batch_sync_mode() -> str:
+    if MEMORY_BATCH_SYNC_MODE in ('broadcast', 'local'):
+        return MEMORY_BATCH_SYNC_MODE
+    if _npu_available():
+        return 'local'
+    return 'broadcast'
+
+
 def _get_global_batch(batch_index: int) -> List[Dict[str, Any]]:
+    sync_mode = _resolve_batch_sync_mode()
+    if not dist.is_available() or not dist.is_initialized():
+        return _load_global_batch_locally(batch_index)
+
+    if sync_mode == 'local':
+        if Platform.get_rank() == 0:
+            _load_global_batch_locally(batch_index)
+        _maybe_barrier()
+        return _load_global_batch_locally(batch_index)
+
     batch = None
     if Platform.get_rank() == 0:
-        dataset = create_dataset(data_slice=None)
-        dataloader = TorchDataLoader(
-            dataset,
-            batch_size=GLOBAL_BATCH_SIZE,
-            num_workers=0,
-            shuffle=False,
-            collate_fn=lambda x: x,
-        )
-        for idx, current_batch in enumerate(dataloader):
-            if idx == batch_index:
-                if not isinstance(current_batch, list):
-                    raise TypeError(f'Expected list batch, got: {type(current_batch)}')
-                batch = current_batch
-                break
-        if batch is None:
-            raise IndexError(f'Batch index {batch_index} out of range')
-
-    if dist.is_available() and dist.is_initialized():
-        object_list = [batch]
-        dist.broadcast_object_list(object_list, src=0)
-        batch = object_list[0]
-    return batch
+        batch = _load_global_batch_locally(batch_index)
+    object_list = [batch]
+    dist.broadcast_object_list(object_list, src=0)
+    return object_list[0]
 
 
 def _slice_local_batch(global_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -553,6 +580,8 @@ def main():
             'TWINKLE_MEMORY_STRICT_DETERMINISM': os.environ.get('TWINKLE_MEMORY_STRICT_DETERMINISM', '0'),
             'TWINKLE_MEMORY_EMPTY_CACHE': os.environ.get('TWINKLE_MEMORY_EMPTY_CACHE', '1'),
             'TWINKLE_MEMORY_PROCESSOR': MEMORY_PROCESSOR or None,
+            'TWINKLE_MEMORY_BATCH_SYNC_MODE': MEMORY_BATCH_SYNC_MODE,
+            'resolved_batch_sync_mode': _resolve_batch_sync_mode(),
             'TWINKLE_MEMORY_TEMPLATE_MAX_LENGTH': TEMPLATE_MAX_LENGTH,
             'TWINKLE_MEMORY_TRUNCATION_STRATEGY': TRUNCATION_STRATEGY,
         },
