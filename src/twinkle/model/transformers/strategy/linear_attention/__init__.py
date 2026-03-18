@@ -1,6 +1,6 @@
-from .qwen35 import Qwen35LinearAttentionSPProvider
+from .qwen35 import Qwen35LinearAttentionSPModelPatch
 
 
-LINEAR_ATTENTION_PROVIDERS = (Qwen35LinearAttentionSPProvider(), )
+LINEAR_ATTENTION_MODEL_PATCHES = (Qwen35LinearAttentionSPModelPatch(), )
 
-__all__ = ['LINEAR_ATTENTION_PROVIDERS', 'Qwen35LinearAttentionSPProvider']
+__all__ = ['LINEAR_ATTENTION_MODEL_PATCHES', 'Qwen35LinearAttentionSPModelPatch']

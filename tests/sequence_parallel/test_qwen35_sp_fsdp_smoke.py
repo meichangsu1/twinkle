@@ -130,7 +130,7 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
             tokenizer=tokenizer,
             device_mesh=device_mesh,
         )
-        self.assertEqual(sequence_parallel.linear_attention_provider_name, 'qwen35')
+        self.assertEqual(sequence_parallel.linear_attention_model_patch_name, 'qwen35')
 
         fsdp_model = FSDP(model, use_orig_params=True, device_id=device)
         optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=1e-6)

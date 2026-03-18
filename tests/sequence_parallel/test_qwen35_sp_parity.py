@@ -344,7 +344,7 @@ class TestQwen35SPParity(unittest.TestCase):
             tokenizer=tokenizer,
             device_mesh=device_mesh,
         )
-        self.assertEqual(sequence_parallel.linear_attention_provider_name, 'qwen35')
+        self.assertEqual(sequence_parallel.linear_attention_model_patch_name, 'qwen35')
         sp_linear_captures: dict[str, dict[str, torch.Tensor]] = {}
         if linear_debug_layers > 0:
             sp_linear_captures = _install_qwen35_linear_rule_capture(sp_model, linear_debug_layers)
@@ -423,7 +423,7 @@ class TestQwen35SPParity(unittest.TestCase):
             f'attn_impl={getattr(sp_model.config, "_attn_implementation", "unknown")}, '
             f'dtype={str(model_dtype).replace("torch.", "")}, '
             f'force_recurrent={force_recurrent}, forced_recurrent_layers={forced_recurrent_layers}, '
-            f'linear_attention_provider={sequence_parallel.linear_attention_provider_name}, '
+            f'linear_attention_model_patch={sequence_parallel.linear_attention_model_patch_name}, '
             f'loss_atol={loss_atol:.2e}, loss_rtol={loss_rtol:.2e}, '
             f'grad_atol={grad_atol:.2e}, grad_rtol={grad_rtol:.2e}'
         )
@@ -440,7 +440,7 @@ class TestQwen35SPParity(unittest.TestCase):
         is_fp32_linear_exact = (
             force_recurrent
             and model_dtype == torch.float32
-            and sequence_parallel.linear_attention_provider_name == 'qwen35'
+            and sequence_parallel.linear_attention_model_patch_name == 'qwen35'
         )
 
         if is_low_precision_sdpa:

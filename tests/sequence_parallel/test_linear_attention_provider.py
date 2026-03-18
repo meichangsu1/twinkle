@@ -26,24 +26,24 @@ class DummyModel(torch.nn.Module):
         self.inner = inner
 
 
-class TestLinearAttentionProvider(unittest.TestCase):
+class TestLinearAttentionModelPatch(unittest.TestCase):
 
-    def test_resolve_qwen35_provider(self):
+    def test_resolve_qwen35_model_patch(self):
         sp = SequenceParallel()
         model = DummyModel(Qwen3_5GatedDeltaNet())
 
-        provider = sp._resolve_linear_attention_provider(model)
+        model_patch = sp._resolve_linear_attention_model_patch(model)
 
-        self.assertIsNotNone(provider)
-        self.assertEqual(provider.name, 'qwen35')
+        self.assertIsNotNone(model_patch)
+        self.assertEqual(model_patch.name, 'qwen35')
 
     def test_non_qwen_model_is_ignored(self):
         sp = SequenceParallel()
         model = DummyModel(DummyLinearBlock())
 
-        provider = sp._resolve_linear_attention_provider(model)
+        model_patch = sp._resolve_linear_attention_model_patch(model)
 
-        self.assertIsNone(provider)
+        self.assertIsNone(model_patch)
 
 
 if __name__ == '__main__':

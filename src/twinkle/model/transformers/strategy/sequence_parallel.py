@@ -487,8 +487,8 @@ class SequenceParallel:
         self._sp_group = None
         self.num_heads = None
         self.causal_mask_func = None
-        self.linear_attention_provider = None
-        self.linear_attention_provider_name = None
+        self.linear_attention_model_patch = None
+        self.linear_attention_model_patch_name = None
         self.extra_kwargs = {}
 
     @property
@@ -501,44 +501,44 @@ class SequenceParallel:
         """Text-aligned position ids with shape [B, S]."""
         return self.extra_kwargs.get('text_position_ids')
 
-    def _resolve_linear_attention_provider(self, base_model: torch.nn.Module):
-        from .linear_attention import LINEAR_ATTENTION_PROVIDERS
+    def _resolve_linear_attention_model_patch(self, base_model: torch.nn.Module):
+        from .linear_attention import LINEAR_ATTENTION_MODEL_PATCHES
 
-        for provider in LINEAR_ATTENTION_PROVIDERS:
-            if provider.match(base_model):
-                return provider
+        for model_patch in LINEAR_ATTENTION_MODEL_PATCHES:
+            if model_patch.match(base_model):
+                return model_patch
         return None
 
-    def _activate_linear_attention_provider(self, llm_model: torch.nn.Module, model: torch.nn.Module) -> None:
-        self.linear_attention_provider = None
-        self.linear_attention_provider_name = None
-        self.extra_kwargs.pop('linear_attention_provider', None)
-        self.extra_kwargs.pop('linear_attention_disabled_gradient_checkpointing', None)
+    def _activate_linear_attention_model_patch(self, llm_model: torch.nn.Module, model: torch.nn.Module) -> None:
+        self.linear_attention_model_patch = None
+        self.linear_attention_model_patch_name = None
+        self.extra_kwargs.pop('linear_attention_model_patch', None)
+        self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing', None)
 
         if self.world_size is None or self.world_size <= 1:
             return
 
-        provider = self._resolve_linear_attention_provider(llm_model)
-        if provider is None:
+        model_patch = self._resolve_linear_attention_model_patch(llm_model)
+        if model_patch is None:
             return
-        if not provider.patch(llm_model, self):
+        if not model_patch.patch(llm_model, self):
             return
 
-        self.linear_attention_provider = provider
-        self.linear_attention_provider_name = provider.name
-        self.extra_kwargs['linear_attention_provider'] = provider.name
-        disabled = provider.maybe_disable_gc(model, self)
-        self.extra_kwargs['linear_attention_disabled_gradient_checkpointing'] = disabled
+        self.linear_attention_model_patch = model_patch
+        self.linear_attention_model_patch_name = model_patch.name
+        self.extra_kwargs['linear_attention_model_patch'] = model_patch.name
+        disabled = model_patch.maybe_disable_gc(model, self)
+        self.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing'] = disabled
 
     def _validate_linear_attention_inputs(self) -> None:
-        if self.linear_attention_provider is None:
+        if self.linear_attention_model_patch is None:
             return
-        self.linear_attention_provider.validate_inputs(self)
+        self.linear_attention_model_patch.validate_inputs(self)
 
     def _should_build_causal_mask(self) -> bool:
-        if self.linear_attention_provider is None:
+        if self.linear_attention_model_patch is None:
             return True
-        return bool(self.linear_attention_provider.should_build_causal_mask())
+        return bool(self.linear_attention_model_patch.should_build_causal_mask())
 
     def _prepare_flash_attn(self, base_model: torch.nn.Module):
         try:
@@ -1054,7 +1054,7 @@ class SequenceParallel:
             self._prepare_flash_attn(llm_model)
             SequenceParallel._global_inited = True
 
-        self._activate_linear_attention_provider(llm_model, model)
+        self._activate_linear_attention_model_patch(llm_model, model)
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):

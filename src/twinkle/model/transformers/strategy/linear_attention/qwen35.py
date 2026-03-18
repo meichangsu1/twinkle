@@ -212,7 +212,7 @@ class _LeftHaloExchangeFn(torch.autograd.Function):
         return grad_local.contiguous(), None, None, None, None
 
 
-class Qwen35LinearAttentionSPProvider:
+class Qwen35LinearAttentionSPModelPatch:
 
     name = 'qwen35'
 
