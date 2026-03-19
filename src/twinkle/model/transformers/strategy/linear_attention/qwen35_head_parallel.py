@@ -69,6 +69,20 @@ def _run_depthwise_causal_conv(
     return conv_output.transpose(1, 2).reshape(batch_size, seq_len, num_heads, inner_dim).contiguous()
 
 
+def _interleave_qkv_value_head_params(
+    query_params: torch.Tensor,
+    key_params: torch.Tensor,
+    value_params: torch.Tensor,
+    *,
+    local_v_heads: int,
+) -> torch.Tensor:
+    """Match the per-value-head q/k/v channel order used by mixed_qkv_expanded."""
+    query_params = query_params.reshape(local_v_heads, -1, *query_params.shape[1:])
+    key_params = key_params.reshape(local_v_heads, -1, *key_params.shape[1:])
+    value_params = value_params.reshape(local_v_heads, -1, *value_params.shape[1:])
+    return torch.cat([query_params, key_params, value_params], dim=1).reshape(-1, *query_params.shape[2:]).contiguous()
+
+
 class Qwen35HeadParallelHelper:
 
     impl_name = 'head_parallel'
@@ -201,7 +215,12 @@ class Qwen35HeadParallelHelper:
             head_dim=module.head_v_dim,
             head_indices=local_value_head_indices,
         )
-        local_conv_weight = torch.cat([local_q_weight, local_k_weight, local_v_weight], dim=0)
+        local_conv_weight = _interleave_qkv_value_head_params(
+            local_q_weight,
+            local_k_weight,
+            local_v_weight,
+            local_v_heads=local_v_heads,
+        )
 
         conv_bias = module.conv1d.bias
         local_conv_bias = None
@@ -227,7 +246,12 @@ class Qwen35HeadParallelHelper:
                 head_dim=module.head_v_dim,
                 head_indices=local_value_head_indices,
             )
-            local_conv_bias = torch.cat([local_q_bias, local_k_bias, local_v_bias], dim=0)
+            local_conv_bias = _interleave_qkv_value_head_params(
+                local_q_bias,
+                local_k_bias,
+                local_v_bias,
+                local_v_heads=local_v_heads,
+            )
 
         mixed_qkv_hp = _run_depthwise_causal_conv(
             mixed_qkv_hp,

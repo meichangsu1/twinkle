@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 from twinkle.model.transformers.strategy.linear_attention.qwen35_head_parallel import (
     Qwen35HeadParallelHelper,
     _head_to_seq_shard,
+    _interleave_qkv_value_head_params,
     _seq_to_head_shard,
 )
 
@@ -175,6 +176,21 @@ class TestQwen35HeadParallel(unittest.TestCase):
             nprocs=world_size,
             join=True,
         )
+
+    def test_interleave_qkv_value_head_params_matches_mixed_qkv_layout(self):
+        query = torch.tensor([10, 11, 20, 21, 30, 31, 40, 41], dtype=torch.float32)
+        key = torch.tensor([50, 51, 60, 61, 70, 71, 80, 81], dtype=torch.float32)
+        value = torch.tensor([90, 91, 92, 100, 101, 102, 110, 111, 112, 120, 121, 122], dtype=torch.float32)
+
+        interleaved = _interleave_qkv_value_head_params(query, key, value, local_v_heads=4)
+        expected = torch.tensor([
+            10, 11, 50, 51, 90, 91, 92,
+            20, 21, 60, 61, 100, 101, 102,
+            30, 31, 70, 71, 110, 111, 112,
+            40, 41, 80, 81, 120, 121, 122,
+        ], dtype=torch.float32)
+
+        self.assertTrue(torch.equal(interleaved, expected))
 
     def test_head_parallel_matches_single_layer_reference(self):
         if not dist.is_available():
