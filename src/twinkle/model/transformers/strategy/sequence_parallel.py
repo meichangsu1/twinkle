@@ -596,8 +596,16 @@ class SequenceParallel:
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
             def _prepare_full_sequence_mask_inputs(config, inputs_embeds, attention_mask, cache_position=None):
-                if (attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() == 2
+                cached_full_attention_mask = self.extra_kwargs.get('strict_full_attention_mask')
+                if (cached_full_attention_mask is not None and torch.is_tensor(cached_full_attention_mask)
+                        and cached_full_attention_mask.dim() == 2
                         and getattr(config, '_attn_implementation', None) in {'sdpa', 'eager'}):
+                    # pad_and_split_inputs already cached the full 2D padding mask before SP split. Reuse it here
+                    # instead of issuing another runtime gather from local shards, which can desync full-attention
+                    # models that materialize causal masks through create_causal_mask.
+                    attention_mask = cached_full_attention_mask.to(device=inputs_embeds.device)
+                elif (attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dim() == 2
+                      and getattr(config, '_attn_implementation', None) in {'sdpa', 'eager'}):
                     # SDPA/eager both consume a 4D causal mask built from the 2D padding mask before the attention
                     # kernel runs. If we feed the per-rank 2D padding mask here, each rank builds a local causal
                     # block; later gathering only the mask tensor cannot recover the true global mask semantics.
@@ -612,7 +620,10 @@ class SequenceParallel:
                     (inputs_embeds.shape[0], inputs_embeds.shape[1] * self.sp_world_size, inputs_embeds.shape[2]),
                     dtype=inputs_embeds.dtype,
                     device=inputs_embeds.device)
-                if cache_position is None:
+                cached_full_cache_position = self.extra_kwargs.get('strict_full_cache_position')
+                if cached_full_cache_position is not None and torch.is_tensor(cached_full_cache_position):
+                    cache_position = cached_full_cache_position.to(device=inputs_embeds.device)
+                elif cache_position is None:
                     cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
                 else:
                     cache_position = torch.arange(0, inputs_embeds.shape[1], device=cache_position.device)
