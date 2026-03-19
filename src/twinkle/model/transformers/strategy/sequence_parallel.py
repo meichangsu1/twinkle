@@ -779,10 +779,11 @@ class SequenceParallel:
                     # semantics to avoid cross-subsequence attention. We derive cu_seqlens from position_ids
                     # resets (0,1,...) and pass cu_seq_lens_* to FA2.
                     if self.extra_kwargs.get('is_packed', False):
-                        if position_ids is not None:
-                            kwargs['position_ids'] = position_ids
+                        packed_position_ids = self.real_position_ids if self.real_position_ids is not None else position_ids
+                        if packed_position_ids is not None:
+                            kwargs['position_ids'] = packed_position_ids
                         # Treat SP-alignment padding (-1) as separate 1-token sequences by mapping -1 -> 0.
-                        pos = position_ids
+                        pos = packed_position_ids
                         if pos is None:
                             raise RuntimeError('SequenceParallel: packed mode requires position_ids.')
                         pos = pos.clone()
@@ -799,9 +800,9 @@ class SequenceParallel:
                         if len(args) > 0:
                             args = (None, *args[1:])
                     elif 'cu_seq_lens_q' in kwargs:
-                        if position_ids is not None:
-                            kwargs['position_ids'] = position_ids
-                        text_position_ids = position_ids
+                        text_position_ids = self.real_position_ids if self.real_position_ids is not None else position_ids
+                        if text_position_ids is not None:
+                            kwargs['position_ids'] = text_position_ids
                         if text_position_ids is None:
                             raise RuntimeError('SequenceParallel: cu_seqlens mode requires position_ids.')
                         text_position_ids = self.pad(
@@ -1201,7 +1202,10 @@ class SequenceParallel:
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else 1
         if position_ids is not None:
-            position_ids = self.pad(position_ids, padding_value=-1, position_ids=real_position_ids, dim=-1)
+            # Keep model-facing position_ids non-negative. Some optimized CUDA kernels assume valid gather indices and
+            # can assert on the SP-alignment sentinel (-1). We keep the true padded layout in real_position_ids for
+            # mask / packed-sequence bookkeeping.
+            position_ids = self.pad(position_ids, padding_value=0, position_ids=real_position_ids, dim=-1)
         if labels is not None:
             labels = self.pad(labels, padding_value=-100, position_ids=real_position_ids)
         if loss_scale is not None:
