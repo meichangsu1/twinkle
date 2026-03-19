@@ -13,9 +13,15 @@ from .sp_collectives import (gather_attention_mask_from_sequence_parallel_region
 class Qwen35StrictFullSeqHelper:
 
     def __init__(self):
-        self.enabled = os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
-        self.trace_enabled = os.environ.get('QWEN35_SP_LINEAR_STRICT_TRACE', '0') == '1'
         self._trace_seq = 0
+
+    @property
+    def enabled(self) -> bool:
+        return os.environ.get('QWEN35_SP_LINEAR_STRICT', '0') == '1'
+
+    @property
+    def trace_enabled(self) -> bool:
+        return os.environ.get('QWEN35_SP_LINEAR_STRICT_TRACE', '0') == '1'
 
     @staticmethod
     def _rank() -> int:

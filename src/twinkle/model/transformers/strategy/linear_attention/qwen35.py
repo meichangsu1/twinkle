@@ -6,6 +6,7 @@ import torch.distributed as dist
 
 from twinkle.utils.transformers_utils import get_llm_model
 
+from .qwen35_head_parallel import Qwen35HeadParallelHelper
 from .qwen35_strict import Qwen35StrictFullSeqHelper
 
 
@@ -220,7 +221,21 @@ class Qwen35LinearAttentionSPModelPatch:
 
     def __init__(self):
         self.patched_linear_layer_indices = set()
+        self.head_parallel = Qwen35HeadParallelHelper()
         self.strict_full_seq = Qwen35StrictFullSeqHelper()
+        self.impl_name = 'state_parallel'
+
+    def _resolve_impl_name(self) -> str:
+        if self.head_parallel.enabled and self.strict_full_seq.enabled:
+            raise RuntimeError(
+                'SequenceParallel: Qwen3.5 head-parallel and strict full-seq are mutually exclusive. '
+                'Set only one of QWEN35_SP_LINEAR_HEAD_PARALLEL=1 or QWEN35_SP_LINEAR_STRICT=1.'
+            )
+        if self.head_parallel.enabled:
+            return self.head_parallel.impl_name
+        if self.strict_full_seq.enabled:
+            return 'strict_full_seq'
+        return 'state_parallel'
 
     def match(self, base_model: torch.nn.Module) -> bool:
         text_model = _get_text_model(base_model)
@@ -244,6 +259,9 @@ class Qwen35LinearAttentionSPModelPatch:
             )
 
     def maybe_disable_gc(self, model: torch.nn.Module, sequence_parallel) -> list[int]:
+        self.impl_name = self._resolve_impl_name()
+        if self.impl_name == self.head_parallel.impl_name:
+            return []
         llm_model = get_llm_model(model)
         was_gc_enabled = bool(getattr(model, 'is_gradient_checkpointing', False))
         if not was_gc_enabled:
@@ -253,6 +271,7 @@ class Qwen35LinearAttentionSPModelPatch:
         return self._disable_gc_for_patched_layers(model)
 
     def patch(self, base_model: torch.nn.Module, sequence_parallel) -> bool:
+        self.impl_name = self._resolve_impl_name()
         text_model = _get_text_model(base_model)
         has_linear_attn = False
         self.patched_linear_layer_indices = set()
@@ -460,6 +479,27 @@ class Qwen35LinearAttentionSPModelPatch:
     ):
         halo_causal_conv1d_fn = self._wrap_causal_conv1d_fn(sequence_parallel, module, origin_causal_conv1d_fn)
 
+        def run_origin_unpatched(
+            hidden_states: torch.Tensor,
+            cache_params=None,
+            cache_position: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+        ):
+            saved_rule = module.chunk_gated_delta_rule
+            saved_causal_conv1d_fn = module.causal_conv1d_fn
+            module.chunk_gated_delta_rule = origin_rule
+            module.causal_conv1d_fn = origin_causal_conv1d_fn
+            try:
+                return origin_forward(
+                    hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                )
+            finally:
+                module.chunk_gated_delta_rule = saved_rule
+                module.causal_conv1d_fn = saved_causal_conv1d_fn
+
         def wrapped_forward(
             hidden_states: torch.Tensor,
             cache_params=None,
@@ -483,14 +523,28 @@ class Qwen35LinearAttentionSPModelPatch:
                 and cache_position is not None
             )
             if use_precomputed_states:
-                return origin_forward(
+                return run_origin_unpatched(
                     hidden_states,
                     cache_params=cache_params,
                     cache_position=cache_position,
                     attention_mask=attention_mask,
                 )
 
-            if self.strict_full_seq.enabled:
+            if self.impl_name == self.head_parallel.impl_name:
+                if cache_params is not None:
+                    raise RuntimeError(
+                        'SequenceParallel: Qwen3.5 head-parallel linear attention does not support cache_params yet.'
+                    )
+                return self.head_parallel.run(
+                    sequence_parallel=sequence_parallel,
+                    module=module,
+                    origin_rule=origin_rule,
+                    origin_causal_conv1d_fn=origin_causal_conv1d_fn,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                )
+
+            if self.impl_name == 'strict_full_seq':
                 return self.strict_full_seq.run(
                     sequence_parallel=sequence_parallel,
                     module=module,

@@ -35,6 +35,24 @@ from twinkle.preprocessor import SelfCognitionProcessor
 # TWINKLE_PARITY_BATCH_SYNC_MODE=local \
 # torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
 
+
+# QWEN35_SP_LINEAR_HEAD_PARALLEL=1 \
+# TWINKLE_PARITY_WRAP_MODE=ddp \
+# TWINKLE_PARITY_ULYSSES_SIZE=2 \
+# TWINKLE_PARITY_DISABLE_GC=0 \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
+
+# TWINKLE_PARITY_BATCH_SYNC_MODE=local
+
+# QWEN35_SP_LINEAR_HEAD_PARALLEL=1 \
+# TWINKLE_PARITY_WRAP_MODE=ddp \
+# TWINKLE_PARITY_ULYSSES_SIZE=2 \
+# TWINKLE_PARITY_DISABLE_GC=0 \
+# TWINKLE_PARITY_OUTPUT=/tmp/qwen35_head_parallel.json \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_first_step_parity
+
+
+
 logger = get_logger()
 
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')

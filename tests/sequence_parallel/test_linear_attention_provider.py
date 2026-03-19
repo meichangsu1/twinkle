@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from twinkle.model.transformers.strategy.linear_attention.qwen35 import Qwen35LinearAttentionSPModelPatch
 from twinkle.model.transformers.strategy.linear_attention.qwen35_strict import Qwen35StrictFullSeqHelper
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel
 
@@ -96,6 +97,24 @@ class TestLinearAttentionModelPatch(unittest.TestCase):
         self.assertTrue(model.layers[1].gradient_checkpointing)
         self.assertIsNotNone(model.layers[1]._gradient_checkpointing_func)
 
+    def test_qwen35_head_parallel_keeps_gc_enabled(self):
+        sp = SequenceParallel()
+        sp.world_size = 2
+        sp.sp_world_size = 2
+        model = DummyQwenTextModel()
+
+        with mock.patch.dict('os.environ', {'QWEN35_SP_LINEAR_HEAD_PARALLEL': '1'}, clear=False):
+            sp._activate_linear_attention_model_patch(model, model)
+
+        self.assertEqual(sp.linear_attention_model_patch_name, 'qwen35')
+        self.assertEqual(sp.extra_kwargs['linear_attention_model_patch_impl'], 'head_parallel')
+        self.assertEqual(
+            sp.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing_layers'],
+            [],
+        )
+        self.assertTrue(model.layers[0].gradient_checkpointing)
+        self.assertIsNotNone(model.layers[0]._gradient_checkpointing_func)
+
     def test_qwen35_strict_helper_is_opt_in_and_rejects_fsdp(self):
         with mock.patch.dict('os.environ', {'QWEN35_SP_LINEAR_STRICT': '1'}):
             helper = Qwen35StrictFullSeqHelper()
@@ -104,6 +123,19 @@ class TestLinearAttentionModelPatch(unittest.TestCase):
         sequence_parallel = SimpleNamespace(device_mesh=SimpleNamespace(fsdp_world_size=2))
         with self.assertRaisesRegex(RuntimeError, 'only supported without FSDP sharding'):
             helper.validate_runtime(sequence_parallel)
+
+    def test_qwen35_impl_flags_are_mutually_exclusive(self):
+        with mock.patch.dict(
+            'os.environ',
+            {
+                'QWEN35_SP_LINEAR_HEAD_PARALLEL': '1',
+                'QWEN35_SP_LINEAR_STRICT': '1',
+            },
+            clear=False,
+        ):
+            patch = Qwen35LinearAttentionSPModelPatch()
+            with self.assertRaisesRegex(RuntimeError, 'mutually exclusive'):
+                patch._resolve_impl_name()
 
 
 if __name__ == '__main__':

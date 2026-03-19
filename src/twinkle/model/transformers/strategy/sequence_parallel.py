@@ -513,6 +513,7 @@ class SequenceParallel:
         self.linear_attention_model_patch = None
         self.linear_attention_model_patch_name = None
         self.extra_kwargs.pop('linear_attention_model_patch', None)
+        self.extra_kwargs.pop('linear_attention_model_patch_impl', None)
         self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing', None)
         self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing_layers', None)
 
@@ -528,7 +529,9 @@ class SequenceParallel:
         self.linear_attention_model_patch = model_patch
         self.linear_attention_model_patch_name = model_patch.name
         self.extra_kwargs['linear_attention_model_patch'] = model_patch.name
+        self.extra_kwargs['linear_attention_model_patch_impl'] = getattr(model_patch, 'impl_name', 'state_parallel')
         disabled = model_patch.maybe_disable_gc(model, self)
+        self.extra_kwargs['linear_attention_model_patch_impl'] = getattr(model_patch, 'impl_name', 'state_parallel')
         self.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing_layers'] = list(disabled)
 
     def _validate_linear_attention_inputs(self) -> None:

@@ -27,6 +27,29 @@ from twinkle.model import TransformersModel
 # TWINKLE_MEMORY_ULYSSES_SIZE=2 \
 # torchrun --standalone --nproc_per_node=2 -m cookbook.transformers.sp_synthetic_memory_compare
 
+
+# TWINKLE_MEMORY_WRAP_MODE=ddp \
+# TWINKLE_MEMORY_ULYSSES_SIZE=1 \
+# TWINKLE_MEMORY_DISABLE_GC=0 \
+# TWINKLE_SYNTHETIC_BATCH_SIZE=8 \
+# TWINKLE_SYNTHETIC_SEQ_LEN=4096 \
+# TWINKLE_SYNTHETIC_NUM_STEPS=5 \
+# TWINKLE_MEMORY_OUTPUT=/tmp/qwen35_sp1_mem.json \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_synthetic_memory_compare
+
+
+
+# QWEN35_SP_LINEAR_HEAD_PARALLEL=1 \
+# TWINKLE_MEMORY_WRAP_MODE=ddp \
+# TWINKLE_MEMORY_ULYSSES_SIZE=2 \
+# TWINKLE_MEMORY_DISABLE_GC=0 \
+# TWINKLE_SYNTHETIC_BATCH_SIZE=8 \
+# TWINKLE_SYNTHETIC_SEQ_LEN=4096 \
+# TWINKLE_SYNTHETIC_NUM_STEPS=5 \
+# TWINKLE_MEMORY_OUTPUT=/tmp/qwen35_head_parallel_mem.json \
+# torchrun --standalone --nproc_per_node=4 -m cookbook.transformers.sp_synthetic_memory_compare
+
+
 logger = get_logger()
 
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
@@ -216,11 +239,45 @@ def _create_model(num_training_steps: int) -> TransformersModel:
 def _resolve_vocab_size(model: TransformersModel) -> int:
     if SYNTHETIC_VOCAB_SIZE_OVERRIDE is not None:
         return int(SYNTHETIC_VOCAB_SIZE_OVERRIDE)
-    config = getattr(model.model, 'config', None)
-    vocab_size = getattr(config, 'vocab_size', None)
-    if vocab_size is None:
-        raise RuntimeError('Could not infer vocab_size from model.config; set TWINKLE_SYNTHETIC_VOCAB_SIZE.')
-    return int(vocab_size)
+
+    candidate_modules = []
+    base_model = getattr(model, 'model', None)
+    if base_model is not None:
+        candidate_modules.append(base_model)
+        language_model = getattr(base_model, 'language_model', None)
+        if language_model is not None and language_model is not base_model:
+            candidate_modules.append(language_model)
+
+    for module in candidate_modules:
+        config = getattr(module, 'config', None)
+        vocab_size = getattr(config, 'vocab_size', None)
+        if vocab_size is not None:
+            return int(vocab_size)
+
+    def _weight_vocab_size(module) -> int | None:
+        if module is None:
+            return None
+        for getter_name in ('get_input_embeddings', 'get_output_embeddings'):
+            getter = getattr(module, getter_name, None)
+            if callable(getter):
+                embedding = getter()
+                weight = getattr(embedding, 'weight', None)
+                if weight is not None and getattr(weight, 'ndim', 0) >= 2:
+                    return int(weight.shape[0])
+        for attr_name in ('embed_tokens', 'lm_head'):
+            submodule = getattr(module, attr_name, None)
+            weight = getattr(submodule, 'weight', None)
+            if weight is not None and getattr(weight, 'ndim', 0) >= 2:
+                return int(weight.shape[0])
+        return None
+
+    for module in candidate_modules:
+        vocab_size = _weight_vocab_size(module)
+        if vocab_size is not None:
+            return vocab_size
+
+    raise RuntimeError(
+        'Could not infer vocab_size from model config or embedding weights; set TWINKLE_SYNTHETIC_VOCAB_SIZE.')
 
 
 def _build_synthetic_global_batch(vocab_size: int, step_idx: int) -> List[Dict[str, Any]]:
