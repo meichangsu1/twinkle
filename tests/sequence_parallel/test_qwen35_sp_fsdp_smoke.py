@@ -90,6 +90,7 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        from twinkle.patch import apply_patch
         from twinkle.model.transformers.strategy.sequence_parallel import sequence_parallel
         from twinkle.utils import DeviceMesh
 
@@ -115,6 +116,7 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
         ).to(device)
         if force_recurrent:
             _force_qwen35_linear_recurrent(model)
+        apply_patch(model, 'Qwen35LinearAttentionSPPatch')
         model.train()
 
         world_size = dist.get_world_size()
@@ -130,7 +132,6 @@ class TestQwen35SPFSDPSmoke(unittest.TestCase):
             tokenizer=tokenizer,
             device_mesh=device_mesh,
         )
-        self.assertEqual(sequence_parallel.linear_attention_model_patch_name, 'qwen35')
 
         fsdp_model = FSDP(model, use_orig_params=True, device_id=device)
         optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=1e-6)

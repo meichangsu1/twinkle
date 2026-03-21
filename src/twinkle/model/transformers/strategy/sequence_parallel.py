@@ -487,8 +487,6 @@ class SequenceParallel:
         self._sp_group = None
         self.num_heads = None
         self.causal_mask_func = None
-        self.linear_attention_model_patch = None
-        self.linear_attention_model_patch_name = None
         self.extra_kwargs = {}
 
     @property
@@ -501,48 +499,14 @@ class SequenceParallel:
         """Text-aligned position ids with shape [B, S]."""
         return self.extra_kwargs.get('text_position_ids')
 
-    def _resolve_linear_attention_model_patch(self, base_model: torch.nn.Module):
-        from .linear_attention import LINEAR_ATTENTION_MODEL_PATCHES
-
-        for model_patch in LINEAR_ATTENTION_MODEL_PATCHES:
-            if model_patch.match(base_model):
-                return model_patch
-        return None
-
-    def _activate_linear_attention_model_patch(self, llm_model: torch.nn.Module, model: torch.nn.Module) -> None:
-        self.linear_attention_model_patch = None
-        self.linear_attention_model_patch_name = None
-        self.extra_kwargs.pop('linear_attention_model_patch', None)
-        self.extra_kwargs.pop('linear_attention_model_patch_impl', None)
-        self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing', None)
-        self.extra_kwargs.pop('linear_attention_model_patch_disabled_gradient_checkpointing_layers', None)
-
-        if self.world_size is None or self.world_size <= 1:
-            return
-
-        model_patch = self._resolve_linear_attention_model_patch(llm_model)
-        if model_patch is None:
-            return
-        if not model_patch.patch(llm_model, self):
-            return
-
-        self.linear_attention_model_patch = model_patch
-        self.linear_attention_model_patch_name = model_patch.name
-        self.extra_kwargs['linear_attention_model_patch'] = model_patch.name
-        self.extra_kwargs['linear_attention_model_patch_impl'] = getattr(model_patch, 'impl_name', 'state_parallel')
-        disabled = model_patch.maybe_disable_gc(model, self)
-        self.extra_kwargs['linear_attention_model_patch_impl'] = getattr(model_patch, 'impl_name', 'state_parallel')
-        self.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing_layers'] = list(disabled)
-
-    def _validate_linear_attention_inputs(self) -> None:
-        if self.linear_attention_model_patch is None:
-            return
-        self.linear_attention_model_patch.validate_inputs(self)
+    def _bind_sequence_parallel_modules(self, base_model: torch.nn.Module) -> None:
+        for module in base_model.modules():
+            bind_sequence_parallel = getattr(module, 'twinkle_bind_sequence_parallel', None)
+            if callable(bind_sequence_parallel):
+                bind_sequence_parallel(self)
 
     def _should_build_causal_mask(self) -> bool:
-        if self.linear_attention_model_patch is None:
-            return True
-        return bool(self.linear_attention_model_patch.should_build_causal_mask())
+        return True
 
     def _prepare_flash_attn(self, base_model: torch.nn.Module):
         try:
@@ -1070,7 +1034,7 @@ class SequenceParallel:
             self._prepare_flash_attn(llm_model)
             SequenceParallel._global_inited = True
 
-        self._activate_linear_attention_model_patch(llm_model, model)
+        self._bind_sequence_parallel_modules(model)
         self._prepare_forward_hook(llm_model)
 
         if SequenceParallel._is_moe_model(getattr(model, 'config', None)):
@@ -1188,7 +1152,6 @@ class SequenceParallel:
         text_position_ids = _extract_text_position_ids(real_position_ids)
         # Track packed batches to drive attention backend behavior (packed => require flash_attention_2 varlen).
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(text_position_ids)
-        self._validate_linear_attention_inputs()
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
@@ -1336,7 +1299,6 @@ class SequenceParallel:
         if text_position_ids is not None:
             self.extra_kwargs['text_position_ids'] = text_position_ids.clone()
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(text_position_ids)
-        self._validate_linear_attention_inputs()
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:

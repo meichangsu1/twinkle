@@ -11,4 +11,12 @@ def apply_patch(module: Any, patch_cls: Union[Patch, Type[Patch], str], *args, *
     return patch_ins(module, *args, **kwargs)
 
 
-__all__ = ['apply_patch', 'Patch']
+def __getattr__(name: str):
+    if name == 'Qwen35LinearAttentionSPPatch':
+        from .qwen35_linear_attention_sp import Qwen35LinearAttentionSPPatch
+
+        return Qwen35LinearAttentionSPPatch
+    raise AttributeError(name)
+
+
+__all__ = ['apply_patch', 'Patch', 'Qwen35LinearAttentionSPPatch']

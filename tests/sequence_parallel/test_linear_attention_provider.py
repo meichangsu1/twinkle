@@ -4,138 +4,72 @@ from unittest import mock
 
 import torch
 
-from twinkle.model.transformers.strategy.linear_attention.qwen35 import Qwen35LinearAttentionSPModelPatch
-from twinkle.model.transformers.strategy.linear_attention.qwen35_strict import Qwen35StrictFullSeqHelper
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel
 
 
-class Qwen3_5GatedDeltaNet(torch.nn.Module):
-
-    def __init__(self, layer_idx: int = 0):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.chunk_gated_delta_rule = lambda *args, **kwargs: None
-        self.recurrent_gated_delta_rule = None
-        self.causal_conv1d_fn = None
-
-    def forward(self, hidden_states, **kwargs):
-        return hidden_states
-
-
-class DummyLinearBlock(torch.nn.Module):
+class DummyPatchableModule(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.proj = torch.nn.Linear(4, 4)
+        self.bound_sequence_parallel = None
+        self.bound_impl_name = None
+
+    def twinkle_bind_sequence_parallel(self, sequence_parallel, *, impl_name=None):
+        self.bound_sequence_parallel = sequence_parallel
+        self.bound_impl_name = impl_name
 
 
 class DummyModel(torch.nn.Module):
 
-    def __init__(self, inner: torch.nn.Module):
-        super().__init__()
-        self.inner = inner
-
-
-class DummyDecoderLayer(torch.nn.Module):
-
-    def __init__(self, layer_type: str, layer_idx: int):
-        super().__init__()
-        self.layer_type = layer_type
-        self.gradient_checkpointing = True
-        self._gradient_checkpointing_func = object()
-        if layer_type == 'linear_attention':
-            self.linear_attn = Qwen3_5GatedDeltaNet(layer_idx=layer_idx)
-        else:
-            self.self_attn = DummyLinearBlock()
-
-
-class DummyQwenTextModel(torch.nn.Module):
-
     def __init__(self):
         super().__init__()
-        self.layers = torch.nn.ModuleList([
-            DummyDecoderLayer('linear_attention', 0),
-            DummyDecoderLayer('full_attention', 1),
-        ])
-        self.is_gradient_checkpointing = True
+        self.config = SimpleNamespace(num_attention_heads=2)
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.patchable = DummyPatchableModule()
+        self.other = torch.nn.Linear(2, 2)
 
 
-class TestLinearAttentionModelPatch(unittest.TestCase):
+class TestSequenceParallelRuntimeBinding(unittest.TestCase):
 
-    def test_resolve_qwen35_model_patch(self):
+    def test_bind_sequence_parallel_modules_binds_patchable_layers(self):
         sp = SequenceParallel()
-        model = DummyModel(Qwen3_5GatedDeltaNet())
+        model = DummyModel()
 
-        model_patch = sp._resolve_linear_attention_model_patch(model)
+        sp._bind_sequence_parallel_modules(model)
 
-        self.assertIsNotNone(model_patch)
-        self.assertEqual(model_patch.name, 'qwen35')
+        self.assertIs(model.patchable.bound_sequence_parallel, sp)
+        self.assertIsNone(model.patchable.bound_impl_name)
 
-    def test_non_qwen_model_is_ignored(self):
+    def test_bind_sequence_parallel_modules_ignores_non_patchable_layers(self):
         sp = SequenceParallel()
-        model = DummyModel(DummyLinearBlock())
+        model = DummyModel()
 
-        model_patch = sp._resolve_linear_attention_model_patch(model)
+        sp._bind_sequence_parallel_modules(model)
 
-        self.assertIsNone(model_patch)
+        self.assertFalse(hasattr(model.other, 'bound_sequence_parallel'))
 
-    def test_qwen35_only_disables_linear_attention_layer_gc(self):
+    def test_prepare_uses_generic_runtime_binding(self):
         sp = SequenceParallel()
-        sp.world_size = 2
-        sp.sp_world_size = 2
-        model = DummyQwenTextModel()
+        model = DummyModel()
+        tokenizer = object()
+        global_inited = SequenceParallel._global_inited
+        SequenceParallel._global_inited = True
+        try:
+            with mock.patch.object(sp, '_prepare_forward_hook') as prepare_forward_hook, mock.patch.object(
+                    SequenceParallel, '_is_moe_model', return_value=False):
+                sp.prepare(sp_size=2, model=model, tokenizer=tokenizer, device_mesh=None)
+        finally:
+            SequenceParallel._global_inited = global_inited
 
-        sp._activate_linear_attention_model_patch(model, model)
+        prepare_forward_hook.assert_called_once()
+        self.assertIs(model.patchable.bound_sequence_parallel, sp)
+        self.assertEqual(sp.world_size, 2)
+        self.assertIs(sp.tokenizer, tokenizer)
 
-        self.assertEqual(sp.linear_attention_model_patch_name, 'qwen35')
-        self.assertEqual(
-            sp.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing_layers'],
-            [0],
-        )
-        self.assertFalse(model.layers[0].gradient_checkpointing)
-        self.assertIsNone(model.layers[0]._gradient_checkpointing_func)
-        self.assertTrue(model.layers[1].gradient_checkpointing)
-        self.assertIsNotNone(model.layers[1]._gradient_checkpointing_func)
-
-    def test_qwen35_head_parallel_keeps_gc_enabled(self):
+    def test_should_build_causal_mask_defaults_true(self):
         sp = SequenceParallel()
-        sp.world_size = 2
-        sp.sp_world_size = 2
-        model = DummyQwenTextModel()
 
-        with mock.patch.dict('os.environ', {'QWEN35_SP_LINEAR_HEAD_PARALLEL': '1'}, clear=False):
-            sp._activate_linear_attention_model_patch(model, model)
-
-        self.assertEqual(sp.linear_attention_model_patch_name, 'qwen35')
-        self.assertEqual(sp.extra_kwargs['linear_attention_model_patch_impl'], 'head_parallel')
-        self.assertEqual(
-            sp.extra_kwargs['linear_attention_model_patch_disabled_gradient_checkpointing_layers'],
-            [],
-        )
-        self.assertTrue(model.layers[0].gradient_checkpointing)
-        self.assertIsNotNone(model.layers[0]._gradient_checkpointing_func)
-
-    def test_qwen35_strict_helper_is_opt_in_and_rejects_fsdp(self):
-        with mock.patch.dict('os.environ', {'QWEN35_SP_LINEAR_STRICT': '1'}):
-            helper = Qwen35StrictFullSeqHelper()
-        self.assertTrue(helper.enabled)
-
-        sequence_parallel = SimpleNamespace(device_mesh=SimpleNamespace(fsdp_world_size=2))
-        with self.assertRaisesRegex(RuntimeError, 'only supported without FSDP sharding'):
-            helper.validate_runtime(sequence_parallel)
-
-    def test_qwen35_impl_flags_are_mutually_exclusive(self):
-        with mock.patch.dict(
-            'os.environ',
-            {
-                'QWEN35_SP_LINEAR_HEAD_PARALLEL': '1',
-                'QWEN35_SP_LINEAR_STRICT': '1',
-            },
-            clear=False,
-        ):
-            patch = Qwen35LinearAttentionSPModelPatch()
-            with self.assertRaisesRegex(RuntimeError, 'mutually exclusive'):
-                patch._resolve_impl_name()
+        self.assertTrue(sp._should_build_causal_mask())
 
 
 if __name__ == '__main__':
