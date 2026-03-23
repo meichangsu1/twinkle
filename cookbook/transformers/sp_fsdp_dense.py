@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import json
 from functools import partial
 from peft import LoraConfig
 
@@ -10,6 +11,10 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.model.transformers.models import TwinkleQwen3_5ForCausalLM
 from twinkle.preprocessor import SelfCognitionProcessor
+# TWINKLE_PROFILE_MODULE_MEMORY=1 \
+# TWINKLE_PROFILE_MODULE_MEMORY_STEP=0 \
+# TWINKLE_PROFILE_MODULE_MEMORY_RANK=0 \
+# python cookbook/transformers/sp_fsdp_dense.py
 
 logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
@@ -73,6 +78,140 @@ def _reset_peak_memory_stats():
     _, device_api = _memory_api()
     if device_api is not None and hasattr(device_api, 'reset_peak_memory_stats'):
         device_api.reset_peak_memory_stats()
+
+
+def _memory_mib_value(num_bytes):
+    return round(float(num_bytes) / (1024 ** 2), 3)
+
+
+def _shape_of(value):
+    if torch.is_tensor(value):
+        return tuple(value.shape)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            shape = _shape_of(item)
+            if shape is not None:
+                return shape
+    return None
+
+
+class _ModuleMemoryProfiler:
+
+    TARGET_CLASS_NAMES = {
+        'TwinkleQwen3_5DecoderLayer',
+        'TwinkleQwen3_5GatedDeltaNet',
+        'Qwen3_5Attention',
+        'Qwen3_5MLP',
+    }
+
+    def __init__(self, model: TransformersModel):
+        self.model = model
+        self.enabled = os.environ.get('TWINKLE_PROFILE_MODULE_MEMORY') == '1'
+        self.target_step = int(os.environ.get('TWINKLE_PROFILE_MODULE_MEMORY_STEP', '0'))
+        self.target_rank = int(os.environ.get('TWINKLE_PROFILE_MODULE_MEMORY_RANK', '0'))
+        self.max_records = int(os.environ.get('TWINKLE_PROFILE_MODULE_MEMORY_LIMIT', '16'))
+        self.active = False
+        self.handles = []
+        self.entries = {}
+        self.records = []
+
+    def attach(self):
+        if not self.enabled or Platform.get_rank() != self.target_rank:
+            return
+        base_model = getattr(self.model, 'model', None)
+        if base_model is None:
+            return
+        for name, module in base_model.named_modules():
+            if module.__class__.__name__ not in self.TARGET_CLASS_NAMES:
+                continue
+            self.handles.append(module.register_forward_pre_hook(self._make_pre_hook(name), with_kwargs=True))
+            self.handles.append(module.register_forward_hook(self._make_post_hook(name), with_kwargs=True))
+
+    def _make_pre_hook(self, name):
+
+        def _hook(module, args, kwargs):
+            if not self.active:
+                return
+            _, device_api = _memory_api()
+            if device_api is None:
+                return
+            if hasattr(device_api, 'synchronize'):
+                device_api.synchronize()
+            self.entries[id(module)] = {
+                'name': name,
+                'class_name': module.__class__.__name__,
+                'input_shape': _shape_of(args) or _shape_of(kwargs),
+                'pre_allocated_mib': _memory_mib_value(device_api.memory_allocated()),
+                'pre_reserved_mib': _memory_mib_value(device_api.memory_reserved()),
+                'pre_peak_allocated_mib': _memory_mib_value(device_api.max_memory_allocated()),
+                'pre_peak_reserved_mib': _memory_mib_value(device_api.max_memory_reserved()),
+            }
+
+        return _hook
+
+    def _make_post_hook(self, name):
+
+        def _hook(module, args, kwargs, output):
+            del name, args, kwargs
+            if not self.active:
+                return
+            _, device_api = _memory_api()
+            if device_api is None:
+                return
+            if hasattr(device_api, 'synchronize'):
+                device_api.synchronize()
+            entry = self.entries.pop(id(module), None)
+            if entry is None:
+                return
+            post_allocated_mib = _memory_mib_value(device_api.memory_allocated())
+            post_reserved_mib = _memory_mib_value(device_api.memory_reserved())
+            post_peak_allocated_mib = _memory_mib_value(device_api.max_memory_allocated())
+            post_peak_reserved_mib = _memory_mib_value(device_api.max_memory_reserved())
+            entry.update({
+                'output_shape': _shape_of(output),
+                'post_allocated_mib': post_allocated_mib,
+                'post_reserved_mib': post_reserved_mib,
+                'post_peak_allocated_mib': post_peak_allocated_mib,
+                'post_peak_reserved_mib': post_peak_reserved_mib,
+                'delta_allocated_mib': round(post_allocated_mib - entry['pre_allocated_mib'], 3),
+                'delta_reserved_mib': round(post_reserved_mib - entry['pre_reserved_mib'], 3),
+                'delta_peak_allocated_mib': round(post_peak_allocated_mib - entry['pre_peak_allocated_mib'], 3),
+                'delta_peak_reserved_mib': round(post_peak_reserved_mib - entry['pre_peak_reserved_mib'], 3),
+            })
+            self.records.append(entry)
+
+        return _hook
+
+    def start_step(self, step: int):
+        self.active = self.enabled and Platform.get_rank() == self.target_rank and step == self.target_step
+        self.entries.clear()
+        self.records.clear()
+        if self.active:
+            _reset_peak_memory_stats()
+
+    def finish_step(self, step: int):
+        if not self.active:
+            return
+        step_memory = _get_memory_stats()
+        sorted_records = sorted(self.records, key=lambda item: item['delta_peak_allocated_mib'], reverse=True)
+        logger.info(
+            'Module memory profile summary: '
+            + json.dumps(
+                {
+                    'step': step,
+                    'rank': Platform.get_rank(),
+                    'total_step_peak_allocated_mib': step_memory.get('mem_peak_allocated'),
+                    'total_step_peak_reserved_mib': step_memory.get('mem_peak_reserved'),
+                    'top_forward_modules_by_peak_allocated': sorted_records[:self.max_records],
+                },
+                ensure_ascii=False,
+            ))
+        self.active = False
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
 
 
 def _get_runtime_backend_info(model: TransformersModel):
@@ -150,15 +289,20 @@ def train():
     logger.info(f'Backend info: {_get_runtime_backend_info(model)}')
     logger.info(f'Initial memory: {_get_memory_stats()}')
     _reset_peak_memory_stats()
+    module_memory_profiler = _ModuleMemoryProfiler(model)
+    module_memory_profiler.attach()
 
     for step, batch in enumerate(dataloader):
+        module_memory_profiler.start_step(step)
         model.forward_backward(inputs=batch, adapter_name='default')
+        module_memory_profiler.finish_step(step)
         model.clip_grad_and_step(adapter_name='default')
         if step % 20 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
             metric.update(_get_memory_stats())
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
     model.save('last-checkpoint', interval=1)
+    module_memory_profiler.close()
 
 
 if __name__ == '__main__':
