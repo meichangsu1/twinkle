@@ -152,14 +152,11 @@ def _build_varlen_metadata(
     full_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     position_ids = _pad_or_trim_2d_tensor(position_ids, full_seq_len, pad_value=-1)
-    attention_mask = _pad_or_trim_2d_tensor(attention_mask, full_seq_len, pad_value=0)
 
     if position_ids is not None:
-        position_ids = position_ids.clone()
-        if attention_mask is not None:
-            position_ids[attention_mask == 0] = -1
         valid_mask = position_ids != -1
     elif attention_mask is not None:
+        attention_mask = _pad_or_trim_2d_tensor(attention_mask, full_seq_len, pad_value=0)
         valid_mask = attention_mask != 0
     else:
         raise ValueError('Varlen metadata requires at least one of position_ids or attention_mask.')
@@ -335,11 +332,6 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
             v_proj = _seq_to_head_shard(v_proj, sequence_parallel_context)
             b = _seq_to_head_shard(b.reshape(batch_size, seq_len, self.num_v_heads), sequence_parallel_context)
             a = _seq_to_head_shard(a.reshape(batch_size, seq_len, self.num_v_heads), sequence_parallel_context)
-            if attention_mask is not None:
-                full_attention_mask = _seq_to_head_shard(
-                    attention_mask.reshape(batch_size, seq_len, 1),
-                    sequence_parallel_context,
-                ).squeeze(-1)
 
             mixed_qkv = torch.cat(
                 (
