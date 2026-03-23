@@ -541,6 +541,12 @@ class SequenceParallel:
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
                         kwargs['max_length_k'] = max_seqlen
+                    else:
+                        # Dense, non-packed SP path should not forward position_ids into FA2.
+                        # Qwen3.5 has already applied RoPE before entering the attention interface, and keeping
+                        # position_ids here can make HF's FA2 helper mis-detect packed/varlen mode, especially when
+                        # batch_size == 1 and position_ids carries mRoPE-style leading dimensions.
+                        kwargs.pop('position_ids', None)
                     return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
                                                                                **kwargs)[0]
 
