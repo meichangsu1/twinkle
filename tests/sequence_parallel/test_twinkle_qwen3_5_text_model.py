@@ -313,7 +313,6 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
                     'input_ids': full_input_ids,
                     'attention_mask': full_attention_mask,
                     'position_ids': full_position_ids,
-                    'cu_seq_lens_q': cu_seq_lens_q,
                     'use_cache': False,
                 },
             )
