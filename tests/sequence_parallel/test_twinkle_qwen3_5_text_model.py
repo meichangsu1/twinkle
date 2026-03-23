@@ -272,7 +272,7 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
                 cu_seq_lens_q=cu_seq_lens_q,
             )
 
-        self.assertEqual(captured['query_shape'], (1, 6, 2, 4))
+        self.assertEqual(captured['query_shape'], (1, 6, 4, 4))
         self.assertTrue(torch.equal(captured['cu_seqlens'], cu_seq_lens_q))
 
     def test_linear_attention_sp_uses_local_attention_mask(self):

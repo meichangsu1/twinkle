@@ -75,6 +75,9 @@ def _sp_is_enabled(sequence_parallel_context: Any | None) -> bool:
 def _get_sp_rank(sequence_parallel_context: Any | None) -> int:
     if not _sp_is_enabled(sequence_parallel_context):
         return 0
+    rank = getattr(sequence_parallel_context, 'rank', None)
+    if rank is not None:
+        return int(rank)
     import torch.distributed as dist
 
     return dist.get_rank(sequence_parallel_context.sp_group)
