@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from functools import partial
 from peft import LoraConfig
 
@@ -34,6 +35,44 @@ twinkle.initialize(
     global_device_mesh=device_mesh,
     lazy_collect=False,
 )
+
+
+def _memory_api():
+    device_type = Platform.get_platform().device_prefix()
+    device_api = getattr(torch, device_type, None)
+    if device_api is None or not hasattr(device_api, 'is_available') or not device_api.is_available():
+        return None, None
+    return device_type, device_api
+
+
+def _format_mib(num_bytes):
+    return f'{num_bytes / (1024 ** 2):.1f} MiB'
+
+
+def _get_memory_stats():
+    device_type, device_api = _memory_api()
+    if device_api is None:
+        return {}
+
+    if hasattr(device_api, 'synchronize'):
+        device_api.synchronize()
+
+    current_device = device_api.current_device() if hasattr(device_api, 'current_device') else 0
+    return {
+        'rank': Platform.get_rank(),
+        'local_rank': Platform.get_local_rank(),
+        'device': f'{device_type}:{current_device}',
+        'mem_allocated': _format_mib(device_api.memory_allocated()),
+        'mem_reserved': _format_mib(device_api.memory_reserved()),
+        'mem_peak_allocated': _format_mib(device_api.max_memory_allocated()),
+        'mem_peak_reserved': _format_mib(device_api.max_memory_reserved()),
+    }
+
+
+def _reset_peak_memory_stats():
+    _, device_api = _memory_api()
+    if device_api is not None and hasattr(device_api, 'reset_peak_memory_stats'):
+        device_api.reset_peak_memory_stats()
 
 
 def eval(model):
@@ -82,12 +121,15 @@ def train():
 
     logger.info(model.get_train_configs(adapter_name='default'))
     logger.info(f'Total steps: {len(dataloader)}')
+    logger.info(f'Initial memory: {_get_memory_stats()}')
+    _reset_peak_memory_stats()
 
     for step, batch in enumerate(dataloader):
         model.forward_backward(inputs=batch, adapter_name='default')
         model.clip_grad_and_step(adapter_name='default')
         if step % 20 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
+            metric.update(_get_memory_stats())
             logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
     model.save('last-checkpoint', interval=1)
 
