@@ -181,6 +181,10 @@ def _run_text_model_memory_step(
 def _run_linear_attention_memory_worker(rank: int, world_size: int, port: int, result_path: str, cases):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = str(port)
+    os.environ['RANK'] = str(rank)
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend='nccl',
@@ -278,6 +282,10 @@ def _run_linear_attention_memory_worker(rank: int, world_size: int, port: int, r
 def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, result_path: str, cases):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = str(port)
+    os.environ['RANK'] = str(rank)
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend='nccl',
