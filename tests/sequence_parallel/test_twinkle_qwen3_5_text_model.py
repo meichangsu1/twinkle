@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import tempfile
+import traceback
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -19,6 +20,13 @@ from twinkle.model.transformers.models.qwen3_5 import modeling_qwen3_5 as tw_qwe
 from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel, SequenceParallelContext
 from twinkle.utils import DeviceMesh
 
+# CUDA_VISIBLE_DEVICES=0,1 \
+# CUDA_LAUNCH_BLOCKING=1 \
+# QWEN35_TEXTMODEL_MEMORY_BENCH=1 \
+# QWEN35_TEXTMODEL_MEMORY_CASES=1x1024 \
+# PYTHONPATH=src \
+# python -m pytest -q -rs -s \
+# tests/sequence_parallel/test_twinkle_qwen3_5_text_model.py::TestTwinkleQwen35TextModel::test_text_model_mixed_attention_memory_benchmark_across_seq_and_batch
 
 def _build_text_config(layer_types=None) -> Qwen3_5TextConfig:
     layer_types = layer_types or ['full_attention']
@@ -186,19 +194,20 @@ def _run_linear_attention_memory_worker(rank: int, world_size: int, port: int, r
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
     torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend='nccl',
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(minutes=10),
-    )
-
-    device = torch.device(f'cuda:{rank}')
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    config = _build_memory_bench_config()
-    results = []
-
+    error_path = f'{result_path}.rank{rank}.err'
     try:
+        dist.init_process_group(
+            backend='nccl',
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(minutes=10),
+        )
+
+        device = torch.device(f'cuda:{rank}')
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        config = _build_memory_bench_config()
+        results = []
+
         for batch_size, seq_len in cases:
             if seq_len % world_size != 0:
                 raise ValueError(f'seq_len ({seq_len}) must be divisible by world_size ({world_size})')
@@ -275,8 +284,13 @@ def _run_linear_attention_memory_worker(rank: int, world_size: int, port: int, r
 
         if rank == 0:
             torch.save(results, result_path)
+    except Exception:
+        with open(error_path, 'w', encoding='utf-8') as f:
+            f.write(traceback.format_exc())
+        raise
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, result_path: str, cases):
@@ -287,19 +301,20 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_WORLD_SIZE'] = str(world_size)
     torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend='nccl',
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(minutes=10),
-    )
-
-    device = torch.device(f'cuda:{rank}')
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    baseline_results = []
-    sp_results = []
-
+    error_path = f'{result_path}.rank{rank}.err'
     try:
+        dist.init_process_group(
+            backend='nccl',
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(minutes=10),
+        )
+
+        device = torch.device(f'cuda:{rank}')
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        baseline_results = []
+        sp_results = []
+
         for batch_size, seq_len in cases:
             config = _build_mixed_text_model_bench_config()
             full_input_ids = torch.randint(1, config.vocab_size, (batch_size, seq_len), device=device, dtype=torch.long)
@@ -387,8 +402,13 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
 
         if rank == 0:
             torch.save(gathered_results, result_path)
+    except Exception:
+        with open(error_path, 'w', encoding='utf-8') as f:
+            f.write(traceback.format_exc())
+        raise
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class _ContextReceiver:
@@ -704,6 +724,15 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
                 join=True,
             )
 
+            error_logs = []
+            for rank in range(world_size):
+                error_path = f'{result_path}.rank{rank}.err'
+                if os.path.exists(error_path):
+                    with open(error_path, 'r', encoding='utf-8') as f:
+                        error_logs.append(f'Rank {rank}:\n{f.read()}')
+            if error_logs:
+                self.fail('\n\n'.join(error_logs))
+
             results = torch.load(result_path, weights_only=False)
 
         self.assertEqual(len(results), len(cases))
@@ -747,6 +776,15 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
                 nprocs=world_size,
                 join=True,
             )
+
+            error_logs = []
+            for rank in range(world_size):
+                error_path = f'{result_path}.rank{rank}.err'
+                if os.path.exists(error_path):
+                    with open(error_path, 'r', encoding='utf-8') as f:
+                        error_logs.append(f'Rank {rank}:\n{f.read()}')
+            if error_logs:
+                self.fail('\n\n'.join(error_logs))
 
             results = torch.load(result_path, weights_only=False)
 
