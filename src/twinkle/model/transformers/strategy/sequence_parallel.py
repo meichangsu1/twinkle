@@ -379,6 +379,7 @@ class SequenceParallel:
         self._sp_group = None
         self.num_heads = None
         self.causal_mask_func = None
+        self.attn_implementation = None
         self.extra_kwargs = {}
         self.requires_cu_seq_lens_q = False
         self._bound_llm_model = None
@@ -678,6 +679,10 @@ class SequenceParallel:
         else:
             if hasattr(llm_model, '_update_causal_mask'):
                 self.causal_mask_func = llm_model._update_causal_mask
+        self.attn_implementation = (
+            get_config_attr(model.config, '_attn_implementation')
+            or get_config_attr(model.config, '_attn_implementation_internal')
+        )
 
         if not SequenceParallel._global_inited:
             # these operations are global initializations and patches
@@ -816,11 +821,12 @@ class SequenceParallel:
             # no need position_ids here, because padding_free does not need attention_mask,
             # so this is not ring-attention
             attention_mask = self.pad(attention_mask, padding_value=0)
-            cache_position = torch.arange(0, attn_shape, device=inputs.device)
-            # pad attention mask to 4d to avoid calculation errors
-            if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
-                attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
-                                                       None, None)
+            if self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+                cache_position = torch.arange(0, attn_shape, device=inputs.device)
+                # SDPA/eager-style paths still expect a fully materialized causal mask here.
+                if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
+                    attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
+                                                           None, None)
         if extra_split_values is not None:
             for (tensor, pad_value, split_dim) in extra_split_values:
                 extra_values.append(

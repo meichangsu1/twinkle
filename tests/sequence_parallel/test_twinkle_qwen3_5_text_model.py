@@ -698,6 +698,30 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertIsNotNone(captured['mask'])
         self.assertTrue(torch.equal(captured['mask'], torch.tensor([[1, 0]], dtype=torch.int64)))
 
+    def test_sequence_parallel_keeps_2d_attention_mask_for_flash_attention_2(self):
+        sp = SequenceParallel()
+        sp.world_size = 2
+        sp.sp_world_size = 2
+        sp.tokenizer = SimpleNamespace(pad_token_id=0)
+        sp.model_dtype = torch.bfloat16
+        sp.attn_implementation = 'flash_attention_2'
+        sp.causal_mask_func = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not build 4d mask'))
+
+        input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
+        position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long)
+        _, _, _, _, attention_mask, _, _ = sp.pad_and_split_inputs(
+            input_ids=input_ids,
+            input_embeds=None,
+            labels=None,
+            position_ids=position_ids,
+            attention_mask=None,
+            loss_scale=None,
+            real_position_ids=position_ids,
+        )
+
+        self.assertIsNotNone(attention_mask)
+        self.assertEqual(attention_mask.dim(), 2)
+
     def test_linear_attention_memory_benchmark_across_seq_and_batch(self):
         if os.environ.get('QWEN35_LINEAR_ATTN_MEMORY_BENCH') != '1':
             self.skipTest('Set QWEN35_LINEAR_ATTN_MEMORY_BENCH=1 to run the CUDA memory benchmark.')
