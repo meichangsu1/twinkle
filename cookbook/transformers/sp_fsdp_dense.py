@@ -1,7 +1,10 @@
+import json
+import math
+import os
+from functools import partial
+
 import numpy as np
 import torch
-import json
-from functools import partial
 from peft import LoraConfig
 
 import twinkle
@@ -152,7 +155,7 @@ class _ModuleMemoryProfiler:
     def _make_post_hook(self, name):
 
         def _hook(module, args, kwargs, output):
-            del name, args, kwargs
+            del args, kwargs
             if not self.active:
                 return
             _, device_api = _memory_api()
@@ -275,17 +278,21 @@ def train():
     )
 
     lora_config = LoraConfig(target_modules='all-linear')
-    model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
+    model.add_adapter_to_model('default', lora_config)
+    grad_accumulation_steps = model.optimizer_group['default'].gradient_accumulation_steps
+    num_optimizer_steps = math.ceil(len(dataloader) / grad_accumulation_steps)
     model.set_optimizer('AdamW', lr=1e-4, adapter_name='default')
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',
         num_warmup_steps=5,
-        num_training_steps=len(dataloader),
+        num_training_steps=num_optimizer_steps,
         adapter_name='default',
     )
 
     logger.info(model.get_train_configs(adapter_name='default'))
-    logger.info(f'Total steps: {len(dataloader)}')
+    logger.info(
+        f'Total micro steps: {len(dataloader)}, optimizer steps: {num_optimizer_steps}, '
+        f'gradient_accumulation_steps: {grad_accumulation_steps}')
     logger.info(f'Backend info: {_get_runtime_backend_info(model)}')
     logger.info(f'Initial memory: {_get_memory_stats()}')
     _reset_peak_memory_stats()
