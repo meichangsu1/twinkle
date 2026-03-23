@@ -131,8 +131,13 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertTrue(torch.equal(outputs['cu_seq_lens_q'], torch.tensor([0, 4, 8], dtype=torch.int32)))
 
     def test_linear_attention_requires_fast_path_dependencies(self):
-        with self.assertRaises(ImportError):
-            tw_qwen35.TwinkleQwen3_5TextModel(_build_text_config(['linear_attention']))
+        with patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_FN', None), \
+                patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_UPDATE', None), \
+                patch.object(tw_qwen35, '_FLA_CHUNK_GATED_DELTA_RULE', None), \
+                patch.object(tw_qwen35, '_FLA_FUSED_RECURRENT_GATED_DELTA_RULE', None), \
+                patch.object(tw_qwen35, '_HAS_CAUSAL_CONV1D', False):
+            with self.assertRaises(ImportError):
+                tw_qwen35.TwinkleQwen3_5TextModel(_build_text_config(['linear_attention']))
 
     def test_linear_attention_sp_uses_cu_seq_lens_and_keeps_z_local(self):
         captured = {
@@ -159,14 +164,24 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
             return value, None
 
         def fake_seq_to_head(tensor, context):
-            del context
+            sp_world_size = context.sp_world_size
+            rank = context.rank
             captured['seq_to_head_calls'] += 1
+            if tensor.dim() == 4:
+                local_heads = tensor.shape[2] // sp_world_size
+                start = rank * local_heads
+                end = start + local_heads
+                return tensor[:, :, start:end, :].contiguous()
+            if tensor.dim() == 3:
+                local_heads = tensor.shape[2] // sp_world_size
+                start = rank * local_heads
+                end = start + local_heads
+                return tensor[:, :, start:end].contiguous()
             return tensor
 
         def fake_head_to_seq(tensor, context):
-            del context
             captured['head_to_seq_calls'] += 1
-            return tensor
+            return tensor.repeat_interleave(context.sp_world_size, dim=2)
 
         class DummyNorm(torch.nn.Module):
 
@@ -178,6 +193,7 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
                 patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_UPDATE', lambda *args, **kwargs: args[0]), \
                 patch.object(tw_qwen35, '_FLA_CHUNK_GATED_DELTA_RULE', fake_chunk_rule), \
                 patch.object(tw_qwen35, '_FLA_FUSED_RECURRENT_GATED_DELTA_RULE', fake_recurrent_rule), \
+                patch.object(tw_qwen35, '_FLA_FUSED_RMS_NORM_GATED', None), \
                 patch.object(tw_qwen35, '_HAS_CAUSAL_CONV1D', True), \
                 patch.object(tw_qwen35, '_seq_to_head_shard', side_effect=fake_seq_to_head), \
                 patch.object(tw_qwen35, '_head_to_seq_shard', side_effect=fake_head_to_seq):
@@ -232,13 +248,20 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
             del query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
             raise AssertionError('recurrent path should not be used')
 
+        class DummyNorm(torch.nn.Module):
+
+            def forward(self, x, z):
+                return x + z
+
         with patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_FN', fake_conv), \
                 patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_UPDATE', lambda *args, **kwargs: args[0]), \
                 patch.object(tw_qwen35, '_FLA_CHUNK_GATED_DELTA_RULE', fake_chunk_rule), \
                 patch.object(tw_qwen35, '_FLA_FUSED_RECURRENT_GATED_DELTA_RULE', fake_recurrent_rule), \
+                patch.object(tw_qwen35, '_FLA_FUSED_RMS_NORM_GATED', None), \
                 patch.object(tw_qwen35, '_HAS_CAUSAL_CONV1D', True):
             config = _build_text_config(['linear_attention'])
             module = tw_qwen35.TwinkleQwen3_5GatedDeltaNet(config, layer_idx=0)
+            module.norm = DummyNorm()
             hidden_states = torch.randn(2, 3, config.hidden_size)
             attention_mask = torch.ones(2, 3, dtype=torch.int64)
             cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
