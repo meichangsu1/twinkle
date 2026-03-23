@@ -307,7 +307,10 @@ def train():
         if step % 20 == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
             metric.update(_get_memory_stats())
-            logger.info(f'Current is step {step} of {len(dataloader)}, metric: {metric}')
+            optimizer_step = metric.get('iters')
+            logger.info(
+                f'Current is optimizer step {optimizer_step} of {num_optimizer_steps} '
+                f'(micro step {step} of {len(dataloader)}), metric: {metric}')
     model.save('last-checkpoint', interval=1)
     module_memory_profiler.close()
 
