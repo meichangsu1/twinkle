@@ -281,6 +281,7 @@ def train():
     model.add_adapter_to_model('default', lora_config)
     grad_accumulation_steps = model.optimizer_group['default'].gradient_accumulation_steps
     num_optimizer_steps = math.ceil(len(dataloader) / grad_accumulation_steps)
+    log_every_optimizer_steps = 20
     model.set_optimizer('AdamW', lr=1e-4, adapter_name='default')
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',
@@ -304,10 +305,12 @@ def train():
         model.forward_backward(inputs=batch, adapter_name='default')
         module_memory_profiler.finish_step(step)
         model.clip_grad_and_step(adapter_name='default')
-        if step % 20 == 0:
+        optimizer_step = step // grad_accumulation_steps
+        is_optimizer_boundary = (step + 1) % grad_accumulation_steps == 0
+        if is_optimizer_boundary and optimizer_step % log_every_optimizer_steps == 0:
             metric = model.calculate_metric(is_training=True, adapter_name='default')
             metric.update(_get_memory_stats())
-            optimizer_step = metric.get('iters')
+            optimizer_step = metric.get('iters', optimizer_step)
             logger.info(
                 f'Current is optimizer step {optimizer_step} of {num_optimizer_steps} '
                 f'(micro step {step} of {len(dataloader)}), metric: {metric}')
