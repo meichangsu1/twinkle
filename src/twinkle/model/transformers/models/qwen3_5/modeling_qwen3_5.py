@@ -100,6 +100,34 @@ def _head_to_seq_shard(tensor: torch.Tensor, sequence_parallel_context: Any | No
     return _SeqAllToAll.apply(sequence_parallel_context.sp_group, tensor, 1, 2)
 
 
+def _resolve_local_padding_mask(
+    attention_mask: torch.Tensor | None,
+    seq_len: int,
+    sequence_parallel_context: Any | None = None,
+) -> torch.Tensor | None:
+    if attention_mask is None or attention_mask.dim() != 2:
+        return attention_mask
+    if attention_mask.shape[-1] == seq_len:
+        return attention_mask
+    if _sp_is_enabled(sequence_parallel_context):
+        sp_world_size = int(sequence_parallel_context.sp_world_size)
+        full_seq_len = attention_mask.shape[-1]
+        if full_seq_len % sp_world_size == 0:
+            local_seq_len = full_seq_len // sp_world_size
+            if local_seq_len == seq_len:
+                sp_rank = _get_sp_rank(sequence_parallel_context)
+                start = sp_rank * local_seq_len
+                end = start + local_seq_len
+                return attention_mask[:, start:end].contiguous()
+    if attention_mask.shape[-1] >= seq_len:
+        return attention_mask[:, :seq_len].contiguous()
+    return attention_mask
+
+
+def _flatten_varlen_batch(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.reshape(1, tensor.shape[0] * tensor.shape[1], *tensor.shape[2:])
+
+
 class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
 
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
@@ -183,6 +211,7 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
         cu_seq_lens_q: torch.Tensor | None = None,
         sequence_parallel_context: Any | None = None,
     ):
+        attention_mask = _resolve_local_padding_mask(attention_mask, hidden_states.shape[1], sequence_parallel_context)
         hidden_states = hf_qwen35.apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape
         use_precomputed_states = (
@@ -245,6 +274,12 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
             conv_weight = self.conv1d.weight.squeeze(1)
 
+        use_varlen_flatten = cu_seq_lens_q is not None and not use_precomputed_states and batch_size > 1
+        if use_varlen_flatten:
+            mixed_qkv = _flatten_varlen_batch(mixed_qkv)
+            b = _flatten_varlen_batch(b)
+            a = _flatten_varlen_batch(a)
+
         if use_precomputed_states:
             if conv_state is None:
                 raise RuntimeError('Qwen3.5 decode requires initialized convolution state.')
@@ -258,9 +293,10 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
             mixed_qkv = self._apply_varlen_conv(mixed_qkv, conv_weight, cu_seq_lens_q)
 
         query, key, value = torch.split(mixed_qkv, [local_key_dim, local_key_dim, local_value_dim], dim=-1)
-        query = query.reshape(batch_size, query.shape[1], local_num_k_heads, self.head_k_dim)
-        key = key.reshape(batch_size, key.shape[1], local_num_k_heads, self.head_k_dim)
-        value = value.reshape(batch_size, value.shape[1], local_num_v_heads, self.head_v_dim)
+        qkv_batch_size = 1 if use_varlen_flatten else batch_size
+        query = query.reshape(qkv_batch_size, query.shape[1], local_num_k_heads, self.head_k_dim)
+        key = key.reshape(qkv_batch_size, key.shape[1], local_num_k_heads, self.head_k_dim)
+        value = value.reshape(qkv_batch_size, value.shape[1], local_num_v_heads, self.head_v_dim)
 
         beta = b.sigmoid()
         if sp_enabled:
@@ -303,6 +339,8 @@ class TwinkleQwen3_5GatedDeltaNet(hf_qwen35.Qwen3_5GatedDeltaNet):
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
         core_attn_out = _head_to_seq_shard(core_attn_out, sequence_parallel_context)
+        if use_varlen_flatten:
+            core_attn_out = core_attn_out.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, self.value_dim)
         return self.out_proj(core_attn_out)

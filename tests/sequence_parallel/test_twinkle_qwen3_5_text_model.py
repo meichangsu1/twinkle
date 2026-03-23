@@ -113,6 +113,23 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertFalse(receiver.context.is_packed)
         self.assertTrue(torch.equal(receiver.context.real_position_ids, inputs['position_ids']))
 
+    def test_sequence_parallel_prepare_inputs_injects_flattened_cu_seq_lens_for_batched_rows(self):
+        sp = SequenceParallel()
+        sp.world_size = 2
+        sp.sp_world_size = 2
+        sp.requires_cu_seq_lens_q = True
+        receiver = _ContextReceiver()
+        sp._bound_llm_model = receiver
+        inputs = {
+            'input_ids': torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long),
+            'position_ids': torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long),
+        }
+
+        outputs = sp.prepare_inputs(inputs)
+
+        self.assertIn('cu_seq_lens_q', outputs)
+        self.assertTrue(torch.equal(outputs['cu_seq_lens_q'], torch.tensor([0, 4, 8], dtype=torch.int32)))
+
     def test_linear_attention_requires_fast_path_dependencies(self):
         with self.assertRaises(ImportError):
             tw_qwen35.TwinkleQwen3_5TextModel(_build_text_config(['linear_attention']))
@@ -191,6 +208,49 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertTrue(torch.equal(captured['cu_seqlens'], cu_seq_lens_q))
         self.assertEqual(captured['norm_z_shape'], (hidden_states.shape[0] * hidden_states.shape[1] * config.linear_num_value_heads, config.linear_value_head_dim))
         self.assertEqual(tuple(output.shape), (1, 2, config.hidden_size))
+
+    def test_linear_attention_sp_flattens_batched_varlen_inputs(self):
+        captured = {
+            'query_shape': None,
+            'cu_seqlens': None,
+        }
+
+        def fake_conv(x, weight, bias, activation, seq_idx=None, backend=None, cu_seqlens=None):
+            del weight, bias, activation, seq_idx, backend
+            captured['cu_seqlens'] = cu_seqlens.clone() if cu_seqlens is not None else None
+            return x
+
+        def fake_chunk_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+                            use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+            del key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
+            captured['query_shape'] = tuple(query.shape)
+            captured['cu_seqlens'] = cu_seqlens.clone() if cu_seqlens is not None else None
+            return query.new_zeros(query.shape[0], query.shape[1], 4, 4), None
+
+        def fake_recurrent_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+                                use_qk_l2norm_in_kernel=False):
+            del query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
+            raise AssertionError('recurrent path should not be used')
+
+        with patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_FN', fake_conv), \
+                patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_UPDATE', lambda *args, **kwargs: args[0]), \
+                patch.object(tw_qwen35, '_FLA_CHUNK_GATED_DELTA_RULE', fake_chunk_rule), \
+                patch.object(tw_qwen35, '_FLA_FUSED_RECURRENT_GATED_DELTA_RULE', fake_recurrent_rule), \
+                patch.object(tw_qwen35, '_HAS_CAUSAL_CONV1D', True):
+            config = _build_text_config(['linear_attention'])
+            module = tw_qwen35.TwinkleQwen3_5GatedDeltaNet(config, layer_idx=0)
+            hidden_states = torch.randn(2, 3, config.hidden_size)
+            attention_mask = torch.ones(2, 3, dtype=torch.int64)
+            cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+            _ = module(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                cu_seq_lens_q=cu_seq_lens_q,
+            )
+
+        self.assertEqual(captured['query_shape'], (1, 6, 2, 4))
+        self.assertTrue(torch.equal(captured['cu_seqlens'], cu_seq_lens_q))
 
     def test_linear_attention_sp_uses_local_attention_mask(self):
         captured = {'mask': None}

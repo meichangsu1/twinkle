@@ -23,6 +23,29 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
     return cu_seqlens
 
 
+def get_flattened_cu_seqlens_from_position_ids(position_ids: torch.LongTensor):
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+    if position_ids.dim() != 2:
+        raise ValueError(f'Expected 1D or 2D position_ids, got shape={tuple(position_ids.shape)}')
+
+    device = position_ids.device
+    cu_seqlens = [0]
+    total = 0
+    for row in position_ids:
+        row = row.clone()
+        row[row < 0] = 0
+        seq_start_indices = torch.where(row == 0)[0]
+        if seq_start_indices.numel() == 0 or seq_start_indices[0].item() != 0:
+            seq_start_indices = torch.cat([torch.tensor([0], device=device, dtype=seq_start_indices.dtype), seq_start_indices])
+        seq_end_indices = torch.cat([seq_start_indices[1:], torch.tensor([len(row)], device=device)])
+        seq_lengths = (seq_end_indices - seq_start_indices).tolist()
+        for seq_length in seq_lengths:
+            total += int(seq_length)
+            cu_seqlens.append(total)
+    return torch.tensor(cu_seqlens, device=device, dtype=torch.long)
+
+
 @dataclass(frozen=True)
 class SequenceParallelContext:
     sp_group: Optional[dist.ProcessGroup]
@@ -885,9 +908,7 @@ class SequenceParallel:
             self._bound_llm_model.set_sequence_parallel_context(self._build_context())
         if self.requires_cu_seq_lens_q and position_ids is not None:
             padded_position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids, dim=-1)
-            padded_position_ids = padded_position_ids.clone()
-            padded_position_ids[padded_position_ids < 0] = 0
-            inputs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(padded_position_ids).to(torch.int32)
+            inputs['cu_seq_lens_q'] = get_flattened_cu_seqlens_from_position_ids(padded_position_ids).to(torch.int32)
         if 'labels' in inputs:
             labels = inputs['labels']
             _, _, labels, _, _, _, _ = self.pad_and_split_inputs(
