@@ -806,27 +806,28 @@ class SequenceParallel:
             loss_scale = self.pad(loss_scale, padding_value=0., position_ids=real_position_ids)
         if real_position_ids is not None:
             real_position_ids = self.pad(real_position_ids, padding_value=-1, position_ids=real_position_ids)
-        # Build a 2D attention_mask whenever we padded for SP alignment so FlashAttention2 can unpad correctly.
-        # For packed batches (batch_size==1 with multiple position_id resets), relying on position_ids alone is
-        # unsafe if we also appended SP-alignment padding (position_ids=-1), because HF's FA2 varlen path will
-        # include the padded tail in the last segment when attention_mask is None.
-        if (input_ids is not None or input_embeds is not None) and batch_size > 1:
-            # not padding_free, so not ring-attention
+        # Preserve a 2D attention mask only when there is real padding to describe.
+        # For dense batches, FA2/FA3 should keep `attention_mask=None`; otherwise HF routes the kernel through
+        # its varlen/unpadding path and can introduce unnecessary overhead or invalid accesses in SP mode.
+        if input_ids is not None or input_embeds is not None:
             inputs = input_ids if input_ids is not None else input_embeds
-            attn_shape = inputs.shape[1]  # The sequence length
+            attn_shape = inputs.shape[1]
             if attention_mask is None:
-                # Mask out padded positions introduced by sequence-parallel padding.
-                # `real_position_ids` is padded with `-1` (see above), so use it to build a valid-token mask.
-                attention_mask = (real_position_ids != -1).to(dtype=torch.int64)
-            # no need position_ids here, because padding_free does not need attention_mask,
-            # so this is not ring-attention
-            attention_mask = self.pad(attention_mask, padding_value=0)
-            if self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
-                cache_position = torch.arange(0, attn_shape, device=inputs.device)
-                # SDPA/eager-style paths still expect a fully materialized causal mask here.
-                if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
-                    attention_mask = self.causal_mask_func(attention_mask, inputs.to(self.model_dtype), cache_position,
-                                                           None, None)
+                has_padding = bool(real_position_ids is not None and torch.any(real_position_ids == -1))
+                if has_padding:
+                    attention_mask = (real_position_ids != -1).to(dtype=torch.int64)
+            else:
+                has_padding = not bool(torch.all(attention_mask != 0))
+                if not has_padding:
+                    attention_mask = None
+            if attention_mask is not None:
+                attention_mask = self.pad(attention_mask, padding_value=0)
+                if self.attn_implementation not in ('flash_attention_2', 'flash_attention_3'):
+                    cache_position = torch.arange(0, attn_shape, device=inputs.device)
+                    # SDPA/eager-style paths still expect a fully materialized causal mask here.
+                    if hasattr(self, 'causal_mask_func') and self.causal_mask_func is not None:
+                        attention_mask = self.causal_mask_func(
+                            attention_mask, inputs.to(self.model_dtype), cache_position, None, None)
         if extra_split_values is not None:
             for (tensor, pad_value, split_dim) in extra_split_values:
                 extra_values.append(

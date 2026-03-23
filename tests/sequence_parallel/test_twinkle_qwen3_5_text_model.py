@@ -698,7 +698,7 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertIsNotNone(captured['mask'])
         self.assertTrue(torch.equal(captured['mask'], torch.tensor([[1, 0]], dtype=torch.int64)))
 
-    def test_sequence_parallel_keeps_2d_attention_mask_for_flash_attention_2(self):
+    def test_sequence_parallel_drops_dense_attention_mask_for_flash_attention_2(self):
         sp = SequenceParallel()
         sp.world_size = 2
         sp.sp_world_size = 2
@@ -719,8 +719,7 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
             real_position_ids=position_ids,
         )
 
-        self.assertIsNotNone(attention_mask)
-        self.assertEqual(attention_mask.dim(), 2)
+        self.assertIsNone(attention_mask)
 
     def test_linear_attention_memory_benchmark_across_seq_and_batch(self):
         if os.environ.get('QWEN35_LINEAR_ATTN_MEMORY_BENCH') != '1':
