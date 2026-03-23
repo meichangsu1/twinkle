@@ -318,7 +318,6 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
         for batch_size, seq_len in cases:
             config = _build_mixed_text_model_bench_config()
             full_input_ids = torch.randint(1, config.vocab_size, (batch_size, seq_len), device=device, dtype=torch.long)
-            full_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.int64, device=device)
             full_position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
             cu_seq_lens_q = torch.arange(
                 0,
@@ -334,7 +333,6 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
                 baseline_model,
                 {
                     'input_ids': full_input_ids,
-                    'attention_mask': full_attention_mask,
                     'position_ids': full_position_ids,
                     'use_cache': False,
                 },
@@ -358,7 +356,6 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
 
             config = _build_mixed_text_model_bench_config()
             full_input_ids = torch.randint(1, config.vocab_size, (batch_size, seq_len), device=device, dtype=torch.long)
-            full_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.int64, device=device)
             full_position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
 
             sp_model = tw_qwen35.TwinkleQwen3_5TextModel(config).to(device=device, dtype=dtype)
@@ -366,7 +363,6 @@ def _run_mixed_text_model_memory_worker(rank: int, world_size: int, port: int, r
             sp.prepare(world_size, sp_model, tokenizer, device_mesh=device_mesh)
             sp_inputs = sp.prepare_inputs({
                 'input_ids': full_input_ids,
-                'attention_mask': full_attention_mask,
                 'position_ids': full_position_ids,
                 'use_cache': False,
             })
