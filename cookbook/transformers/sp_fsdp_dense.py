@@ -7,7 +7,7 @@ from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
-from twinkle.model.transformers.models.qwen3_5 import TwinkleQwen3_5ForCausalLM
+from twinkle.model.transformers.models import TwinkleQwen3_5ForCausalLM
 from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()

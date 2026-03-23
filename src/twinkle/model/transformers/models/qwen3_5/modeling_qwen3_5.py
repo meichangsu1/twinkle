@@ -406,6 +406,19 @@ class TwinkleQwen3_5TextModel(TwinkleQwen3_5PreTrainedModel):
             linear_attn_mask = None
         return linear_attn_mask
 
+    def _resolve_linear_attn_mask(
+        self,
+        attention_mask: torch.Tensor | None,
+        text_position_ids: torch.LongTensor | None,
+        seq_len: int,
+    ) -> torch.Tensor | None:
+        if attention_mask is not None and attention_mask.dim() == 2 and attention_mask.shape[-1] == seq_len:
+            return attention_mask
+        if text_position_ids is None:
+            return attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None
+        dtype = attention_mask.dtype if attention_mask is not None else torch.int64
+        return (text_position_ids != -1).to(dtype=dtype)
+
     @merge_with_config_defaults
     @capture_outputs
     def forward(
@@ -454,10 +467,13 @@ class TwinkleQwen3_5TextModel(TwinkleQwen3_5PreTrainedModel):
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         sp_context = self._sequence_parallel_context
+        linear_attn_mask = self._update_linear_attn_mask(
+            self._resolve_linear_attn_mask(attention_mask, text_position_ids, hidden_states.shape[1]),
+            cache_position,
+        )
         if _sp_is_enabled(sp_context) and self.requires_cu_seq_lens_q and cu_seq_lens_q is None:
             raise ValueError('TwinkleQwen3_5TextModel requires cu_seq_lens_q when sequence parallel is enabled.')
 

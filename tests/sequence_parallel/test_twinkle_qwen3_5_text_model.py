@@ -192,6 +192,59 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertEqual(captured['norm_z_shape'], (hidden_states.shape[0] * hidden_states.shape[1] * config.linear_num_value_heads, config.linear_value_head_dim))
         self.assertEqual(tuple(output.shape), (1, 2, config.hidden_size))
 
+    def test_linear_attention_sp_uses_local_attention_mask(self):
+        captured = {'mask': None}
+
+        def fake_conv(x, weight, bias, activation, seq_idx=None, backend=None, cu_seqlens=None):
+            del weight, bias, activation, seq_idx, backend, cu_seqlens
+            return x
+
+        def fake_chunk_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+                            use_qk_l2norm_in_kernel=False, cu_seqlens=None):
+            del query, key, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens
+            return value, None
+
+        def fake_recurrent_rule(query, key, value, g, beta, initial_state=None, output_final_state=False,
+                                use_qk_l2norm_in_kernel=False):
+            del query, key, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel
+            return value, None
+
+        with patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_FN', fake_conv), \
+                patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_UPDATE', lambda *args, **kwargs: args[0]), \
+                patch.object(tw_qwen35, '_FLA_CHUNK_GATED_DELTA_RULE', fake_chunk_rule), \
+                patch.object(tw_qwen35, '_FLA_FUSED_RECURRENT_GATED_DELTA_RULE', fake_recurrent_rule), \
+                patch.object(tw_qwen35, '_HAS_CAUSAL_CONV1D', True):
+            config = _build_text_config(['linear_attention'])
+            model = tw_qwen35.TwinkleQwen3_5TextModel(config)
+            model.set_sequence_parallel_context(
+                SequenceParallelContext(
+                    sp_group='dummy_group',
+                    sp_world_size=2,
+                    rank=0,
+                    world_size=2,
+                    real_position_ids=torch.tensor([[0, 1, 2, -1]], dtype=torch.long),
+                    is_packed=False,
+                ))
+
+            def fake_linear_forward(hidden_states, cache_params=None, cache_position=None, attention_mask=None,
+                                    cu_seq_lens_q=None, sequence_parallel_context=None):
+                del hidden_states, cache_params, cache_position, cu_seq_lens_q, sequence_parallel_context
+                captured['mask'] = attention_mask.clone() if attention_mask is not None else None
+                return torch.zeros(1, 2, config.hidden_size)
+
+            with patch.object(model.layers[0].linear_attn, 'forward', side_effect=fake_linear_forward):
+                _ = model(
+                    input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+                    attention_mask=torch.tensor([[1, 1, 1, 0]], dtype=torch.int64),
+                    position_ids=torch.tensor([[0, -1]], dtype=torch.long),
+                    cache_position=torch.tensor([0, 1], dtype=torch.long),
+                    cu_seq_lens_q=torch.tensor([0, 2], dtype=torch.int32),
+                    use_cache=False,
+                )
+
+        self.assertIsNotNone(captured['mask'])
+        self.assertTrue(torch.equal(captured['mask'], torch.tensor([[1, 0]], dtype=torch.int64)))
+
 
 if __name__ == '__main__':
     unittest.main()
