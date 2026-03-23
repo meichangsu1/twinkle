@@ -75,6 +75,32 @@ def _reset_peak_memory_stats():
         device_api.reset_peak_memory_stats()
 
 
+def _get_runtime_backend_info(model: TransformersModel):
+    model._ensure_sp_strategy()
+
+    underlying_model = getattr(model, 'model', None)
+    llm_model = getattr(underlying_model, 'model', underlying_model)
+    config = getattr(underlying_model, 'config', None)
+
+    attn_implementation = None
+    attn_implementation_internal = None
+    if config is not None:
+        attn_implementation = getattr(config, '_attn_implementation', None)
+        attn_implementation_internal = getattr(config, '_attn_implementation_internal', None)
+
+    return {
+        'model_cls': type(underlying_model).__name__ if underlying_model is not None else None,
+        'llm_model_cls': type(llm_model).__name__ if llm_model is not None else None,
+        'attn_implementation': attn_implementation,
+        'attn_implementation_internal': attn_implementation_internal,
+        'requires_cu_seq_lens_q': bool(getattr(llm_model, 'requires_cu_seq_lens_q', False)),
+        'sp_enabled': bool(getattr(model, '_enable_sp', False)),
+        'ulysses_size': getattr(getattr(model, 'device_mesh', None), 'ulysses_size', None),
+        'sp_strategy_enabled': bool(getattr(getattr(model, 'sp_strategy', None), 'enabled', False)),
+        'sp_strategy_ulysses_size': getattr(getattr(model, 'sp_strategy', None), 'ulysses_size', None),
+    }
+
+
 def eval(model):
     dataloader = DataLoader(
         dataset=partial(create_dataset, data_slice=range(100)),
@@ -121,6 +147,7 @@ def train():
 
     logger.info(model.get_train_configs(adapter_name='default'))
     logger.info(f'Total steps: {len(dataloader)}')
+    logger.info(f'Backend info: {_get_runtime_backend_info(model)}')
     logger.info(f'Initial memory: {_get_memory_stats()}')
     _reset_peak_memory_stats()
 
