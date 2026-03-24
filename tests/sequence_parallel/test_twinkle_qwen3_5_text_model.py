@@ -192,6 +192,25 @@ class TestTwinkleQwen35TextModel(unittest.TestCase):
         self.assertIn('cu_seq_lens_q', outputs)
         self.assertTrue(torch.equal(outputs['cu_seq_lens_q'], torch.tensor([0, 4, 8], dtype=torch.int32)))
 
+    def test_sequence_parallel_prepare_inputs_tracks_position_ids_for_inputs_embeds(self):
+        sp = SequenceParallel()
+        sp.world_size = 2
+        sp.sp_world_size = 2
+        sp.requires_cu_seq_lens_q = True
+        receiver = _ContextReceiver()
+        sp._bound_llm_model = receiver
+        inputs = {
+            'inputs_embeds': torch.randn(2, 4, 8),
+            'position_ids': torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long),
+        }
+
+        outputs = sp.prepare_inputs(inputs)
+
+        self.assertIn('cu_seq_lens_q', outputs)
+        self.assertTrue(torch.equal(outputs['cu_seq_lens_q'], torch.tensor([0, 4, 8], dtype=torch.int32)))
+        self.assertIsNotNone(receiver.context)
+        self.assertTrue(torch.equal(receiver.context.real_position_ids, inputs['position_ids']))
+
     def test_linear_attention_requires_fast_path_dependencies(self):
         with patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_FN', None), \
                 patch.object(tw_qwen35, '_FLA_CAUSAL_CONV1D_UPDATE', None), \

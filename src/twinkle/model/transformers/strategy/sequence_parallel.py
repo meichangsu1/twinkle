@@ -914,8 +914,10 @@ class SequenceParallel:
         """
         position_ids = None
         input_ids = inputs.get('input_ids')
+        inputs_embeds = inputs.get('inputs_embeds')
         position_ids = inputs.get('position_ids')
-        if position_ids is not None and input_ids is not None and position_ids.shape[0] == input_ids.shape[0]:
+        batch_source = input_ids if input_ids is not None else inputs_embeds
+        if position_ids is not None and batch_source is not None and position_ids.shape[0] == batch_source.shape[0]:
             self.extra_kwargs['position_ids'] = position_ids.clone()
         self.extra_kwargs['is_packed'] = self._is_packed_position_ids(position_ids)
         if input_ids is not None:
