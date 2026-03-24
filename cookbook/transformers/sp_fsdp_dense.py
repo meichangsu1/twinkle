@@ -22,6 +22,12 @@ from twinkle.preprocessor import SelfCognitionProcessor
 logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 DATASETS = 'ms://swift/self-cognition'
+TRAIN_SEED = int(os.environ.get('TRAIN_SEED', '1234'))
+TRAIN_DETERMINISTIC = os.environ.get('TRAIN_DETERMINISTIC', '1') == '1'
+TRAIN_NUM_WORKERS = int(os.environ.get('TRAIN_NUM_WORKERS', '0'))
+TRAIN_SHUFFLE = os.environ.get('TRAIN_SHUFFLE', '0') == '1'
+TRAIN_ATTENTION_DROPOUT = float(os.environ.get('TRAIN_ATTENTION_DROPOUT', '0.0'))
+TRAIN_LORA_DROPOUT = float(os.environ.get('TRAIN_LORA_DROPOUT', '0.0'))
 
 device_group = [DeviceGroup(
     name='default',
@@ -43,6 +49,7 @@ twinkle.initialize(
     global_device_mesh=device_mesh,
     lazy_collect=False,
 )
+twinkle.framework_util.seed_everything(TRAIN_SEED, TRAIN_DETERMINISTIC)
 
 
 def _memory_api():
@@ -248,6 +255,8 @@ def eval(model):
         dataset=partial(create_dataset, data_slice=range(100)),
         batch_size=4,
         device_mesh=device_mesh,
+        num_workers=TRAIN_NUM_WORKERS,
+        shuffle=False,
     )
     for _, batch in enumerate(dataloader):
         model.forward_only(inputs=batch, adapter_name='default')
@@ -268,6 +277,8 @@ def train():
         dataset=partial(create_dataset, data_slice=None),
         batch_size=8,
         device_mesh=device_mesh,
+        num_workers=TRAIN_NUM_WORKERS,
+        shuffle=TRAIN_SHUFFLE,
     )
 
     model = TransformersModel(
@@ -275,9 +286,10 @@ def train():
         model_cls=TwinkleQwen3_5ForCausalLM,
         device_mesh=device_mesh,
         strategy='native_fsdp',
+        attention_dropout=TRAIN_ATTENTION_DROPOUT,
     )
 
-    lora_config = LoraConfig(target_modules='all-linear')
+    lora_config = LoraConfig(target_modules='all-linear', lora_dropout=TRAIN_LORA_DROPOUT)
     model.add_adapter_to_model('default', lora_config)
     grad_accumulation_steps = model.optimizer_group['default'].gradient_accumulation_steps
     num_optimizer_steps = math.ceil(len(dataloader) / grad_accumulation_steps)
@@ -294,6 +306,16 @@ def train():
     logger.info(
         f'Total micro steps: {len(dataloader)}, optimizer steps: {num_optimizer_steps}, '
         f'gradient_accumulation_steps: {grad_accumulation_steps}')
+    logger.info(
+        'Reproducibility config: '
+        + str({
+            'seed': TRAIN_SEED,
+            'deterministic': TRAIN_DETERMINISTIC,
+            'dataloader_shuffle': TRAIN_SHUFFLE,
+            'dataloader_num_workers': TRAIN_NUM_WORKERS,
+            'attention_dropout': TRAIN_ATTENTION_DROPOUT,
+            'lora_dropout': TRAIN_LORA_DROPOUT,
+        }))
     logger.info(f'Backend info: {_get_runtime_backend_info(model)}')
     logger.info(f'Initial memory: {_get_memory_stats()}')
     _reset_peak_memory_stats()
