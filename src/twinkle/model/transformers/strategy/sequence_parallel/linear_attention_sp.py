@@ -3,6 +3,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Any, Optional, Tuple
+import warnings
 
 from twinkle.model.transformers.strategy.sequence_parallel.utils import head_to_seq_shard, seq_to_head_shard
 from twinkle.patch import Patch
@@ -14,8 +15,11 @@ else:
     _FLA_CAUSAL_CONV1D_FN = None
     _FLA_CHUNK_GATED_DELTA_RULE = None
 
-_SP_LINEAR_KERNEL_IMPORT_ERROR = ('Qwen3.5 linear attention sequence parallel requires flash-linear-attention. '
-                                  'Install: https://github.com/fla-org/flash-linear-attention#installation')
+_SP_LINEAR_KERNEL_FALLBACK_WARNING = (
+    'flash-linear-attention is not available; falling back to torch implementations for the sequence-parallel '
+    'Qwen3.5 linear-attention kernels.'
+)
+_SP_LINEAR_KERNEL_FALLBACK_WARNED = False
 
 
 def _sp_is_enabled(sequence_parallel_context) -> bool:
@@ -45,10 +49,45 @@ def _get_local_padding_mask(
 
 
 def _ensure_linear_attention_kernels(mod: torch.nn.Module):
-    mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
-    mod.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
-    if mod.chunk_gated_delta_rule is None or mod.causal_conv1d_fn is None:
-        raise ImportError(_SP_LINEAR_KERNEL_IMPORT_ERROR)
+    if _FLA_CAUSAL_CONV1D_FN is not None and _FLA_CHUNK_GATED_DELTA_RULE is not None:
+        mod.causal_conv1d_fn = _FLA_CAUSAL_CONV1D_FN
+        mod.chunk_gated_delta_rule = _FLA_CHUNK_GATED_DELTA_RULE
+        return False
+
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+
+    def _torch_causal_conv1d_fn(
+        *,
+        x,
+        weight,
+        bias=None,
+        activation=None,
+        seq_idx=None,
+        backend=None,
+        cu_seqlens=None,
+    ):
+        del activation, seq_idx, backend
+        if cu_seqlens is not None:
+            raise NotImplementedError(
+                'Torch fallback for Qwen3.5 linear attention sequence parallel does not support packed cu_seqlens.')
+        seq_len = x.shape[1]
+        x = x.transpose(1, 2).contiguous()
+        out = F.conv1d(x, weight.unsqueeze(1), bias, padding=weight.shape[-1] - 1, groups=x.shape[1])
+        out = F.silu(out[:, :, :seq_len]).transpose(1, 2).contiguous()
+        return out, None
+
+    mod.causal_conv1d_fn = _torch_causal_conv1d_fn
+    mod.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+    _warn_linear_attention_kernel_fallback_once()
+    return True
+
+
+def _warn_linear_attention_kernel_fallback_once():
+    global _SP_LINEAR_KERNEL_FALLBACK_WARNED
+    if _SP_LINEAR_KERNEL_FALLBACK_WARNED:
+        return
+    warnings.warn(_SP_LINEAR_KERNEL_FALLBACK_WARNING, stacklevel=2)
+    _SP_LINEAR_KERNEL_FALLBACK_WARNED = True
 
 
 def _get_local_conv_weights(
@@ -93,7 +132,7 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         cu_seq_lens_q: Optional[torch.Tensor] = None,
         sequence_parallel_context=None,
     ) -> torch.Tensor:
-        _ensure_linear_attention_kernels(mod)
+        using_torch_fallback = _ensure_linear_attention_kernels(mod)
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
         local_attention_mask = attention_mask
@@ -171,6 +210,9 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             raise ValueError(
                 'Packed Qwen3.5 linear attention sequence parallel requires cu_seq_lens_q to be populated by '
                 'sequence parallel input preparation.')
+        if using_torch_fallback and packed_cu_seqlens is not None:
+            raise NotImplementedError(
+                'Torch fallback for Qwen3.5 linear attention sequence parallel does not support packed sequences.')
         if cache_params is not None:
             cache_params.conv_states[mod.layer_idx] = F.pad(
                 mixed_qkv.transpose(1, 2).contiguous(), (mod.conv_kernel_size - mixed_qkv.shape[1], 0))

@@ -7,6 +7,7 @@ from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
+from twinkle.processor import InputProcessor
 from twinkle.preprocessor import SelfCognitionProcessor
 
 logger = get_logger()
@@ -71,6 +72,7 @@ def train():
 
     lora_config = LoraConfig(target_modules='all-linear')
     model.add_adapter_to_model('default', lora_config, gradient_accumulation_steps=1)
+    model.set_processor(InputProcessor, padding_free=True, adapter_name='default')
     model.set_optimizer('AdamW', lr=1e-4, adapter_name='default')
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',

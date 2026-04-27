@@ -114,22 +114,41 @@ class SequenceParallel:
 
             masking_utils.flash_attention_mask = flash_attention_mask
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['flash_attention_2'] = flash_attention_mask
+            def sdpa_mask(*args, **kwargs):
+                """Compatibility wrapper for transformers sdpa mask interface.
 
-            def sdpa_mask(batch_size, cache_position, kv_length, *args, **kwargs):
+                Different transformers versions may call the mask function with
+                positional or keyword arguments and with slight signature
+                differences. Parse defensively from args/kwargs.
+                """
+                batch_size = kwargs.get('batch_size', args[0] if len(args) > 0 else None)
+                cache_position = kwargs.get('cache_position', args[1] if len(args) > 1 else None)
+                kv_length = kwargs.get('kv_length', args[2] if len(args) > 2 else None)
+                extra_args = tuple(args[3:]) if len(args) > 3 else ()
+                call_kwargs = dict(kwargs)
+                call_kwargs.pop('batch_size', None)
+                call_kwargs.pop('cache_position', None)
+                call_kwargs.pop('kv_length', None)
+
+                sdpa_origin = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin']
                 if self.world_size == 1:
-                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
-                                                                                                     cache_position,
-                                                                                                     kv_length, *args,
-                                                                                                     **kwargs)
-                device = cache_position.device
-                cache_position = self.real_position_ids[0]
-                cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
-                cache_position = torch.arange(0, cache_position.shape[0], device=device)
-                kv_length = cache_position.shape[0]
-                return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
-                                                                                                 cache_position,
-                                                                                                 kv_length, *args,
-                                                                                                 **kwargs)
+                    return sdpa_origin(batch_size, cache_position, kv_length, *extra_args, **call_kwargs)
+
+                if cache_position is None:
+                    # Some newer transformers call sdpa mask without cache_position.
+                    # Do not synthesize from kv_length here: converting device scalars
+                    # to Python int may trigger backend sync issues (especially on NPU).
+                    return sdpa_origin(batch_size, cache_position, kv_length, *extra_args, **call_kwargs)
+                else:
+                    device = cache_position.device
+                    if self.real_position_ids is not None and torch.is_tensor(self.real_position_ids):
+                        cache_position = self.real_position_ids[0]
+                        cache_position = self.pad(
+                            cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
+                        cache_position = torch.arange(0, cache_position.shape[0], device=device)
+                        kv_length = cache_position.shape[0]
+
+                return sdpa_origin(batch_size, cache_position, kv_length, *extra_args, **call_kwargs)
 
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping[
                 'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
@@ -316,6 +335,19 @@ class SequenceParallel:
             kwargs['inputs_embeds'] = inputs_embeds
             kwargs['position_ids'] = position_ids
             kwargs['attention_mask'] = attention_mask
+            if cache_position is not None and torch.is_tensor(cache_position):
+                # Keep cache_position aligned with the SP-split local sequence.
+                # Qwen3.5 linear attention reads cache_position[0] during mask update.
+                if position_ids is not None and torch.is_tensor(position_ids):
+                    local_seq_len = int(position_ids.shape[-1])
+                elif input_ids is not None and torch.is_tensor(input_ids):
+                    local_seq_len = int(input_ids.shape[1])
+                elif inputs_embeds is not None and torch.is_tensor(inputs_embeds):
+                    local_seq_len = int(inputs_embeds.shape[1])
+                else:
+                    local_seq_len = int(cache_position.shape[0])
+                kwargs['cache_position'] = torch.arange(
+                    local_seq_len, device=cache_position.device, dtype=cache_position.dtype)
             return args, kwargs
 
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
