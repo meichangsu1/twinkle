@@ -119,6 +119,24 @@ def _get_local_conv_weights(
     return local_conv_weight, torch.cat([local_q_bias, local_k_bias, local_v_bias], dim=0)
 
 
+def _get_packed_cu_seqlens(
+    cu_seq_lens_q: Optional[torch.Tensor],
+    sequence_parallel_context,
+    *,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if cu_seq_lens_q is not None:
+        return cu_seq_lens_q.to(dtype=torch.int32, device=device)
+    if sequence_parallel_context is None:
+        return None
+
+    extra_kwargs = getattr(sequence_parallel_context, 'extra_kwargs', {})
+    cu_seqlens = extra_kwargs.get('cu_seq_lens_q')
+    if cu_seqlens is not None:
+        return cu_seqlens.to(dtype=torch.int32, device=device)
+    return None
+
+
 class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
 
     @staticmethod
@@ -198,14 +216,12 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             conv_weight = mod.conv1d.weight.squeeze(1)
             conv_bias = getattr(mod.conv1d, 'bias', None)
 
-        packed_cu_seqlens = None
-        if cu_seq_lens_q is not None:
-            packed_cu_seqlens = cu_seq_lens_q.to(dtype=torch.int32, device=mixed_qkv.device)
-        elif sequence_parallel_context is not None:
-            packed_cu_seqlens = getattr(sequence_parallel_context, 'extra_kwargs', {}).get('cu_seq_lens_q')
-            if packed_cu_seqlens is not None:
-                packed_cu_seqlens = packed_cu_seqlens.to(dtype=torch.int32, device=mixed_qkv.device)
-        if bool(getattr(sequence_parallel_context, 'extra_kwargs', {}).get('is_packed',
+        packed_cu_seqlens = _get_packed_cu_seqlens(
+            cu_seq_lens_q,
+            sequence_parallel_context,
+            device=mixed_qkv.device,
+        )
+        if bool(getattr(sequence_parallel_context, 'extra_kwargs', {}).get('padding_free',
                                                                            False)) and packed_cu_seqlens is None:
             raise ValueError(
                 'Packed Qwen3.5 linear attention sequence parallel requires cu_seq_lens_q to be populated by '

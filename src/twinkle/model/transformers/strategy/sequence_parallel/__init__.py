@@ -65,9 +65,33 @@ class SequenceParallel:
             return position_ids[0]
         return position_ids
 
-    def _update_packed_varlen_metadata(self, real_position_ids: Optional[torch.Tensor]) -> None:
-        self.extra_kwargs.pop('cu_seq_lens_q', None)
-        if real_position_ids is None or not self._is_packed_position_ids(real_position_ids):
+    def _update_varlen_metadata(
+        self,
+        real_position_ids: Optional[torch.Tensor],
+        *,
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seq_lens_kv: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[Union[int, torch.Tensor]] = None,
+        max_seqlen_kv: Optional[Union[int, torch.Tensor]] = None,
+    ) -> None:
+        varlen_keys = ('cu_seq_lens_q', 'cu_seq_lens_kv', 'max_seqlen_q', 'max_seqlen_kv')
+
+        def get_max_seqlen(cu_seqlens: torch.Tensor) -> int:
+            return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+
+        for key in varlen_keys:
+            self.extra_kwargs.pop(key, None)
+        if cu_seq_lens_q is not None:
+            cu_seq_lens_q = cu_seq_lens_q.to(torch.int32)
+            cu_seq_lens_kv = cu_seq_lens_kv.to(torch.int32) if cu_seq_lens_kv is not None else cu_seq_lens_q
+            self.extra_kwargs.update({
+                'cu_seq_lens_q': cu_seq_lens_q,
+                'cu_seq_lens_kv': cu_seq_lens_kv,
+                'max_seqlen_q': max_seqlen_q if max_seqlen_q is not None else get_max_seqlen(cu_seq_lens_q),
+                'max_seqlen_kv': max_seqlen_kv if max_seqlen_kv is not None else get_max_seqlen(cu_seq_lens_kv),
+            })
+            return
+        if real_position_ids is None or not self.extra_kwargs.get('padding_free', False):
             return
         position_ids = self._extract_real_position_ids(real_position_ids)
         if position_ids is None or not torch.is_tensor(position_ids):
@@ -75,11 +99,19 @@ class SequenceParallel:
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
         if position_ids.shape[0] != 1:
-            raise ValueError('Packed sequence-parallel inputs require batch_size == 1 when deriving cu_seq_lens_q from '
-                             'position_ids. Please populate cu_seq_lens_q explicitly for batched packed inputs.')
+            raise ValueError('Padding-free sequence-parallel inputs require batch_size == 1 when deriving '
+                             'cu_seq_lens_q from position_ids. Please populate cu_seq_lens_q explicitly for '
+                             'batched padding-free inputs.')
         safe_position_ids = position_ids.clone()
         safe_position_ids[safe_position_ids < 0] = 0
-        self.extra_kwargs['cu_seq_lens_q'] = get_cu_seqlens_from_position_ids(safe_position_ids).to(torch.int32)
+        cu_seqlens = get_cu_seqlens_from_position_ids(safe_position_ids).to(torch.int32)
+        max_seqlen = get_max_seqlen(cu_seqlens)
+        self.extra_kwargs.update({
+            'cu_seq_lens_q': cu_seqlens,
+            'cu_seq_lens_kv': cu_seqlens,
+            'max_seqlen_q': max_seqlen,
+            'max_seqlen_kv': max_seqlen,
+        })
 
     @property
     def sp_rank(self) -> int:
@@ -239,18 +271,11 @@ class SequenceParallel:
                             window_size=kwargs.get('sliding_window') or (-1, -1),
                             group=self._rp_group,
                         )
-                    elif self.extra_kwargs.get('is_packed', False) or 'cu_seq_lens_q' in kwargs:
-                        cu_seqlens = kwargs.get('cu_seq_lens_q')
-                        if cu_seqlens is None:
-                            position_ids = kwargs.get('position_ids')
-                            if position_ids is None:
-                                position_ids = self.real_position_ids
-                            position_ids = self._extract_real_position_ids(position_ids)
-                            position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
-                            cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(torch.int32)
-                        else:
-                            cu_seqlens = cu_seqlens.to(dtype=torch.int32, device=query.device)
-                        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+                    elif self.extra_kwargs.get('cu_seq_lens_q') is not None:
+                        cu_seqlens = self.extra_kwargs['cu_seq_lens_q'].to(dtype=torch.int32, device=query.device)
+                        max_seqlen = self.extra_kwargs['max_seqlen_q']
+                        if torch.is_tensor(max_seqlen):
+                            max_seqlen = int(max_seqlen.item())
                         total_tokens = int(cu_seqlens[-1].item())
                         if query.shape[2] != total_tokens:
                             raise ValueError('Packed/varlen flash_attention_2 expects query sequence length to match '
@@ -260,7 +285,7 @@ class SequenceParallel:
                         kwargs['cu_seq_lens_k'] = cu_seqlens
                         kwargs['max_length_q'] = max_seqlen
                         kwargs['max_length_k'] = max_seqlen
-                        if self.extra_kwargs.get('is_packed', False) and len(args) > 0:
+                        if self.extra_kwargs.get('padding_free', False) and len(args) > 0:
                             args = (None, *args[1:])
                     return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
                                                                                **kwargs)[0]
@@ -280,7 +305,7 @@ class SequenceParallel:
             # Policy: packed (PackingDataset/padding-free) batches require FlashAttention2 varlen/packed semantics.
             # SDPA does not have a native packed/varlen interface; supporting packed batches would require building a
             # large block-diagonal causal mask (slow / memory heavy).
-            if self.extra_kwargs.get('is_packed', False):
+            if self.extra_kwargs.get('padding_free', False):
                 raise RuntimeError(
                     'SequenceParallel: detected packed batch (position_ids contains multiple sequences). '
                     'SDPA backend is not supported for packed batches; please use flash_attention_2.')
@@ -720,9 +745,6 @@ class SequenceParallel:
         """
         tokenizer = self.tokenizer
         real_position_ids = real_position_ids if real_position_ids is not None else position_ids
-        # Track packed batches to drive attention backend behavior (packed => require flash_attention_2 varlen).
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
-        self._update_packed_varlen_metadata(real_position_ids)
         extra_values = []
         batch_size = input_ids.shape[
             0] if input_ids is not None else input_embeds.shape[0] if input_embeds is not None else None
@@ -836,11 +858,22 @@ class SequenceParallel:
         """
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
+        padding_free = bool(inputs.pop('padding_free', False))
+        cu_seq_lens_q = inputs.pop('cu_seq_lens_q', None)
+        cu_seq_lens_kv = inputs.pop('cu_seq_lens_kv', None)
+        max_seqlen_q = inputs.pop('max_seqlen_q', None)
+        max_seqlen_kv = inputs.pop('max_seqlen_kv', None)
         real_position_ids = self._extract_real_position_ids(position_ids)
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
             self.extra_kwargs['position_ids'] = real_position_ids.clone()
-        self.extra_kwargs['is_packed'] = self._is_packed_position_ids(real_position_ids)
-        self._update_packed_varlen_metadata(real_position_ids)
+        self.extra_kwargs['padding_free'] = padding_free
+        self._update_varlen_metadata(
+            real_position_ids,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_kv=cu_seq_lens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+        )
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
