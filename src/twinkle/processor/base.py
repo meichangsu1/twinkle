@@ -24,12 +24,6 @@ class PackedSeqParams:
 
 @remote_class()
 class InputProcessor:
-    TRANSFORMERS_VARLEN_FIELDS = (
-        'cu_seq_lens_q',
-        'cu_seq_lens_kv',
-        'max_seqlen_q',
-        'max_seqlen_kv',
-    )
     padding_map = {
         'input_ids': 0,
         'mm_token_type_ids': 0,
@@ -292,12 +286,6 @@ class InputProcessor:
             padding_free = self.padding_free or self._any_packing([_inp])
             if padding_free and self.framework == 'megatron':
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
-            elif padding_free and self.framework == 'transformers':
-                packed_seq_params = self._get_packed_seq_params(_inp['position_ids'])
-                _inp['cu_seq_lens_q'] = packed_seq_params.cu_seqlens_q
-                _inp['cu_seq_lens_kv'] = packed_seq_params.cu_seqlens_kv
-                _inp['max_seqlen_q'] = packed_seq_params.max_seqlen_q
-                _inp['max_seqlen_kv'] = packed_seq_params.max_seqlen_kv
         return inputs
 
     def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
@@ -501,7 +489,7 @@ class InputProcessor:
                 'position_ids',
                 'labels',
                 'completion_mask',
-            ] + list(InputProcessor.VLM_CONCAT_FIELDS) + list(InputProcessor.TRANSFORMERS_VARLEN_FIELDS)
+            ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
                 if key in _keys:
                     output[key] = np.array(_input[key]) if not isinstance(_input[key], torch.Tensor) else _input[key]

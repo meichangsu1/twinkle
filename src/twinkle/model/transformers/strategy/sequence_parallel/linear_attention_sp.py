@@ -5,7 +5,11 @@ from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Any, Optional, Tuple
 import warnings
 
-from twinkle.model.transformers.strategy.sequence_parallel.utils import head_to_seq_shard, seq_to_head_shard
+from twinkle.model.transformers.strategy.sequence_parallel.utils import (
+    get_cu_seqlens_from_position_ids,
+    head_to_seq_shard,
+    seq_to_head_shard,
+)
 from twinkle.patch import Patch
 
 if is_flash_linear_attention_available():
@@ -69,7 +73,9 @@ def _ensure_linear_attention_kernels(mod: torch.nn.Module):
         del activation, seq_idx, backend
         if cu_seqlens is not None:
             raise NotImplementedError(
-                'Torch fallback for Qwen3.5 linear attention sequence parallel does not support packed cu_seqlens.')
+                'Qwen3.5 linear attention sequence parallel with padding_free/packed inputs requires '
+                'flash-linear-attention. The torch fallback only supports non-packed sequences. '
+                'Please install flash-linear-attention or disable padding_free/packing.')
         seq_len = x.shape[1]
         x = x.transpose(1, 2).contiguous()
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=weight.shape[-1] - 1, groups=x.shape[1])
@@ -119,22 +125,18 @@ def _get_local_conv_weights(
     return local_conv_weight, torch.cat([local_q_bias, local_k_bias, local_v_bias], dim=0)
 
 
-def _get_packed_cu_seqlens(
-    cu_seq_lens_q: Optional[torch.Tensor],
-    sequence_parallel_context,
-    *,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
-    if cu_seq_lens_q is not None:
-        return cu_seq_lens_q.to(dtype=torch.int32, device=device)
+def _get_packed_cu_seqlens(sequence_parallel_context, *, device: torch.device) -> Optional[torch.Tensor]:
     if sequence_parallel_context is None:
         return None
-
     extra_kwargs = getattr(sequence_parallel_context, 'extra_kwargs', {})
-    cu_seqlens = extra_kwargs.get('cu_seq_lens_q')
-    if cu_seqlens is not None:
-        return cu_seqlens.to(dtype=torch.int32, device=device)
-    return None
+    if not extra_kwargs.get('padding_free', False):
+        return None
+    position_ids = getattr(sequence_parallel_context, 'real_position_ids', None)
+    if position_ids is None:
+        return None
+    position_ids = sequence_parallel_context.pad(position_ids, padding_value=-1, position_ids=position_ids)
+    position_ids = sequence_parallel_context._extract_real_position_ids(position_ids)
+    return get_cu_seqlens_from_position_ids(position_ids).to(dtype=torch.int32, device=device)
 
 
 class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
@@ -147,7 +149,6 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
         cache_params=None,
         cache_position=None,
         attention_mask: Optional[torch.Tensor] = None,
-        cu_seq_lens_q: Optional[torch.Tensor] = None,
         sequence_parallel_context=None,
     ) -> torch.Tensor:
         using_torch_fallback = _ensure_linear_attention_kernels(mod)
@@ -216,19 +217,16 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             conv_weight = mod.conv1d.weight.squeeze(1)
             conv_bias = getattr(mod.conv1d, 'bias', None)
 
-        packed_cu_seqlens = _get_packed_cu_seqlens(
-            cu_seq_lens_q,
-            sequence_parallel_context,
-            device=mixed_qkv.device,
-        )
+        packed_cu_seqlens = _get_packed_cu_seqlens(sequence_parallel_context, device=mixed_qkv.device)
         if bool(getattr(sequence_parallel_context, 'extra_kwargs', {}).get('padding_free',
                                                                            False)) and packed_cu_seqlens is None:
             raise ValueError(
-                'Packed Qwen3.5 linear attention sequence parallel requires cu_seq_lens_q to be populated by '
-                'sequence parallel input preparation.')
+                'Packed Qwen3.5 linear attention sequence parallel requires position_ids to derive cu_seqlens.')
         if using_torch_fallback and packed_cu_seqlens is not None:
             raise NotImplementedError(
-                'Torch fallback for Qwen3.5 linear attention sequence parallel does not support packed sequences.')
+                'Qwen3.5 linear attention sequence parallel with padding_free/packed inputs requires '
+                'flash-linear-attention. The torch fallback only supports non-packed sequences. '
+                'Please install flash-linear-attention or disable padding_free/packing.')
         if cache_params is not None:
             cache_params.conv_states[mod.layer_idx] = F.pad(
                 mixed_qkv.transpose(1, 2).contiguous(), (mod.conv_kernel_size - mixed_qkv.shape[1], 0))
@@ -311,9 +309,6 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
             **extra_kwargs,
         ):
             sequence_parallel_context = extra_kwargs.pop('sequence_parallel_context', sequence_parallel)
-            cu_seq_lens_q = extra_kwargs.pop('cu_seq_lens_q', None)
-            if cu_seq_lens_q is None and sequence_parallel_context is not None:
-                cu_seq_lens_q = getattr(sequence_parallel_context, 'extra_kwargs', {}).get('cu_seq_lens_q')
             if not _sp_is_enabled(sequence_parallel_context):
                 return origin_forward(
                     mod,
@@ -328,7 +323,6 @@ class Qwen3_5GatedDeltaNetUlyssesPatch(Patch):
                 cache_params=cache_params,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
-                cu_seq_lens_q=cu_seq_lens_q,
                 sequence_parallel_context=sequence_parallel_context,
             )
 

@@ -65,54 +65,6 @@ class SequenceParallel:
             return position_ids[0]
         return position_ids
 
-    def _update_varlen_metadata(
-        self,
-        real_position_ids: Optional[torch.Tensor],
-        *,
-        cu_seq_lens_q: Optional[torch.Tensor] = None,
-        cu_seq_lens_kv: Optional[torch.Tensor] = None,
-        max_seqlen_q: Optional[Union[int, torch.Tensor]] = None,
-        max_seqlen_kv: Optional[Union[int, torch.Tensor]] = None,
-    ) -> None:
-        varlen_keys = ('cu_seq_lens_q', 'cu_seq_lens_kv', 'max_seqlen_q', 'max_seqlen_kv')
-
-        def get_max_seqlen(cu_seqlens: torch.Tensor) -> int:
-            return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-
-        for key in varlen_keys:
-            self.extra_kwargs.pop(key, None)
-        if cu_seq_lens_q is not None:
-            cu_seq_lens_q = cu_seq_lens_q.to(torch.int32)
-            cu_seq_lens_kv = cu_seq_lens_kv.to(torch.int32) if cu_seq_lens_kv is not None else cu_seq_lens_q
-            self.extra_kwargs.update({
-                'cu_seq_lens_q': cu_seq_lens_q,
-                'cu_seq_lens_kv': cu_seq_lens_kv,
-                'max_seqlen_q': max_seqlen_q if max_seqlen_q is not None else get_max_seqlen(cu_seq_lens_q),
-                'max_seqlen_kv': max_seqlen_kv if max_seqlen_kv is not None else get_max_seqlen(cu_seq_lens_kv),
-            })
-            return
-        if real_position_ids is None or not self.extra_kwargs.get('padding_free', False):
-            return
-        position_ids = self._extract_real_position_ids(real_position_ids)
-        if position_ids is None or not torch.is_tensor(position_ids):
-            return
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
-        if position_ids.shape[0] != 1:
-            raise ValueError('Padding-free sequence-parallel inputs require batch_size == 1 when deriving '
-                             'cu_seq_lens_q from position_ids. Please populate cu_seq_lens_q explicitly for '
-                             'batched padding-free inputs.')
-        safe_position_ids = position_ids.clone()
-        safe_position_ids[safe_position_ids < 0] = 0
-        cu_seqlens = get_cu_seqlens_from_position_ids(safe_position_ids).to(torch.int32)
-        max_seqlen = get_max_seqlen(cu_seqlens)
-        self.extra_kwargs.update({
-            'cu_seq_lens_q': cu_seqlens,
-            'cu_seq_lens_kv': cu_seqlens,
-            'max_seqlen_q': max_seqlen,
-            'max_seqlen_kv': max_seqlen,
-        })
-
     @property
     def sp_rank(self) -> int:
         return self._sp_rank
@@ -146,42 +98,21 @@ class SequenceParallel:
 
             masking_utils.flash_attention_mask = flash_attention_mask
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['flash_attention_2'] = flash_attention_mask
-            def sdpa_mask(*args, **kwargs):
-                """Compatibility wrapper for transformers sdpa mask interface.
-
-                Different transformers versions may call the mask function with
-                positional or keyword arguments and with slight signature
-                differences. Parse defensively from args/kwargs.
-                """
-                batch_size = kwargs.get('batch_size', args[0] if len(args) > 0 else None)
-                cache_position = kwargs.get('cache_position', args[1] if len(args) > 1 else None)
-                kv_length = kwargs.get('kv_length', args[2] if len(args) > 2 else None)
-                extra_args = tuple(args[3:]) if len(args) > 3 else ()
-                call_kwargs = dict(kwargs)
-                call_kwargs.pop('batch_size', None)
-                call_kwargs.pop('cache_position', None)
-                call_kwargs.pop('kv_length', None)
-
-                sdpa_origin = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin']
+            def sdpa_mask(batch_size, cache_position, kv_length, *args, **kwargs):
                 if self.world_size == 1:
-                    return sdpa_origin(batch_size, cache_position, kv_length, *extra_args, **call_kwargs)
-
-                if cache_position is None:
-                    # Some newer transformers call sdpa mask without cache_position.
-                    # Do not synthesize from kv_length here: converting device scalars
-                    # to Python int may trigger backend sync issues (especially on NPU).
-                    return sdpa_origin(batch_size, cache_position, kv_length, *extra_args, **call_kwargs)
-                else:
-                    device = cache_position.device
-                    if self.real_position_ids is not None and torch.is_tensor(self.real_position_ids):
-                        cache_position = self.real_position_ids[0]
-                        cache_position = self.pad(
-                            cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
-                        cache_position = torch.arange(0, cache_position.shape[0], device=device)
-                        kv_length = cache_position.shape[0]
-
-                return sdpa_origin(batch_size, cache_position, kv_length, *extra_args, **call_kwargs)
-
+                    return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
+                                                                                                     cache_position,
+                                                                                                     kv_length, *args,
+                                                                                                     **kwargs)
+                device = cache_position.device
+                cache_position = self.real_position_ids[0]
+                cache_position = self.pad(cache_position, padding_value=-1, position_ids=self.real_position_ids, dim=0)
+                cache_position = torch.arange(0, cache_position.shape[0], device=device)
+                kv_length = cache_position.shape[0]
+                return masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa_origin'](batch_size,
+                                                                                                 cache_position,
+                                                                                                 kv_length, *args,
+                                                                                                 **kwargs)
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping[
                 'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
@@ -271,11 +202,15 @@ class SequenceParallel:
                             window_size=kwargs.get('sliding_window') or (-1, -1),
                             group=self._rp_group,
                         )
-                    elif self.extra_kwargs.get('cu_seq_lens_q') is not None:
-                        cu_seqlens = self.extra_kwargs['cu_seq_lens_q'].to(dtype=torch.int32, device=query.device)
-                        max_seqlen = self.extra_kwargs['max_seqlen_q']
-                        if torch.is_tensor(max_seqlen):
-                            max_seqlen = int(max_seqlen.item())
+                    elif self.extra_kwargs.get('padding_free', False):
+                        position_ids = kwargs.get('position_ids')
+                        if position_ids is None:
+                            position_ids = self.real_position_ids
+                            position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
+                        position_ids = self._extract_real_position_ids(position_ids)
+                        cu_seqlens = get_cu_seqlens_from_position_ids(position_ids).to(
+                            dtype=torch.int32, device=query.device)
+                        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
                         total_tokens = int(cu_seqlens[-1].item())
                         if query.shape[2] != total_tokens:
                             raise ValueError('Packed/varlen flash_attention_2 expects query sequence length to match '
@@ -360,19 +295,6 @@ class SequenceParallel:
             kwargs['inputs_embeds'] = inputs_embeds
             kwargs['position_ids'] = position_ids
             kwargs['attention_mask'] = attention_mask
-            if cache_position is not None and torch.is_tensor(cache_position):
-                # Keep cache_position aligned with the SP-split local sequence.
-                # Qwen3.5 linear attention reads cache_position[0] during mask update.
-                if position_ids is not None and torch.is_tensor(position_ids):
-                    local_seq_len = int(position_ids.shape[-1])
-                elif input_ids is not None and torch.is_tensor(input_ids):
-                    local_seq_len = int(input_ids.shape[1])
-                elif inputs_embeds is not None and torch.is_tensor(inputs_embeds):
-                    local_seq_len = int(inputs_embeds.shape[1])
-                else:
-                    local_seq_len = int(cache_position.shape[0])
-                kwargs['cache_position'] = torch.arange(
-                    local_seq_len, device=cache_position.device, dtype=cache_position.dtype)
             return args, kwargs
 
         base_model.register_forward_pre_hook(pre_forward_split_hook, with_kwargs=True)
@@ -853,27 +775,16 @@ class SequenceParallel:
         """Prepare inputs
 
         1. set extra_kwargs['position_ids']
-        2. cache packed/varlen metadata
+        2. set padding-free flag
         3. split labels
         """
         input_ids = inputs.get('input_ids')
         position_ids = inputs.get('position_ids')
         padding_free = bool(inputs.pop('padding_free', False))
-        cu_seq_lens_q = inputs.pop('cu_seq_lens_q', None)
-        cu_seq_lens_kv = inputs.pop('cu_seq_lens_kv', None)
-        max_seqlen_q = inputs.pop('max_seqlen_q', None)
-        max_seqlen_kv = inputs.pop('max_seqlen_kv', None)
         real_position_ids = self._extract_real_position_ids(position_ids)
         if real_position_ids is not None and input_ids is not None and real_position_ids.shape[0] == input_ids.shape[0]:
             self.extra_kwargs['position_ids'] = real_position_ids.clone()
         self.extra_kwargs['padding_free'] = padding_free
-        self._update_varlen_metadata(
-            real_position_ids,
-            cu_seq_lens_q=cu_seq_lens_q,
-            cu_seq_lens_kv=cu_seq_lens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv,
-        )
         if input_ids is not None:
             self.extra_kwargs['input_ids'] = input_ids.clone()
         if 'labels' in inputs:
