@@ -1,5 +1,7 @@
 import os
 
+import torch
+import torch.distributed as dist
 import twinkle
 from peft import LoraConfig
 from transformers import AutoConfig
@@ -66,6 +68,29 @@ device_mesh = DeviceMesh.from_sizes(
 debug_log(f'before_twinkle_initialize device_mesh_world_size={device_mesh.world_size}')
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 debug_log('after_twinkle_initialize')
+
+
+def debug_collectives():
+    if os.environ.get('DEBUG_COLLECTIVES', '0') != '1':
+        return
+    if not dist.is_available() or not dist.is_initialized():
+        debug_log('debug_collectives.skip_dist_not_initialized')
+        return
+
+    rank = dist.get_rank()
+    debug_log('debug_collectives.before_broadcast_object_list')
+    obj = [{'rank0': 'ok'}] if rank == 0 else [None]
+    dist.broadcast_object_list(obj, src=0)
+    debug_log(f'debug_collectives.after_broadcast_object_list obj={obj}')
+
+    device = torch.device(Platform.get_local_device())
+    tensor = torch.ones(1, device=device) if rank == 0 else torch.zeros(1, device=device)
+    debug_log('debug_collectives.before_tensor_broadcast')
+    dist.broadcast(tensor, src=0)
+    debug_log(f'debug_collectives.after_tensor_broadcast value={tensor.item()}')
+
+
+debug_collectives()
 
 
 def create_dataset(data_slice=None):
