@@ -142,15 +142,31 @@ def _init_process_group_if_needed(target_world_size: int) -> None:
             f'target-world-size={target_world_size} requires torchrun with WORLD_SIZE={target_world_size}. '
             f'Current WORLD_SIZE={Platform.get_world_size()}.')
     torch_util.set_device()
+    backend = Platform.device_backend()
+    if backend == 'hccl':
+        from twinkle.utils.platforms import ensure_hccl_socket_env
+        master_port = int(os.environ.get('MASTER_PORT', '29500'))
+        ensure_hccl_socket_env(master_port)
+        print(
+            f'{_rank_prefix()} converter.hccl_socket_env '
+            f'HCCL_IF_BASE_PORT={os.environ.get("HCCL_IF_BASE_PORT")} '
+            f'HCCL_HOST_SOCKET_PORT_RANGE={os.environ.get("HCCL_HOST_SOCKET_PORT_RANGE")} '
+            f'HCCL_NPU_SOCKET_PORT_RANGE={os.environ.get("HCCL_NPU_SOCKET_PORT_RANGE")}',
+            flush=True,
+        )
     init_kwargs = {
-        'backend': Platform.device_backend(),
+        'backend': backend,
         'init_method': 'env://',
         'rank': Platform.get_rank(),
         'world_size': Platform.get_world_size(),
     }
-    if Platform.device_backend() in ('nccl', 'hccl'):
+    if backend in ('nccl', 'hccl'):
         init_kwargs['device_id'] = torch.device(Platform.get_local_device())
     dist.init_process_group(**init_kwargs)
+    if backend == 'hccl':
+        default_pg = dist.distributed_c10d._get_default_group()
+        if getattr(default_pg, 'bound_device_id', None) is not None:
+            default_pg.bound_device_id = None
 
 
 def _init_empty_model(config, trust_remote_code: bool):

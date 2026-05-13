@@ -519,14 +519,30 @@ def _load_rank0_full_state_dict(model: nn.Module, full_sd: dict) -> None:
     """Load rank0 full weights into a sharded FSDP2 model via DCP broadcast."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    set_model_state_dict(
-        model=model,
-        model_state_dict=full_sd,
-        options=StateDictOptions(
-            full_state_dict=True,
-            broadcast_from_rank0=True,
-        ),
+    print(
+        f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.start '
+        f'full_sd_keys={len(full_sd)}',
+        flush=True,
     )
+    try:
+        print(f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.before_set_model_state_dict',
+              flush=True)
+        set_model_state_dict(
+            model=model,
+            model_state_dict=full_sd,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+            ),
+        )
+        print(f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.after_set_model_state_dict', flush=True)
+    except Exception as exc:
+        print(
+            f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.error '
+            f'{type(exc).__name__}: {exc}',
+            flush=True,
+        )
+        raise
 
 
 def _get_non_persistent_buffers(model: nn.Module) -> Dict[str, torch.Tensor]:
