@@ -119,9 +119,11 @@ def _save_conversion_metadata(
 def _load_config(source_model_dir: str, args: argparse.Namespace):
     config = AutoConfig.from_pretrained(source_model_dir, trust_remote_code=args.trust_remote_code)
     if args.num_layers is not None and hasattr(config, 'num_hidden_layers'):
+        original_num_layers = config.num_hidden_layers
         config.num_hidden_layers = args.num_layers
-        if hasattr(config, 'layer_types') and config.layer_types is not None:
-            config.layer_types = list(config.layer_types)[:args.num_layers]
+        for name, value in vars(config).items():
+            if isinstance(value, (list, tuple)) and len(value) == original_num_layers:
+                setattr(config, name, list(value)[:args.num_layers])
     if hasattr(config, 'use_cache'):
         config.use_cache = False
     return config
