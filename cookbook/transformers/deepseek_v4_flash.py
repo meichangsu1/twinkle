@@ -90,9 +90,6 @@ def debug_collectives():
     debug_log(f'debug_collectives.after_tensor_broadcast value={tensor.item()}')
 
 
-debug_collectives()
-
-
 def create_dataset(data_slice=None):
     debug_log(f'create_dataset.start data_slice={data_slice}')
     dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=data_slice or range(1000)))
@@ -145,6 +142,7 @@ def train():
         },
     )
     debug_log('after_transformers_model_init')
+    debug_collectives()
 
     lora_config = LoraConfig(r=8, lora_alpha=32, target_modules=LORA_TARGET_MODULES)
     debug_log('before_add_adapter_to_model')
