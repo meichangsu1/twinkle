@@ -5,7 +5,7 @@ import torch.distributed as dist
 import twinkle
 from peft import LoraConfig
 from transformers import AutoConfig
-from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -21,6 +21,8 @@ DATASET_ID = os.environ.get('DATASET_ID', 'ms://swift/self-cognition')
 TEMPLATE_ID = os.environ.get('TEMPLATE_ID', 'DeepseekV4Template')
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
 
+MODEL_GPUS = int(os.environ.get('MODEL_GPUS', os.environ.get('WORLD_SIZE', '4')))
+NPROC_PER_NODE = int(os.environ.get('NPROC_PER_NODE', os.environ.get('LOCAL_WORLD_SIZE', '1')))
 NUM_LAYERS = int(os.environ.get('NUM_LAYERS', '4'))
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '4'))
@@ -59,14 +61,21 @@ debug_log(
     f'CUDA_VISIBLE_DEVICES={os.environ.get("CUDA_VISIBLE_DEVICES")} '
     f'ASCEND_RT_VISIBLE_DEVICES={os.environ.get("ASCEND_RT_VISIBLE_DEVICES")}')
 
+device_type = Platform.get_platform().device_prefix()
+device_groups = [
+    DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type=device_type.upper()),
+]
+
 device_mesh = DeviceMesh.from_sizes(
-    fsdp_size=4,
+    fsdp_size=MODEL_GPUS,
     dp_size=1,
-    device_type=Platform.get_platform().device_prefix(),
+    device_type=device_type,
 )
 
-debug_log(f'before_twinkle_initialize device_mesh_world_size={device_mesh.world_size}')
-twinkle.initialize(mode='local', global_device_mesh=device_mesh)
+debug_log(
+    f'before_twinkle_initialize mode=ray model_gpus={MODEL_GPUS} '
+    f'nproc_per_node={NPROC_PER_NODE} device_mesh_world_size={device_mesh.world_size}')
+twinkle.initialize(mode='ray', nproc_per_node=NPROC_PER_NODE, groups=device_groups)
 debug_log('after_twinkle_initialize')
 
 
@@ -134,6 +143,7 @@ def train():
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
+        remote_group='policy',
         strategy='native_fsdp',
         memory_efficient_init=True,
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
