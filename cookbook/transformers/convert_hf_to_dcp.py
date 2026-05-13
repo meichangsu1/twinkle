@@ -14,6 +14,12 @@ from twinkle.hub import HubOperation
 from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
 from twinkle.utils import DeviceMesh, Platform, torch_util
 
+print(
+    f'[worker-bootstrap] pid={os.getpid()} RANK={os.environ.get("RANK")} '
+    f'LOCAL_RANK={os.environ.get("LOCAL_RANK")} WORLD_SIZE={os.environ.get("WORLD_SIZE")}',
+    flush=True,
+)
+
 
 def _rank_prefix() -> str:
     if dist.is_available() and dist.is_initialized():
@@ -114,6 +120,8 @@ def _load_config(source_model_dir: str, args: argparse.Namespace):
     config = AutoConfig.from_pretrained(source_model_dir, trust_remote_code=args.trust_remote_code)
     if args.num_layers is not None and hasattr(config, 'num_hidden_layers'):
         config.num_hidden_layers = args.num_layers
+        if hasattr(config, 'layer_types') and config.layer_types is not None:
+            config.layer_types = list(config.layer_types)[:args.num_layers]
     if hasattr(config, 'use_cache'):
         config.use_cache = False
     return config
