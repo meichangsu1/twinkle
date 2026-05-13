@@ -13,6 +13,12 @@ if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
 
 
+def _debug_rank_prefix() -> str:
+    if dist.is_available() and dist.is_initialized():
+        return f'[rank{dist.get_rank()}]'
+    return '[rank?]'
+
+
 class NativeFSDPStrategy:
 
     def __init__(self,
@@ -66,6 +72,8 @@ class NativeFSDPStrategy:
                 _unbind_optimizer_params(optimizer)
 
             use_meta = self.use_rank0_pretrained_broadcast() and not ep_enabled
+            print(f'{_debug_rank_prefix()} native_fsdp.wrap_model start use_meta={use_meta} ep_enabled={ep_enabled}',
+                  flush=True)
 
             original_sd = None
             saved_buffers = None
@@ -125,6 +133,7 @@ class NativeFSDPStrategy:
                 )
                 layer_mod._fsdp_modules.append(layer_mod)
 
+            print(f'{_debug_rank_prefix()} native_fsdp.before_fully_shard_root', flush=True)
             fully_shard(
                 model,
                 mesh=fsdp_mesh,
@@ -132,12 +141,17 @@ class NativeFSDPStrategy:
                 mp_policy=mp_policy,
                 ignored_params=expert_params,
             )
+            print(f'{_debug_rank_prefix()} native_fsdp.after_fully_shard_root', flush=True)
 
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
+                print(f'{_debug_rank_prefix()} native_fsdp.before_set_model_state_dict', flush=True)
                 _load_rank0_full_state_dict(model, original_sd or {})
+                print(f'{_debug_rank_prefix()} native_fsdp.after_set_model_state_dict', flush=True)
                 target_device = torch.device(device_type)
+                print(f'{_debug_rank_prefix()} native_fsdp.before_non_persistent_buffers', flush=True)
                 _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
+                print(f'{_debug_rank_prefix()} native_fsdp.after_non_persistent_buffers', flush=True)
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
