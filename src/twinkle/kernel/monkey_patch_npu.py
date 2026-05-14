@@ -173,9 +173,23 @@ def _npu_sparse_attn_shared_kv(query: torch.Tensor, ori_kv: torch.Tensor, cmp_kv
     return output.transpose(1, 2).contiguous()  # [B, H, S, D]
 
 
+def _align_npu_tensor_format(tensor: torch.Tensor, ref_tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != 'npu' or ref_tensor.device.type != 'npu':
+        return tensor
+    try:
+        ref_format = torch_npu.get_npu_format(ref_tensor)
+        tensor = torch_npu.npu_format_cast(tensor, ref_format)
+    except Exception:
+        pass
+    return tensor.contiguous()
+
+
 def apply_deepseek_v4_indexer_capture_patch():
     try:
-        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+            DeepseekV4Indexer,
+            apply_rotary_pos_emb,
+        )
     except Exception as exc:
         print(f'[PATCH] skip DeepseekV4Indexer capture patch: {exc}')
         return
@@ -186,15 +200,121 @@ def apply_deepseek_v4_indexer_capture_patch():
     old_forward = DeepseekV4Indexer.forward
 
     @functools.wraps(old_forward)
-    def new_forward(self, *args, **kwargs):
-        indices = old_forward(self, *args, **kwargs)
-        self._twinkle_last_top_k_indices = indices
-        return indices
+    def new_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx):
+        if (
+            hidden_states.device.type != 'npu'
+            or past_key_values is not None
+            or getattr(self, '_twinkle_npu_li_disabled', False)
+        ):
+            indices = old_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx)
+            self._twinkle_last_top_k_indices = indices
+            return indices
+
+        try:
+            import mindspeed.ops.npu_lightning_indexer as mindspeed_li
+
+            batch, seq_len, _ = hidden_states.shape
+            cache_layer = past_key_values.layers[layer_idx] if past_key_values is not None else None
+            kv = self.kv_proj(hidden_states)
+            gate = self.gate_proj(hidden_states)
+
+            if cache_layer is None:
+                usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+                chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
+            else:
+                chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights(
+                    'indexer', kv, gate
+                )
+
+            if chunk_kv.shape[1] > 0:
+                n_windows = chunk_kv.shape[1] // self.compress_rate
+                ratio = self.compress_rate
+                chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
+                chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
+
+                new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
+                new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float('-inf'))
+                new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim:]
+                new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim:]
+                if n_windows > 1:
+                    new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, :self.head_dim]
+                    new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, :self.head_dim]
+                if cache_layer is not None:
+                    prior_kv, prior_gate = cache_layer.update_overlap_state(
+                        'indexer', chunk_kv, chunk_gate, self.head_dim
+                    )
+                    if prior_kv is not None:
+                        new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+                        new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+
+                compressed = self.kv_norm(
+                    (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
+                )
+                positions = torch.arange(n_windows, device=compressed.device)
+                positions = positions * self.compress_rate + first_window_position
+                positions = positions.unsqueeze(0).expand(batch, -1)
+                cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
+                compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+            else:
+                compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+            compressed_kv = (
+                compressed if cache_layer is None else cache_layer.update_compressor_states('indexer', compressed)
+            )
+            compressed_len = compressed_kv.shape[1]
+            if compressed_len == 0:
+                indices = old_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx)
+                self._twinkle_last_top_k_indices = indices
+                return indices
+
+            cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
+            q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+            q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+            weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+
+            top_k_indices, index_score = mindspeed_li.npu_lightning_indexer(
+                q.to(torch.bfloat16),
+                compressed_kv.to(torch.bfloat16).unsqueeze(2),
+                weights.to(torch.bfloat16),
+                sparse_count=min(self.index_topk, compressed_len),
+                sparse_mode=3,
+                cmp_ratio=self.compress_rate,
+            )
+            top_k_indices = top_k_indices.squeeze(2)
+            index_score = index_score.squeeze(2)
+
+            causal_threshold = (position_ids + 1) // self.compress_rate
+            invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+            top_k_indices = torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+
+            if not getattr(self, '_twinkle_npu_li_logged', False):
+                self._twinkle_npu_li_logged = True
+                print(
+                    '[PATCH] DeepSeek V4 NPU Lightning Indexer used: '
+                    f'layer_idx={layer_idx}, '
+                    f'q={tuple(q.shape)}, compressed_kv={tuple(compressed_kv.shape)}, '
+                    f'top_k_indices={tuple(top_k_indices.shape)}',
+                    flush=True,
+                )
+
+            self._twinkle_last_top_k_indices = top_k_indices
+            self._twinkle_last_index_score = index_score
+            return top_k_indices
+        except Exception as exc:
+            self._twinkle_npu_li_disabled = True
+            indices = old_forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx)
+            self._twinkle_last_top_k_indices = indices
+            print(
+                '[PATCH] DeepSeek V4 NPU Lightning Indexer fallback to HF indexer: '
+                f'layer_idx={layer_idx}, error={type(exc).__name__}: {exc}',
+                flush=True,
+            )
+            return indices
 
     new_forward._twinkle_npu_patched = True
     new_forward._twinkle_old_forward = old_forward
     DeepseekV4Indexer.forward = new_forward
-    print('[PATCH] DeepseekV4Indexer.forward captures top_k_indices')
+    print('[PATCH] DeepseekV4Indexer.forward -> NPU Lightning Indexer with HF fallback')
 
 
 def apply_deepseek_v4_sfa_attention_patch():
@@ -212,6 +332,11 @@ def apply_deepseek_v4_sfa_attention_patch():
 
     if getattr(DeepseekV4Attention.forward, '_twinkle_npu_patched', False):
         return
+
+    def _shape_dtype(x):
+        if x is None:
+            return None
+        return {'shape': tuple(x.shape), 'dtype': str(x.dtype), 'device': str(x.device)}
 
     def _get_position_cos_sin(self, position_embeddings):
         if isinstance(position_embeddings, dict):
@@ -284,14 +409,42 @@ def apply_deepseek_v4_sfa_attention_patch():
                     cmp_ratio=_get_compress_ratio(self),
                     sliding_window=self.sliding_window,
                 )
+                if not getattr(self, '_twinkle_npu_sfa_logged', False):
+                    self._twinkle_npu_sfa_logged = True
+                    print(
+                        '[PATCH] DeepSeek V4 NPU SFA used: '
+                        f'layer_idx={getattr(self, "layer_idx", None)}, '
+                        f'q={tuple(q.shape)}, ori_kv={tuple(ori_kv.shape)}, '
+                        f'compressed_kv={tuple(compressed_kv.shape)}, '
+                        f'top_k_indices={tuple(top_k_indices.shape)}',
+                        flush=True,
+                    )
                 attn_weights = None
             except Exception as exc:
                 self._twinkle_npu_sfa_disabled = True
-                print(f'[PATCH] DeepSeek V4 NPU SFA fallback to HF attention: {exc}')
+                print(
+                    '[PATCH] DeepSeek V4 NPU SFA fallback to HF attention: '
+                    f'layer_idx={getattr(self, "layer_idx", None)}, '
+                    f'layer_type={getattr(self, "layer_type", None)}, '
+                    f'cmp_ratio={_get_compress_ratio(self)}, '
+                    f'sliding_window={getattr(self, "sliding_window", None)}, '
+                    f'q={_shape_dtype(q)}, '
+                    f'ori_kv={_shape_dtype(ori_kv)}, '
+                    f'compressed_kv={_shape_dtype(compressed_kv)}, '
+                    f'top_k_indices={_shape_dtype(top_k_indices)}, '
+                    f'sinks={_shape_dtype(self.sinks)}, '
+                    f'error={type(exc).__name__}: {exc}',
+                    flush=True,
+                )
                 use_npu_sfa = False
 
         if not use_npu_sfa:
-            kv = ori_kv if compressed_kv is None else torch.cat([ori_kv, compressed_kv], dim=2)
+            if compressed_kv is not None:
+                ori_kv = _align_npu_tensor_format(ori_kv, ori_kv)
+                compressed_kv = _align_npu_tensor_format(compressed_kv, ori_kv)
+                kv = torch.cat([ori_kv, compressed_kv], dim=2)
+            else:
+                kv = ori_kv
 
             if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
                 if block_bias is not None:
