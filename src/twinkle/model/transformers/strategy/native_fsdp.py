@@ -19,6 +19,44 @@ def _debug_rank_prefix() -> str:
     return '[rank?]'
 
 
+def _format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if abs(value) < 1024.0 or unit == 'TiB':
+            return f'{value:.2f}{unit}'
+        value /= 1024.0
+
+
+def _device_memory_stats() -> Dict[str, int]:
+    if torch.cuda.is_available():
+        return {
+            'allocated': torch.cuda.memory_allocated(),
+            'reserved': torch.cuda.memory_reserved(),
+            'max_allocated': torch.cuda.max_memory_allocated(),
+            'max_reserved': torch.cuda.max_memory_reserved(),
+        }
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return {
+            'allocated': torch.npu.memory_allocated(),
+            'reserved': torch.npu.memory_reserved(),
+            'max_allocated': torch.npu.max_memory_allocated(),
+            'max_reserved': torch.npu.max_memory_reserved(),
+        }
+    return {'allocated': 0, 'reserved': 0, 'max_allocated': 0, 'max_reserved': 0}
+
+
+def _debug_memory(tag: str) -> None:
+    stats = _device_memory_stats()
+    print(
+        f'{_debug_rank_prefix()} native_fsdp.memory.{tag} '
+        f'allocated={_format_bytes(stats["allocated"])} '
+        f'reserved={_format_bytes(stats["reserved"])} '
+        f'max_allocated={_format_bytes(stats["max_allocated"])} '
+        f'max_reserved={_format_bytes(stats["max_reserved"])}',
+        flush=True,
+    )
+
+
 class NativeFSDPStrategy:
 
     def __init__(self,
@@ -74,6 +112,7 @@ class NativeFSDPStrategy:
             use_meta = self.use_rank0_pretrained_broadcast() and not ep_enabled
             print(f'{_debug_rank_prefix()} native_fsdp.wrap_model start use_meta={use_meta} ep_enabled={ep_enabled}',
                   flush=True)
+            _debug_memory('wrap_model_start')
 
             original_sd = None
             saved_buffers = None
@@ -84,10 +123,13 @@ class NativeFSDPStrategy:
                 model = model.to(torch.device('meta'))
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
+                _debug_memory('after_to_meta')
 
             if ep_enabled:
+                _debug_memory('before_ep_prepare')
                 _ensure_moe_patched_if_needed(model, self.ep_fsdp_device_mesh)
                 _place_ep_experts_on_local_device(model, self.ep_fsdp_device_mesh)
+                _debug_memory('after_ep_prepare')
             mp_policy = _build_mp_policy(self.mixed_precision)
             reshard_after_forward = self.fsdp_config.get('reshard_after_forward', True)
 
@@ -107,7 +149,7 @@ class NativeFSDPStrategy:
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
-            for layer_mod, experts_mod in layer_pairs:
+            for layer_idx, (layer_mod, experts_mod) in enumerate(layer_pairs):
                 layer_mod._fsdp_modules = []
 
                 if experts_mod is not None and ep_fsdp_mesh_1d is not None:
@@ -121,9 +163,17 @@ class NativeFSDPStrategy:
                         mp_policy=ep_mp_policy,
                         shard_placement_fn=lambda param: Shard(1),
                     )
-                    experts_mod.set_gradient_divide_factor(world_size)
+                    if hasattr(experts_mod, 'set_gradient_divide_factor'):
+                        experts_mod.set_gradient_divide_factor(world_size)
+                    else:
+                        print(
+                            f'{_debug_rank_prefix()} native_fsdp.skip_set_gradient_divide_factor '
+                            f'experts_type={type(experts_mod).__name__}',
+                            flush=True,
+                        )
                     layer_mod._fsdp_modules.append(experts_mod)
 
+                _debug_memory(f'before_fully_shard_layer_{layer_idx}')
                 fully_shard(
                     layer_mod,
                     mesh=fsdp_mesh,
@@ -131,9 +181,11 @@ class NativeFSDPStrategy:
                     mp_policy=mp_policy,
                     ignored_params=expert_params,
                 )
+                _debug_memory(f'after_fully_shard_layer_{layer_idx}')
                 layer_mod._fsdp_modules.append(layer_mod)
 
             print(f'{_debug_rank_prefix()} native_fsdp.before_fully_shard_root', flush=True)
+            _debug_memory('before_fully_shard_root')
             fully_shard(
                 model,
                 mesh=fsdp_mesh,
@@ -142,16 +194,21 @@ class NativeFSDPStrategy:
                 ignored_params=expert_params,
             )
             print(f'{_debug_rank_prefix()} native_fsdp.after_fully_shard_root', flush=True)
+            _debug_memory('after_fully_shard_root')
 
             if use_meta:
                 device_type = self.device_mesh.device_type or 'cuda'
                 print(f'{_debug_rank_prefix()} native_fsdp.before_set_model_state_dict', flush=True)
+                _debug_memory('before_set_model_state_dict')
                 _load_rank0_full_state_dict(model, original_sd or {})
                 print(f'{_debug_rank_prefix()} native_fsdp.after_set_model_state_dict', flush=True)
+                _debug_memory('after_set_model_state_dict')
                 target_device = torch.device(device_type)
                 print(f'{_debug_rank_prefix()} native_fsdp.before_non_persistent_buffers', flush=True)
+                _debug_memory('before_non_persistent_buffers')
                 _broadcast_non_persistent_buffers(model, saved_buffers or {}, device=target_device)
                 print(f'{_debug_rank_prefix()} native_fsdp.after_non_persistent_buffers', flush=True)
+                _debug_memory('after_non_persistent_buffers')
                 if hasattr(model, 'tie_weights'):
                     model.tie_weights()
 
@@ -524,9 +581,11 @@ def _load_rank0_full_state_dict(model: nn.Module, full_sd: dict) -> None:
         f'full_sd_keys={len(full_sd)}',
         flush=True,
     )
+    _debug_memory('_load_rank0_full_state_dict_start')
     try:
         print(f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.before_set_model_state_dict',
               flush=True)
+        _debug_memory('_load_rank0_full_state_dict_before_set')
         set_model_state_dict(
             model=model,
             model_state_dict=full_sd,
@@ -536,6 +595,7 @@ def _load_rank0_full_state_dict(model: nn.Module, full_sd: dict) -> None:
             ),
         )
         print(f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.after_set_model_state_dict', flush=True)
+        _debug_memory('_load_rank0_full_state_dict_after_set')
     except Exception as exc:
         print(
             f'{_debug_rank_prefix()} native_fsdp._load_rank0_full_state_dict.error '
