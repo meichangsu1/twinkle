@@ -114,7 +114,12 @@ def debug_trainable_parameters(model):
 
     items = []
     total = 0
-    for name, param in module.named_parameters():
+    try:
+        named_parameters = list(module.named_parameters())
+    except AttributeError as exc:
+        debug_log(f'trainable_params.skip named_parameters_failed={type(exc).__name__}: {exc}')
+        return
+    for name, param in named_parameters:
         if not param.requires_grad:
             continue
         shape = tuple(param.shape)
@@ -137,6 +142,8 @@ def _unwrap_torch_module(model):
     if hasattr(module, 'get_base_model'):
         module = module.get_base_model()
     if not isinstance(module, torch.nn.Module):
+        return None
+    if not all(hasattr(module, attr) for attr in ('_parameters', '_modules', '_buffers')):
         return None
     return module
 
