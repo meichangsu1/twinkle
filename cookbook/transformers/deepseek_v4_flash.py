@@ -6,7 +6,7 @@ import torch.distributed as dist
 import twinkle
 from peft import LoraConfig
 from transformers import AutoConfig
-from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
+from twinkle import DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -66,10 +66,6 @@ debug_log(
     f'ASCEND_RT_VISIBLE_DEVICES={os.environ.get("ASCEND_RT_VISIBLE_DEVICES")}')
 
 device_type = Platform.get_platform().device_prefix()
-device_groups = [
-    DeviceGroup(name='policy', ranks=list(range(MODEL_GPUS)), device_type=device_type.upper()),
-]
-
 device_mesh = DeviceMesh.from_sizes(
     fsdp_size=MODEL_GPUS,
     dp_size=1,
@@ -77,9 +73,9 @@ device_mesh = DeviceMesh.from_sizes(
 )
 
 debug_log(
-    f'before_twinkle_initialize mode=ray model_gpus={MODEL_GPUS} '
+    f'before_twinkle_initialize mode=local model_gpus={MODEL_GPUS} '
     f'nproc_per_node={NPROC_PER_NODE} device_mesh_world_size={device_mesh.world_size}')
-twinkle.initialize(mode='ray', nproc_per_node=NPROC_PER_NODE, groups=device_groups)
+twinkle.initialize(mode='local', nproc_per_node=NPROC_PER_NODE, global_device_mesh=device_mesh)
 debug_log('after_twinkle_initialize')
 
 
@@ -174,11 +170,27 @@ def _memory_allocated():
     return 0
 
 
+def _memory_reserved():
+    if torch.cuda.is_available():
+        return torch.cuda.memory_reserved()
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return torch.npu.memory_reserved()
+    return 0
+
+
 def _max_memory_allocated():
     if torch.cuda.is_available():
         return torch.cuda.max_memory_allocated()
     if hasattr(torch, 'npu') and torch.npu.is_available():
         return torch.npu.max_memory_allocated()
+    return 0
+
+
+def _max_memory_reserved():
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_reserved()
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return torch.npu.max_memory_reserved()
     return 0
 
 
@@ -235,25 +247,33 @@ def register_decoder_layer_memory_debugger(model):
         if state['step'] >= DEBUG_LAYER_MEMORY_STEPS:
             return
         state['before_allocated'] = _memory_allocated()
+        state['before_reserved'] = _memory_reserved()
         _reset_peak_memory_stats()
         debug_log(
             f'layer_memory.step_{state["step"]}.before_forward '
             f'input_tensor_bytes={_format_bytes(_tensor_nbytes(inputs))} '
-            f'allocated={_format_bytes(state["before_allocated"])}')
+            f'allocated={_format_bytes(state["before_allocated"])} '
+            f'reserved={_format_bytes(state["before_reserved"])}')
 
     def post_hook(_module, inputs, output):
         if state['step'] >= DEBUG_LAYER_MEMORY_STEPS:
             return
         after_allocated = _memory_allocated()
+        after_reserved = _memory_reserved()
         peak_allocated = _max_memory_allocated()
+        peak_reserved = _max_memory_reserved()
         before_allocated = state.get('before_allocated', after_allocated)
+        before_reserved = state.get('before_reserved', after_reserved)
         debug_log(
             f'layer_memory.step_{state["step"]}.after_forward '
             f'input_tensor_bytes={_format_bytes(_tensor_nbytes(inputs))} '
             f'output_tensor_bytes={_format_bytes(_tensor_nbytes(output))} '
             f'allocated_delta={_format_bytes(after_allocated - before_allocated)} '
             f'peak_delta={_format_bytes(peak_allocated - before_allocated)} '
-            f'allocated={_format_bytes(after_allocated)}')
+            f'reserved_delta={_format_bytes(after_reserved - before_reserved)} '
+            f'peak_reserved_delta={_format_bytes(peak_reserved - before_reserved)} '
+            f'allocated={_format_bytes(after_allocated)} '
+            f'reserved={_format_bytes(after_reserved)}')
 
     handles = [
         layer.register_forward_pre_hook(pre_hook),
@@ -306,7 +326,6 @@ def train():
         model_id=MODEL_ID,
         config=config,
         device_mesh=device_mesh,
-        remote_group='policy',
         strategy='native_fsdp',
         memory_efficient_init=True,
         ignore_mismatched_sizes=IGNORE_MISMATCHED_SIZES,
