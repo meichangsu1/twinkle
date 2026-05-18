@@ -1,4 +1,5 @@
 import os
+import hashlib
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,9 @@ SAVE_STEPS = int(os.environ.get('SAVE_STEPS', '50'))
 RESHARD_AFTER_FORWARD = os.environ.get('RESHARD_AFTER_FORWARD', '1') == '1'
 GRADIENT_CHECKPOINTING = True
 IGNORE_MISMATCHED_SIZES = False
+DEBUG_LAYER_MEMORY = os.environ.get('DEBUG_LAYER_MEMORY', '0') == '1'
+DEBUG_LAYER_MEMORY_STEPS = int(os.environ.get('DEBUG_LAYER_MEMORY_STEPS', '1'))
+DEBUG_LAYER_MEMORY_INDEX = int(os.environ.get('DEBUG_LAYER_MEMORY_INDEX', '0'))
 LORA_TARGET_MODULES = [
     'q_a_proj',
     'q_b_proj',
@@ -99,6 +103,147 @@ def debug_collectives():
     debug_log(f'debug_collectives.after_tensor_broadcast value={tensor.item()}')
 
 
+def debug_trainable_parameters(model):
+    if os.environ.get('DEBUG_TRAINABLE_PARAMS', '1') != '1':
+        return
+
+    module = getattr(model, 'model', model)
+    items = []
+    total = 0
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        shape = tuple(param.shape)
+        numel = param.numel()
+        items.append((name, shape, numel, str(param.dtype), str(param.device)))
+        total += numel
+
+    digest = hashlib.sha256(
+        '\n'.join(f'{name}|{shape}|{numel}|{dtype}' for name, shape, numel, dtype, _ in items).encode()
+    ).hexdigest()[:16]
+    debug_log(f'trainable_params.count={len(items)} total_numel={total} digest={digest}')
+
+    if os.environ.get('DEBUG_TRAINABLE_PARAM_DETAIL', '1') == '1':
+        for name, shape, numel, dtype, device in items:
+            debug_log(f'trainable_param name={name} shape={shape} numel={numel} dtype={dtype} device={device}')
+
+
+def _format_bytes(num_bytes):
+    num_bytes = float(num_bytes)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if abs(num_bytes) < 1024.0 or unit == 'TiB':
+            return f'{num_bytes:.2f}{unit}'
+        num_bytes /= 1024.0
+
+
+def _tensor_nbytes(value):
+    if torch.is_tensor(value):
+        return value.numel() * value.element_size()
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_nbytes(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_tensor_nbytes(item) for item in value.values())
+    return 0
+
+
+def _memory_allocated():
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated()
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return torch.npu.memory_allocated()
+    return 0
+
+
+def _max_memory_allocated():
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated()
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return torch.npu.max_memory_allocated()
+    return 0
+
+
+def _reset_peak_memory_stats():
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    elif hasattr(torch, 'npu') and torch.npu.is_available():
+        torch.npu.reset_peak_memory_stats()
+
+
+def _find_decoder_layers(root):
+    for name, module in root.named_modules():
+        if name.endswith('model.layers') and isinstance(module, torch.nn.ModuleList):
+            return name, module
+    for name, module in root.named_modules():
+        if name.endswith('layers') and isinstance(module, torch.nn.ModuleList):
+            return name, module
+    return None, None
+
+
+def register_decoder_layer_memory_debugger(model):
+    if not DEBUG_LAYER_MEMORY:
+        return None
+
+    root = getattr(model, 'model', model)
+    if hasattr(root, 'get_base_model'):
+        root = root.get_base_model()
+    if not isinstance(root, torch.nn.Module):
+        debug_log(f'layer_memory.skip root_type={type(root).__name__}')
+        return None
+
+    layers_name, layers = _find_decoder_layers(root)
+    if layers is None:
+        debug_log('layer_memory.skip decoder_layers_not_found')
+        return None
+    if DEBUG_LAYER_MEMORY_INDEX >= len(layers):
+        debug_log(f'layer_memory.skip layer_index={DEBUG_LAYER_MEMORY_INDEX} num_layers={len(layers)}')
+        return None
+
+    layer = layers[DEBUG_LAYER_MEMORY_INDEX]
+    param_bytes = sum(param.numel() * param.element_size() for param in layer.parameters(recurse=True))
+    trainable_param_bytes = sum(
+        param.numel() * param.element_size() for param in layer.parameters(recurse=True) if param.requires_grad
+    )
+    param_numel = sum(param.numel() for param in layer.parameters(recurse=True))
+    trainable_param_numel = sum(param.numel() for param in layer.parameters(recurse=True) if param.requires_grad)
+    debug_log(
+        f'layer_memory.layer={layers_name}.{DEBUG_LAYER_MEMORY_INDEX} '
+        f'param_numel={param_numel} param_bytes={_format_bytes(param_bytes)} '
+        f'trainable_param_numel={trainable_param_numel} '
+        f'trainable_param_bytes={_format_bytes(trainable_param_bytes)}')
+
+    state = {'step': 0}
+
+    def pre_hook(_module, inputs):
+        if state['step'] >= DEBUG_LAYER_MEMORY_STEPS:
+            return
+        state['before_allocated'] = _memory_allocated()
+        _reset_peak_memory_stats()
+        debug_log(
+            f'layer_memory.step_{state["step"]}.before_forward '
+            f'input_tensor_bytes={_format_bytes(_tensor_nbytes(inputs))} '
+            f'allocated={_format_bytes(state["before_allocated"])}')
+
+    def post_hook(_module, inputs, output):
+        if state['step'] >= DEBUG_LAYER_MEMORY_STEPS:
+            return
+        after_allocated = _memory_allocated()
+        peak_allocated = _max_memory_allocated()
+        before_allocated = state.get('before_allocated', after_allocated)
+        debug_log(
+            f'layer_memory.step_{state["step"]}.after_forward '
+            f'input_tensor_bytes={_format_bytes(_tensor_nbytes(inputs))} '
+            f'output_tensor_bytes={_format_bytes(_tensor_nbytes(output))} '
+            f'allocated_delta={_format_bytes(after_allocated - before_allocated)} '
+            f'peak_delta={_format_bytes(peak_allocated - before_allocated)} '
+            f'allocated={_format_bytes(after_allocated)}')
+
+    handles = [
+        layer.register_forward_pre_hook(pre_hook),
+        layer.register_forward_hook(post_hook),
+    ]
+    return state, handles
+
+
 def create_dataset(data_slice=None):
     debug_log(f'create_dataset.start data_slice={data_slice}')
     dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID, data_slice=data_slice or range(1000)))
@@ -158,6 +303,7 @@ def train():
     debug_log('before_add_adapter_to_model')
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
     debug_log('after_add_adapter_to_model')
+    debug_trainable_parameters(model)
 
     if not GRADIENT_CHECKPOINTING:
         model.model.gradient_checkpointing_disable()
@@ -187,6 +333,7 @@ def train():
         f'gradient_checkpointing={GRADIENT_CHECKPOINTING}, '
         f'reshard_after_forward={RESHARD_AFTER_FORWARD}, '
         f'lora_target_modules={LORA_TARGET_MODULES}')
+    layer_memory_debug = register_decoder_layer_memory_debugger(model)
 
     best_loss = float('inf')
     for step, batch in enumerate(dataloader):
@@ -196,6 +343,8 @@ def train():
             debug_log(f'step_{step}.before_call_batch')
             batch = batch()
             debug_log(f'step_{step}.after_call_batch')
+        if layer_memory_debug is not None:
+            layer_memory_debug[0]['step'] = step
         debug_log(f'step_{step}.before_forward_backward')
         model.forward_backward(
             inputs=batch,
