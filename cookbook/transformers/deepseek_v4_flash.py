@@ -107,7 +107,11 @@ def debug_trainable_parameters(model):
     if os.environ.get('DEBUG_TRAINABLE_PARAMS', '1') != '1':
         return
 
-    module = getattr(model, 'model', model)
+    module = _unwrap_torch_module(model)
+    if module is None:
+        debug_log(f'trainable_params.skip model_type={type(model).__name__}')
+        return
+
     items = []
     total = 0
     for name, param in module.named_parameters():
@@ -126,6 +130,15 @@ def debug_trainable_parameters(model):
     if os.environ.get('DEBUG_TRAINABLE_PARAM_DETAIL', '1') == '1':
         for name, shape, numel, dtype, device in items:
             debug_log(f'trainable_param name={name} shape={shape} numel={numel} dtype={dtype} device={device}')
+
+
+def _unwrap_torch_module(model):
+    module = getattr(model, 'model', model)
+    if hasattr(module, 'get_base_model'):
+        module = module.get_base_model()
+    if not isinstance(module, torch.nn.Module):
+        return None
+    return module
 
 
 def _format_bytes(num_bytes):
@@ -183,11 +196,9 @@ def register_decoder_layer_memory_debugger(model):
     if not DEBUG_LAYER_MEMORY:
         return None
 
-    root = getattr(model, 'model', model)
-    if hasattr(root, 'get_base_model'):
-        root = root.get_base_model()
-    if not isinstance(root, torch.nn.Module):
-        debug_log(f'layer_memory.skip root_type={type(root).__name__}')
+    root = _unwrap_torch_module(model)
+    if root is None:
+        debug_log(f'layer_memory.skip model_type={type(model).__name__}')
         return None
 
     layers_name, layers = _find_decoder_layers(root)
