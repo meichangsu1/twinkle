@@ -238,7 +238,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function(collect='first')
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        with self.multi_adapter.save_context(kwargs.get('adapter_name')) as state_adapter_name:
+            kwargs['_state_adapter_name'] = state_adapter_name
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
         if dist.is_initialized():
             dist.barrier()

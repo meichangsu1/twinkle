@@ -897,6 +897,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 save_optimizer: Whether to save optimizer state.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        state_adapter_name = kwargs.pop('_state_adapter_name', adapter_name)
         optimizer_config = self.optimizer_group[adapter_name]
         if name is None:
             name = f'checkpoint-step-{optimizer_config.cur_step}'
@@ -913,8 +914,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
             # LoRA adapter save. Avoid collecting the full base model for large FSDP/EP jobs.
-            adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
-            adapter_suffix = f'.{adapter_name}.'
+            adapter_state = self.strategy.get_adapter_state_dict(self.model, state_adapter_name)
+            adapter_suffix = f'.{state_adapter_name}.'
             for key, value in adapter_state.items():
                 normalized = key.replace(adapter_suffix, '.')
                 processed_state_dict[normalized] = value
