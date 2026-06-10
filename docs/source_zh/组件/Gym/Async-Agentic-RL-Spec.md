@@ -64,7 +64,7 @@ flowchart LR
     Trainer --> Sync["Checkpoint Engine<br/>update rollout weights"]
     Sync --> Rollout
 
-    Manager["Stateless RLFlowManager<br/>sync/async policy + backpressure"] -. permits / polling .-> Rollout
+    Manager["StatelessRLManager<br/>sync/async policy + backpressure"] -. permits / polling .-> Rollout
     Manager -. permits / polling .-> Reward
     Manager -. permits / polling .-> Advantage
     Manager -. permits / polling .-> Trainer
@@ -73,19 +73,34 @@ flowchart LR
 
 ## 类设计
 
-本设计在现有 Twinkle 组件外部增加 adapter 和 flow manager，不新增 rollout 算法。
+本设计在现有 Twinkle 组件外部增加 `BaseRLPipeline`、`TransferQueueClient` 和 stateless manager，不新增 rollout 算法。
 
 ```mermaid
 classDiagram
-    class RLFlowManager {
+    class BaseRLPipeline {
+        +PipelineConfig config
+        +TransferQueueClient queue
+        +StatelessRLManager manager
+        +build_components() None
+        +allocate_resources() None
+        +create_roles() None
+        +run() None
+        +shutdown() None
+    }
+
+    class StatelessRLManager {
         +RLMode mode
         +BackpressurePolicy policy
-        +acquire_rollout_budget(policy_version, target_samples) int
-        +can_run_reward(partition_id) bool
-        +can_run_advantage(partition_id) bool
-        +can_train(partition_id, required_fields, batch_size) bool
-        +on_train_step_end(partition_id, batch_meta, metrics) None
-        +should_sync_weights(trainer_step, policy_version) bool
+        +int trainer_policy_version
+        +int rollout_policy_version
+        +on_pipeline_start(snapshot) FlowDecision
+        +on_queue_snapshot(snapshot) FlowDecision
+        +on_before_rollout(snapshot) int
+        +on_rollout_done(batch_meta) FlowDecision
+        +on_before_train(snapshot) bool
+        +on_train_step_end(partition_id, batch_meta, metrics) FlowDecision
+        +on_parameter_sync_due(snapshot) FlowDecision
+        +on_parameter_synced(policy_version) None
     }
 
     class BackpressurePolicy {
@@ -99,7 +114,7 @@ classDiagram
         +decide(snapshot) FlowDecision
     }
 
-    class TransferQueueAdapter {
+    class TransferQueueClient {
         +put_rollout(samples, partition_id) BatchMeta
         +get_reward_batch(partition_id, batch_size) tuple
         +put_rewards(meta, rewards, reward_info) None
@@ -112,43 +127,143 @@ classDiagram
 
     class RolloutWorker {
         +Rollout rollout
-        +TransferQueueAdapter queue
+        +TransferQueueClient queue
         +run_once(train_k, prompts, policy_version) None
     }
 
     class RewardWorker {
         +Reward reward_fn
-        +TransferQueueAdapter queue
+        +TransferQueueClient queue
         +run_once(partition_id) None
     }
 
     class AdvantageWorker {
         +GRPOAdvantage advantage_fn
-        +TransferQueueAdapter queue
+        +TransferQueueClient queue
         +run_once(partition_id) None
     }
 
     class TrainerWorker {
         +TransformersModel model
-        +TransferQueueAdapter queue
+        +TransferQueueClient queue
         +train_once(partition_id) dict
     }
 
-    RLFlowManager --> BackpressurePolicy
-    RLFlowManager --> TransferQueueAdapter : reads metadata only
-    RolloutWorker --> TransferQueueAdapter : writes rollout fields
-    RewardWorker --> TransferQueueAdapter : appends rewards
-    AdvantageWorker --> TransferQueueAdapter : appends advantages
-    TrainerWorker --> TransferQueueAdapter : consumes train fields
+    BaseRLPipeline --> StatelessRLManager
+    BaseRLPipeline --> TransferQueueClient
+    BaseRLPipeline --> RolloutWorker
+    BaseRLPipeline --> RewardWorker
+    BaseRLPipeline --> AdvantageWorker
+    BaseRLPipeline --> TrainerWorker
+    StatelessRLManager --> BackpressurePolicy
+    StatelessRLManager --> TransferQueueClient : reads metadata only
+    RolloutWorker --> TransferQueueClient : writes rollout fields
+    RewardWorker --> TransferQueueClient : appends rewards
+    AdvantageWorker --> TransferQueueClient : appends advantages
+    TrainerWorker --> TransferQueueClient : consumes train fields
     RolloutWorker --> Rollout : reuses existing rollout
     RewardWorker --> Reward : task-defined reward
     AdvantageWorker --> GRPOAdvantage
     TrainerWorker --> TransformersModel
 ```
 
-`TransferQueueAdapter` 是 Twinkle 侧的封装层。它隐藏底层到底使用 TransferQueue native `put/get_meta/get_data`、KV API，还是 `StreamingDataset`。这样算法代码不依赖 TransferQueue 的具体 API 细节。
+`BaseRLPipeline` 是训练入口。它负责从 YAML 读取配置、初始化组件、分配资源、创建角色、启动训练循环和关闭资源。用户如果要实现新的 RL 流程，应优先继承 `BaseRLPipeline`，覆盖组件构造或少量阶段方法，而不是修改 TransferQueue 或 `MultiTurnRollout`。
 
-`RLFlowManager` 在 sample payload 维度是 stateless 的。它可以保存少量运行时计数，例如当前 `train_k`、当前 `policy_version`、上次 sync step，但不能保存 sample row，也不能变成 replay buffer。sample readiness 和生产/消费状态仍然由 TransferQueue 管理。
+`BaseRLPipeline` 的职责：
+
+- 解析 YAML 配置。
+- 初始化 dataset、rollout、reward、advantage、trainer、sampler、checkpoint engine。
+- 创建 TransferQueue partition 和 `TransferQueueClient`。
+- 根据资源配置创建 rollout/reward/advantage/trainer roles。
+- 驱动基础编排流程：rollout -> reward -> advantage -> train -> sync。
+- 调用 `StatelessRLManager` 获取 permits 和 sync 决策。
+- 负责日志、checkpoint、异常处理和 shutdown。
+
+`TransferQueueClient` 是 Twinkle 面向 RL pipeline 的客户端封装。它内部持有或创建 TransferQueue 原生 client，并隐藏底层到底使用 native `put/get_meta/get_data`、KV API，还是 `StreamingDataset`。这样 pipeline 和算法代码不依赖 TransferQueue 的具体 API 细节。
+
+`StatelessRLManager` 在 sample payload 维度是 stateless 的。它可以保存少量运行时计数，例如当前 `train_k`、trainer 参数版本、rollout 参数版本、上次 sync step，但不能保存 sample row，也不能变成 replay buffer。sample readiness 和生产/消费状态仍然由 TransferQueue 管理。
+
+`StatelessRLManager` 的核心控制变量是参数版本间隔：
+
+```text
+version_gap = trainer_policy_version - rollout_policy_version
+```
+
+manager 使用 `version_gap`、`trigger_parameter_sync_step`、`staleness_threshold`、`partial_rollout` 和 TQ snapshot 决定 rollout 是否还能继续向 TQ 写入。TransferQueue 仍然只是容器；是否暂停 rollout、是否允许 trainer 消费、是否触发参数同步，由 manager 返回 `FlowDecision`。
+
+## Pipeline 编排
+
+`BaseRLPipeline` 是面向用户的主抽象。它把当前 cookbook 里散落的初始化和训练循环沉淀为可配置流程。
+
+建议生命周期：
+
+```text
+load_config()
+  -> build_components()
+  -> allocate_resources()
+  -> create_roles()
+  -> init_transfer_queue()
+  -> run()
+  -> shutdown()
+```
+
+其中：
+
+- `build_components()` 构造 dataset、rollout、reward、advantage、trainer、sampler、checkpoint engine。
+- `allocate_resources()` 根据 YAML 中的 model/sampler/rollout/reward/trainer 资源配置创建 `DeviceMesh` 或 remote group。
+- `create_roles()` 创建 `RolloutWorker`、`RewardWorker`、`AdvantageWorker`、`TrainerWorker`。
+- `init_transfer_queue()` 初始化 TransferQueue backend、partition、`TransferQueueClient`。
+- `run()` 执行基础编排循环，并在每个阶段前后调用 `StatelessRLManager`。
+- `shutdown()` 清理 worker、TransferQueue partition、checkpoint/sampler 资源。
+
+基础编排循环：
+
+```python
+class BaseRLPipeline:
+    def run(self):
+        self.manager.on_pipeline_start(self.queue.snapshot(self.partition_id))
+
+        while not self.should_stop():
+            snapshot = self.queue.snapshot(self.partition_id)
+            decision = self.manager.on_queue_snapshot(snapshot)
+
+            if decision.rollout_permits > 0:
+                rollout_meta = self.rollout_worker.run_once(
+                    train_k=self.train_k,
+                    permits=decision.rollout_permits,
+                    policy_version=self.manager.rollout_policy_version,
+                )
+                decision = self.manager.on_rollout_done(rollout_meta)
+
+            if decision.run_reward:
+                self.reward_worker.run_once(self.partition_id)
+
+            if decision.run_advantage:
+                self.advantage_worker.run_once(self.partition_id)
+
+            if decision.run_train:
+                train_metrics = self.trainer_worker.train_once(self.partition_id)
+                decision = self.manager.on_train_step_end(
+                    partition_id=self.partition_id,
+                    batch_meta=train_metrics.get("batch_meta"),
+                    metrics=train_metrics,
+                )
+
+            if decision.sync_weights:
+                self.checkpoint_engine.sync_weights(merge_and_sync=False)
+                self.manager.on_parameter_synced(
+                    policy_version=self.manager.trainer_policy_version,
+                )
+```
+
+用户扩展方式：
+
+- 普通用户只写 YAML，选择已有 rollout/reward/advantage/trainer。
+- 任务用户实现自定义 `Reward`、`ToolManager`、rollout subclass 或 env/tool flow。
+- 框架用户继承 `BaseRLPipeline`，覆盖 `build_components()` 或某个 worker 创建方法。
+- 高级用户自定义 `StatelessRLManager`，改变参数同步和 backpressure 策略。
+
+这意味着异步 RL cookbook 不应该把所有逻辑写在一个长脚本里，而应展示如何用 YAML 启动一个 `BaseRLPipeline` 子类。
 
 ## TransferQueue 使用方式
 
@@ -196,7 +311,7 @@ DROPPED
 FAILED
 ```
 
-高吞吐 tensor 数据优先使用 native `put/get_meta/get_data` 路径。细粒度状态更新和 partial field update 可以使用 KV API，例如 `kv_batch_put`、`kv_batch_get`、`kv_list`、`kv_clear`。具体选择由 Twinkle adapter 屏蔽。
+高吞吐 tensor 数据优先使用 native `put/get_meta/get_data` 路径。细粒度状态更新和 partial field update 可以使用 KV API，例如 `kv_batch_put`、`kv_batch_get`、`kv_list`、`kv_clear`。具体选择由 Twinkle `TransferQueueClient` 屏蔽。
 
 ## 数据 Schema
 
@@ -369,7 +484,7 @@ model.clip_grad_and_step()
 rl_tq.mark_trained(meta)
 ```
 
-具体 API 可以由 Twinkle adapter 封装，但阶段所有权应保持不变。
+具体 API 可以由 Twinkle `TransferQueueClient` 封装，但阶段所有权应保持不变。
 
 ## Stateless Flow Manager
 
@@ -378,27 +493,46 @@ manager 决定每个组件可以生产或消费多少数据。它不保存 sampl
 建议接口：
 
 ```python
-class RLFlowManager:
-    def acquire_rollout_budget(self, *, policy_version: int, target_samples: int) -> int:
+class StatelessRLManager:
+    def on_pipeline_start(self, snapshot: "QueueSnapshot") -> "FlowDecision":
         ...
 
-    def can_run_reward(self, *, partition_id: str) -> bool:
+    def on_queue_snapshot(self, snapshot: "QueueSnapshot") -> "FlowDecision":
         ...
 
-    def can_run_advantage(self, *, partition_id: str) -> bool:
+    def on_before_rollout(self, snapshot: "QueueSnapshot") -> int:
         ...
 
-    def can_train(self, *, partition_id: str, required_fields: list[str], batch_size: int) -> bool:
+    def on_rollout_done(self, batch_meta) -> "FlowDecision":
         ...
 
-    def on_train_step_end(self, *, partition_id: str, batch_meta, metrics: dict) -> None:
+    def on_before_train(self, snapshot: "QueueSnapshot") -> bool:
         ...
 
-    def should_sync_weights(self, *, trainer_step: int, policy_version: int) -> bool:
+    def on_train_step_end(self, *, partition_id: str, batch_meta, metrics: dict) -> "FlowDecision":
+        ...
+
+    def on_parameter_sync_due(self, snapshot: "QueueSnapshot") -> "FlowDecision":
+        ...
+
+    def on_parameter_synced(self, *, policy_version: int) -> None:
         ...
 ```
 
-manager 只读取 TransferQueue metadata、tags、counters，以及 trainer/rollout 的进度信号。
+manager 只读取 TransferQueue metadata、tags、counters，以及 trainer/rollout 的进度信号。`on_xxx` 方法只返回控制决策，不直接写 TransferQueue payload。
+
+建议 hook 语义：
+
+| Hook | 触发时机 | 主要决策 |
+| --- | --- | --- |
+| `on_pipeline_start` | pipeline 启动后 | 初始化 `trainer_policy_version` / `rollout_policy_version` |
+| `on_queue_snapshot` | 每个 control tick | 是否发放 rollout permits、是否允许 reward/advantage/train |
+| `on_before_rollout` | rollout worker 取 prompt 前 | 当前参数版本是否还能继续 rollout |
+| `on_rollout_done` | rollout 写入 TQ 后 | 更新已生产数量、判断是否暂停 rollout |
+| `on_before_train` | trainer 取 train batch 前 | 是否有 train-ready 且不 stale 的 batch |
+| `on_train_step_end` | optimizer step 后 | 更新 trainer 参数版本、判断是否需要 sync |
+| `on_parameter_sync_due` | 满足 sync 条件时 | 等待活跃 rollout、请求 partial interrupt 或直接 sync |
+| `on_parameter_synced` | checkpoint engine 同步完成后 | 更新 rollout 参数版本，恢复 rollout permits |
 
 ### Manager Snapshot
 
@@ -437,8 +571,8 @@ class FlowDecision:
 
 ```mermaid
 sequenceDiagram
-    participant M as RLFlowManager
-    participant Q as TransferQueueAdapter
+    participant M as StatelessRLManager
+    participant Q as TransferQueueClient
     participant R as RolloutWorker
     participant W as RewardWorker
     participant A as AdvantageWorker
@@ -489,7 +623,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant M as RLFlowManager
+    participant M as StatelessRLManager
     participant R as Rollout
     participant Q as TransferQueue
     participant W as Reward/Advantage
@@ -735,15 +869,16 @@ Trainer 失败：
 
 Phase 1：同步数据面替换。
 
-- 增加 Twinkle TransferQueue adapter。
-- 保持单 driver 进程。
+- 增加 `BaseRLPipeline`，先支持单进程/单 driver 编排。
+- 增加 Twinkle `TransferQueueClient`。
+- 增加默认 `StatelessRLManager`，先支持 `on-policy pipeline`。
 - 将 GRPO 示例中的 Python-list handoff 替换为 TransferQueue 写入和读取。
 - 保持现有 rollout、reward、advantage、trainer 调用不变。
 
 Phase 2：异步 workers。
 
 - 将 rollout、reward、advantage、trainer 作为独立 workers 运行。
-- 增加基于 `trigger_parameter_sync_step`、`staleness_threshold`、`partial_rollout` 的 stateless manager。
+- 支持 `stream off-policy pipeline` 和 `async stream with stale samples`。
 - 增加 policy-version 和 stale-sample 处理。
 
 Phase 3：trainer streaming input。
@@ -752,14 +887,28 @@ Phase 3：trainer streaming input。
 - 对 DP groups 使用 rank-aware sampling。
 - 保持 rollout-side production 不变。
 
+Phase 4：partial rollout。
+
+- 为 rollout worker 定义可中断/可恢复的 agent state 接口。
+- 支持 `partial_rollout=True`。
+- 对 `MultiTurnRollout` 提供 wrapper 或逐步重构为可暂停执行的 agent loop。
+
 ## 配置示例
 
 ```yaml
 rl:
+  pipeline: AsyncAgenticGRPOPipeline
   mode: sync  # sync | async
   algorithm: grpo
   num_generations: 8
   partition_prefix: rl/train
+
+resources:
+  model_gpus: 4
+  sampler_gpus: 4
+  rollout_cpus: 4
+  reward_cpus: 2
+  advantage_cpus: 1
 
 transfer_queue:
   backend: SimpleStorage
@@ -779,14 +928,26 @@ rollout:
   class: MultiTurnRollout
   max_turns: 6
   max_trajectory_tokens: 8192
+  tool_manager: ToolManager
 
 trainer:
+  model_class: TransformersModel
+  loss: GRPOLoss
   required_fields:
     - input_ids
     - attention_mask
     - labels
     - old_logps
     - advantages
+
+reward:
+  class:
+    - F1Reward
+    - CoTReward
+
+advantage:
+  class: GRPOAdvantage
+  scale: group
 ```
 
 推荐配置：
