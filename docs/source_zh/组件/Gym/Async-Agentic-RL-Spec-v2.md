@@ -2,17 +2,17 @@
 
 ## 目标
 
-本规格定义 Twinkle 在 agentic 多轮 RL 中接入 TransferQueue 的目标架构。设计重点不是新增一个 `AsyncMultiTurnRollout`，而是在现有 `MultiTurnRollout`、`vLLMSampler`、reward、advantage、trainer 之外增加一层异步生产和训练编排：
+本规格定义 Twinkle 在 agentic 多轮 RL 中接入 TransferQueue 的目标架构。设计重点不是新增一个 `AsyncMultiTurnRollout`，而是把 TransferQueue 作为 rollout、reward、advantage、trainer 之间的统一数据协议层，在现有 `MultiTurnRollout`、`vLLMSampler`、reward、advantage、trainer 之外增加异步生产、流式消费和版本控制编排：
 
 ```text
 BaseRLPipeline 负责整个 RL 生命周期编排。
 AsyncRollouter 负责 rollout 数据生产侧。
-TransferQueue 只作为数据容器。
-StatelessManager 负责背压和参数版本同步策略。
-TrainerWorker 持续从 TransferQueue 消费可训练数据。
+TransferQueue 作为数据面和 metadata 控制面的统一媒介。
+StalenessManager 负责 staleness 判断和 rollout 提交控制。
+RewardWorker、AdvantageWorker、TrainerWorker 从 TransferQueue 消费数据并追加 reward、advantage、trained 状态。
 ```
 
-第一版落地目标是 GRPO。设计以当前 `cookbook/exp/grpo_baseline.py` 的同步流程为基线，但把内存中的 `all_trajectories / rewards / advantages / old_logps` handoff 改为通过 TransferQueue 传递，并让 rollout 和 trainer 可以重叠执行。
+第一版落地目标是 GRPO。设计以当前 `cookbook/exp/grpo_baseline.py` 的同步流程为基线，但把内存中的 `all_trajectories / rewards / advantages / old_logps` handoff 改为 TransferQueue 中的 partition、field、metadata 和 sampler/claim 语义，并让 rollout 和 trainer 可以重叠执行。
 
 ## 当前基线
 
@@ -84,6 +84,29 @@ partition_id = train_{rollout_id}
 
 一个 `train_k` 可以被多次 append。rollout side 按 transfer batch 往 `train_k` 追加 ready groups；trainer side 从 `train_k` 持续读取字段 ready 的 samples。`train_k` 达到目标样本量并训练完成后，触发权重同步并清理 partition。
 
+### TransferQueue 数据协议
+
+TransferQueue 在本设计中不是普通 FIFO，也不是 `list[Trajectory]` 的远端替代品。所有跨阶段数据交换必须落到以下协议上：
+
+```text
+partition:
+  train_k 作为 rollout step、policy version 和生命周期边界
+
+row:
+  sample / trajectory 作为 TQ 中的一行
+
+field:
+  rollout、reward、advantage、train 状态按阶段追加
+
+metadata:
+  记录 field ready、消费状态、partition 进度、policy version、存储占用
+
+sampler / claim:
+  控制不同阶段如何选择 ready rows，避免重复消费并保持 GRPO group 完整
+```
+
+因此 `BaseRLPipeline` 不再在内存里传递大对象；`AsyncRollouter`、reward、advantage、trainer 都只通过 `TransferQueueClient` 读写 TQ。
+
 ### Policy Version
 
 `policy_version` 表示 rollout 使用的参数版本。第一版建议令：
@@ -110,27 +133,20 @@ trainer 根据 `current_policy_version - partition.policy_version` 判断 stalen
 flowchart LR
     Dataset["DataLoader<br/>Prompt batches"] --> Pipeline["BaseRLPipeline<br/>全局编排"]
 
-    Pipeline --> Manager["StatelessManager<br/>控制面<br/>背压 / staleness / sync 策略"]
+    Pipeline --> Manager["StalenessManager<br/>max_staleness / rollout permits"]
     Pipeline --> Rollouter["AsyncRollouter<br/>rollout producer"]
-    Pipeline --> Reward["RewardWorker<br/>任务 reward"]
-    Pipeline --> Advantage["AdvantageWorker<br/>GRPOAdvantage"]
-    Pipeline --> Trainer["TrainerWorker<br/>forward_backward / step"]
+    Pipeline --> Processing["Processing Workers<br/>Reward / Advantage / Trainer"]
     Pipeline --> Ckpt["CheckpointEngineManager<br/>权重同步"]
 
-    TQ["TransferQueue<br/>train_k partitions"] -. "get_metadata()" .-> Manager
+    TQ["TransferQueue<br/>data plane + metadata<br/>train_k partitions"] -. "get_metadata()" .-> Manager
     Manager -. "rollout permits<br/>partition / policy_version" .-> Rollouter
-    Manager -. "reward permits" .-> Reward
-    Manager -. "advantage permits" .-> Advantage
-    Manager -. "train permits" .-> Trainer
-    Manager -. "sync / clear decisions" .-> Ckpt
+    Processing -. "train_k done" .-> Pipeline
+    Pipeline -. "sync train_k done" .-> Ckpt
 
-    Rollouter -->|"ready groups append"| TQ
-    TQ --> Reward
-    Reward -->|"append rewards"| TQ
-    TQ --> Advantage
-    Advantage -->|"append advantages"| TQ
-    TQ --> Trainer
-    Trainer -->|"train events / metrics"| Manager
+    Rollouter -->|"put_rollout_batch()<br/>append rollout fields"| TQ
+    TQ -->|"claim ready rows/groups"| Processing
+    Processing -->|"append reward/advantage fields<br/>mark_trained()"| TQ
+    Processing -->|"train events / metrics"| Pipeline
     Ckpt -->|"update sampler weights"| Rollouter
 
     Rollouter --> Rollout["MultiTurnRollout<br/>现有多轮/tool loop"]
@@ -141,142 +157,54 @@ flowchart LR
 
 - `BaseRLPipeline`：训练入口和总编排，负责组件初始化、资源分配、角色创建、worker 启停、日志、checkpoint、异常处理。
 - `AsyncRollouter`：只负责 rollout 数据生产侧，不负责 reward、advantage、loss、optimizer。
-- `TransferQueue`：只负责存储 sample、field、metadata，不决定同步还是异步。
-- `TransferQueueClient`：Twinkle 侧封装，屏蔽 TransferQueue native API、KV API、StreamingDataset 的具体差异。
-- `StatelessManager`：控制面核心。它只根据 TransferQueue metadata 和少量版本计数返回控制决策，不持有 sample payload。
-- `RewardWorker`：读取 rollout-ready samples，追加 reward 字段。
-- `AdvantageWorker`：按 group 等齐 rewards，追加 advantages。
-- `TrainerWorker`：读取 train-ready samples，执行 ref forward、forward_backward、optimizer step。
+- `TransferQueue`：承载 sample row、stage fields、partition metadata、消费状态和存储生命周期；它不决定同步还是异步，但所有调度决策都以它的 metadata 为输入。
+- `TransferQueueClient`：Twinkle 侧封装，屏蔽 TransferQueue native API、KV API、StreamingDataLoader 的具体差异。
+- `StalenessManager`：staleness 控制核心。它只根据 TransferQueue metadata 和少量版本计数判断当前 rollout 是否可以继续提交、应写入哪个 partition，不持有 sample payload，也不控制权重同步。
+- `RewardWorker / AdvantageWorker / TrainerWorker`：分别处理 reward、advantage、train 三个阶段；第一版可以独立实现，也可以先在同一个进程中顺序运行。
 - `CheckpointEngineManager`：复用现有 trainer -> sampler 权重同步路径。
 
 ## 组件架构图
 
-### 控制面与数据面
+### 组件分层
 
 ```mermaid
 flowchart TB
-    subgraph Driver["BaseRLPipeline"]
-        Config["load_config()"]
-        Build["build_components()"]
-        Dispatch["dispatch(ControlDecision)"]
-        Lifecycle["shutdown()"]
-    end
+    Pipeline["BaseRLPipeline<br/>生命周期 / 资源 / dispatch"] --> Manager["StalenessManager<br/>allow_rollout(metadata)"]
+    Pipeline --> Rollouter["AsyncRollouter<br/>prompt group producer"]
+    Pipeline --> Processor["Processing Workers<br/>Reward / Advantage / Trainer"]
+    Pipeline --> Checkpoint["CheckpointEngineManager<br/>sync weights"]
 
-    subgraph ControlPlane["控制面"]
-        TQMeta["TransferQueueClient.get_metadata()"]
-        Manager["StatelessManager.decide()"]
-        Decision["ControlDecision"]
-    end
+    TQ["TransferQueue<br/>rows / fields / metadata<br/>train_k partitions"] -. "get_metadata()" .-> Manager
+    Manager -. "RolloutControl" .-> Pipeline
 
-    subgraph Producers["生产侧"]
-        Rollouter["AsyncRollouter"]
-        Rollout["MultiTurnRollout"]
-        Sampler["vLLMSampler"]
-    end
+    Rollouter -->|"put_rollout_batch()"| TQ
+    TQ -->|"claim_reward_batch()<br/>claim_train_batch()"| Processor
+    Processor -->|"append_rewards()<br/>append_advantages()<br/>mark_trained()"| TQ
+    Processor -->|"train_k done event"| Pipeline
+    Pipeline -->|"sync after train_k done"| Checkpoint
+    Checkpoint -->|"receive_weights()"| Rollouter
 
-    subgraph DataPlane["数据面"]
-        TQ["TransferQueue<br/>train_k partition"]
-        RolloutFields["rollout fields"]
-        RewardFields["reward fields"]
-        AdvantageFields["advantage fields"]
-        TrainState["trained / dropped state"]
-    end
-
-    subgraph Consumers["消费侧"]
-        RewardWorker["RewardWorker"]
-        AdvantageWorker["AdvantageWorker"]
-        TrainerWorker["TrainerWorker"]
-        Ckpt["CheckpointEngineManager"]
-    end
-
-    Config --> Build --> Dispatch
-    TQ --> TQMeta --> Manager --> Decision --> Dispatch
-
-    Dispatch --> Rollouter
-    Rollouter --> Rollout --> Sampler
-    Rollouter --> RolloutFields --> TQ
-
-    Dispatch --> RewardWorker
-    TQ --> RewardWorker --> RewardFields --> TQ
-
-    Dispatch --> AdvantageWorker
-    TQ --> AdvantageWorker --> AdvantageFields --> TQ
-
-    Dispatch --> TrainerWorker
-    TQ --> TrainerWorker --> TrainState --> TQ
-    TrainerWorker --> Ckpt --> Sampler
-
-    Dispatch --> Lifecycle
+    Rollouter --> Rollout["MultiTurnRollout"]
+    Rollout --> Sampler["vLLMSampler"]
 ```
 
-控制面只处理 metadata 和 decision；数据面只处理 sample payload、field 追加和状态更新。`BaseRLPipeline` 不直接实现算法逻辑，它只把 `StatelessManager.decide()` 产出的 `ControlDecision` 分发给对应组件。
+这张图只表达组件分层和边界：`BaseRLPipeline` 驱动流程，`StalenessManager` 只做 staleness 和 rollout 提交判断，`TransferQueue` 承载 row/field/metadata/partition 生命周期，具体 reward、advantage、train 阶段可以是独立 worker，也可以先由同一个进程顺序执行。
 
 ### AsyncRollouter 内部结构
 
 ```mermaid
 flowchart LR
-    Dataset["DataLoader"] --> Feed["feed_pending_queue()"]
-    Feed --> Pending["pending_queue<br/>RolloutGroupRequest"]
-    Pending --> Submit["submit_until_capacity()"]
-    Submit --> Active["active_tasks<br/>group tasks"]
+    Data["DataLoader prompts"] --> Pending["pending_queue"]
+    Pending --> Active["active group tasks"]
+    Active --> Rollout["MultiTurnRollout<br/>[prompt] * num_generations"]
+    Rollout --> Buffer["transfer_buffer<br/>ready groups"]
+    Buffer --> TQ["TransferQueue<br/>put_rollout_batch(train_k)<br/>append rows + rollout fields"]
 
-    Active --> RunGroup["run_one_group()"]
-    RunGroup --> MTR["MultiTurnRollout.__call__()"]
-    MTR --> Sampler["vLLMSampler.sample()"]
-    Sampler --> MTR
-    MTR --> Result["RolloutGroupResult"]
-
-    Result --> Drain["drain_completed_groups()"]
-    Drain --> Buffer["transfer_buffer<br/>ready groups"]
-    Buffer --> Flush["flush_transfer_buffer()"]
-    Flush --> TQPut["TransferQueueClient.put_rollout_batch()"]
-    TQPut --> Partition["train_k partition"]
-
-    Manager["ControlDecision"] -. "set_rollout_budget()" .-> Submit
-    Manager -. "pause_submit()" .-> Submit
+    Control["RolloutControl"] -. "set_rollout_permits()" .-> Pending
+    Control -. "pause_submit()" .-> Active
 ```
 
 `AsyncRollouter` 的核心状态是 `pending_queue`、`active_tasks` 和 `transfer_buffer`。它按 prompt group 生产数据，group 完成后先进入 transfer buffer，达到 `transfer_batch_size_groups` 后追加到当前 `train_k`。
-
-### TransferQueue 消费侧结构
-
-```mermaid
-flowchart TB
-    TQ["TransferQueue<br/>train_k"]
-
-    subgraph Fields["partition fields"]
-        F1["rollout fields<br/>input_ids / labels / old_logps / messages"]
-        F2["reward fields<br/>rewards / raw_rewards"]
-        F3["advantage fields<br/>advantages / returns"]
-        F4["train state<br/>trained / dropped"]
-    end
-
-    subgraph Workers["workers"]
-        RW["RewardWorker"]
-        AW["AdvantageWorker"]
-        TW["TrainerWorker"]
-    end
-
-    TQ --> F1
-    F1 --> RW
-    RW --> F2
-    F2 --> TQ
-
-    TQ --> F2
-    F2 --> AW
-    AW --> F3
-    F3 --> TQ
-
-    TQ --> F3
-    F3 --> TW
-    TW --> F4
-    F4 --> TQ
-
-    TQ -. "get_metadata()" .-> Meta["QueueMetadata / PartitionMetadata"]
-    Meta -. "decide()" .-> Manager["StatelessManager"]
-```
-
-TransferQueue 中的 field 是分阶段追加的。`RewardWorker`、`AdvantageWorker`、`TrainerWorker` 都通过 `TransferQueueClient` claim 自己需要的 ready 数据；`StatelessManager` 只读取 metadata，不读取 payload。
 
 ## 类关系
 
@@ -285,7 +213,7 @@ classDiagram
     class BaseRLPipeline {
         +config
         +TransferQueueClient tq
-        +StatelessManager manager
+        +StalenessManager manager
         +build_components()
         +allocate_resources()
         +create_roles()
@@ -301,14 +229,13 @@ classDiagram
         +submit_groups()
         +run_one_group()
         +flush_transfer_buffer()
-        +abort_stale_tasks()
     }
 
-    class StatelessManager {
+    class StalenessManager {
         +current_policy_version
-        +decide(metadata)
-        +on_parameter_synced()
-        +on_partition_trained()
+        +allow_rollout(metadata)
+        +rollout_partition()
+        +is_stale_partition()
     }
 
     class TransferQueueClient {
@@ -316,6 +243,7 @@ classDiagram
         +append_rewards()
         +append_advantages()
         +claim_train_batch()
+        +build_train_batch_reader()
         +mark_partition_done()
         +clear_partition()
         +get_metadata()
@@ -334,7 +262,6 @@ classDiagram
     class TrainerWorker {
         +run()
         +train_batch()
-        +sync_weights()
     }
 
     class MultiTurnRollout {
@@ -351,14 +278,14 @@ classDiagram
     BaseRLPipeline --> RewardWorker
     BaseRLPipeline --> AdvantageWorker
     BaseRLPipeline --> TrainerWorker
-    BaseRLPipeline --> StatelessManager
+    BaseRLPipeline --> StalenessManager
     BaseRLPipeline --> TransferQueueClient
     AsyncRollouter --> MultiTurnRollout
     MultiTurnRollout --> vLLMSampler
     RewardWorker --> TransferQueueClient
     AdvantageWorker --> TransferQueueClient
     TrainerWorker --> TransferQueueClient
-    StatelessManager --> TransferQueueClient : reads metadata only
+    StalenessManager --> TransferQueueClient : reads metadata only
 ```
 
 ## AsyncRollouter
@@ -390,6 +317,9 @@ class RolloutGroupRequest:
     group_id: str
     num_generations: int
     policy_version: int
+    partial_state: dict | None = None
+    abort_count: int = 0
+    protected: bool = False
 
 
 @dataclass
@@ -397,6 +327,7 @@ class RolloutGroupResult:
     request: RolloutGroupRequest
     trajectories: list[Trajectory]
     status: str  # ok / timeout / aborted / failed
+    partial_state: dict | None = None
     error: str | None = None
 ```
 
@@ -410,6 +341,9 @@ queue_size
 concurrency
 transfer_batch_size_groups
 group_timeout_s
+partial_rollout_enabled
+partial_rollout_max_aborted_count
+mask_offpolicy_in_partial_rollout
 ```
 
 ### 运行逻辑
@@ -426,6 +360,8 @@ class AsyncRollouter:
 
     async def run_one_group(self, request: RolloutGroupRequest) -> RolloutGroupResult:
         group_inputs = [request.prompt] * request.num_generations
+        if request.partial_state is not None:
+            group_inputs = self.restore_partial_inputs(group_inputs, request.partial_state)
         trajectories = await self.call_rollout(group_inputs)
         for generation_idx, traj in enumerate(trajectories):
             traj["partition_id"] = request.partition_id
@@ -433,6 +369,7 @@ class AsyncRollouter:
             traj["group_id"] = request.group_id
             traj["generation_idx"] = generation_idx
             traj["policy_version"] = request.policy_version
+            self.apply_partial_loss_mask(traj, request)
         return RolloutGroupResult(request=request, trajectories=trajectories, status="ok")
 ```
 
@@ -446,6 +383,66 @@ class AsyncRollouter:
 这样 group 内部仍然复用 `MultiTurnRollout` 的 batched sampler 调用；group 之间由 `AsyncRollouter` 做并发。
 
 后续如果要更接近 verl，可把 `MultiTurnRollout` 内部局部状态拆成可调度的 agent loop state，让同一 group 内的 `NUM_GENERATIONS` 条 trajectory 也以独立 task 并发执行。
+
+### Partial Rollout
+
+`partial_rollout` 是长 response / agentic 多轮任务的可选能力。它解决的问题是：权重同步或背压收缩时，如果直接 abort 正在运行的长尾 rollout，会浪费已经生成的上下文、tool 结果和 response tokens。
+
+第一版可以采用 Relax-style 语义：
+
+```text
+partial_rollout.enabled = true
+  active rollout task 被 abort 时，不直接丢弃。
+  rollouter 保存 partial_state，重新放回 pending_queue。
+  后续用新权重从 partial_state 继续生成。
+
+partial_rollout.max_aborted_count = N
+  一个 group 最多允许被中断 N 次。
+  abort_count >= N 后进入 protected 状态，不再被中断，保证最终完成。
+
+partial_rollout.mask_offpolicy_tokens = true
+  旧 policy version 已经生成的 response tokens 作为上下文保留。
+  这些 token 的 loss_mask 置 0，不参与 policy loss。
+```
+
+这不会改变第一版的版本一致性约束：
+
+```text
+完成后的 sample 写入当前 train_k / policy_version
+trainer batch 仍然只 claim 同一个 train_k / policy_version
+旧版本 token 可以作为上下文
+旧版本 token 默认不贡献 loss
+新版本续写 token 才参与训练
+```
+
+需要保存的 partial state：
+
+```text
+prompt / messages
+generated_tokens
+tool_calls / env_state
+turn_state
+old_policy_version
+offpolicy_token_count
+partial_source_policy_version
+abort_count
+```
+
+当 `BaseRLPipeline` 准备执行 train_k 完成后的权重同步且存在 active rollout tasks 时：
+
+```text
+partial_rollout disabled:
+  等待 active tasks 完成，或者按普通 timeout/retry 处理。
+
+partial_rollout enabled:
+  abort 未 protected 的 active tasks
+  将 partial_state 回收到 pending_queue
+  同步 sampler 权重
+  为 partial request 重新分配当前 rollout_id / partition_id / policy_version
+  继续提交 pending_queue 中的 partial requests
+```
+
+如果当前 `MultiTurnRollout` 无法导出 token/tool/env 级 partial state，则第一版实现可以先退化为 whole-group retry；但 spec 的接口应保留 `partial_state`、`abort_count`、`protected` 和 `loss_mask` 字段，避免后续重做数据协议。
 
 ### 和 vLLMSampler 的关系
 
@@ -461,19 +458,31 @@ class AsyncRollouter:
 
 ## 数据流
 
+数据流不是 Python 对象在各阶段之间传递，而是 TransferQueue 中同一批 rows 的字段逐步 ready：
+
+```text
+rollout fields ready
+  -> reward fields ready
+  -> advantage fields ready
+  -> train state ready
+  -> clear partition
+```
+
+每个阶段只读取自己依赖的字段，只追加自己产出的字段。这样 TQ 的字段级读写、消费状态和 metadata 才能被充分利用。
+
 ### 数据线和权重线
 
 ```mermaid
 flowchart LR
     subgraph DataLine["数据线"]
         D["DataLoader"] --> AR["AsyncRollouter"]
-        AR -->|"ready groups / transfer batch"| TQ["TransferQueue train_k"]
-        TQ --> RW["RewardWorker"]
-        RW --> TQ
-        TQ --> AW["AdvantageWorker"]
-        AW --> TQ
-        TQ --> TW["TrainerWorker"]
-        TW -->|"clear train_k"| TQ
+        AR -->|"put_rollout_batch()<br/>rollout fields"| TQ["TransferQueue<br/>train_k rows / fields / metadata"]
+        TQ -->|"claim_reward_batch()"| RW["RewardWorker"]
+        RW -->|"append_rewards()"| TQ
+        TQ -->|"claim_reward_ready_groups()"| AW["AdvantageWorker"]
+        AW -->|"append_advantages()"| TQ
+        TQ -->|"claim_train_batch()<br/>or StreamingDataLoader"| TW["TrainerWorker"]
+        TW -->|"mark_trained() / clear_partition()"| TQ
     end
 
     subgraph WeightLine["权重线"]
@@ -481,6 +490,7 @@ flowchart LR
         Model -->|"sync weights"| CKPT["CheckpointEngineManager"]
         CKPT -->|"receive_weights"| Sampler["vLLMSampler"]
         Sampler --> AR
+        AR -->|"partial_state recycle<br/>optional"| AR
     end
 ```
 
@@ -555,11 +565,16 @@ messages
 turns
 stop_reason
 truncated
+loss_mask              # partial rollout 时旧版本 token 可置 0
 policy_version
 rollout_id
 partition_id
 group_id
 generation_idx
+partial_rollout
+abort_count
+offpolicy_token_count
+partial_source_policy_version
 ```
 
 reward 追加字段：
@@ -631,12 +646,12 @@ required fields:
 
 ## 控制流
 
-控制流由 `BaseRLPipeline` 驱动，`StatelessManager` 是控制决策中心。`BaseRLPipeline` 负责启动 worker、周期性读取 TransferQueue metadata、调用 `StatelessManager.decide()` 并分发 `ControlDecision`；`StatelessManager` 决定哪个阶段可以推进、推进多少、是否同步权重。
+控制流由 `BaseRLPipeline` 驱动，`StalenessManager` 只负责 rollout 背压和 staleness 判断。`BaseRLPipeline` 负责启动 worker、周期性读取 TransferQueue metadata、调用 `StalenessManager.allow_rollout()` 获取 rollout 提交许可；Reward、Advantage、Trainer 按配置的 batch size 从 TransferQueue claim ready 数据。权重同步不由 `StalenessManager` 决策，而是固定在每个 `train_k` 训练完成后执行一次。
 
 ```mermaid
 sequenceDiagram
     participant P as BaseRLPipeline
-    participant M as StatelessManager
+    participant M as StalenessManager
     participant Q as TransferQueueClient
     participant R as AsyncRollouter
     participant L as MultiTurnRollout
@@ -658,10 +673,10 @@ sequenceDiagram
 
     loop run()
         P->>Q: get_metadata()
-        P->>M: decide()
+        P->>M: allow_rollout()
 
         alt rollout permits > 0
-            P->>R: set_rollout_budget()
+            P->>R: set_rollout_permits()
             R->>R: feed_pending_queue()
             R->>R: submit_until_capacity()
             R->>L: __call__()
@@ -672,23 +687,17 @@ sequenceDiagram
             P->>R: pause_submit()
         end
 
-        alt reward permits > 0
-            P->>W: run_reward()
+        par workers consume ready data by batch size
             W->>Q: claim_reward_batch()
             W->>W: compute_rewards()
             W->>Q: append_rewards()
-        end
 
-        alt advantage permits > 0
-            P->>A: run_advantage()
             A->>Q: claim_reward_ready_groups()
             A->>A: compute_advantages()
             A->>Q: append_advantages()
-        end
 
-        alt train_budget > 0
-            P->>T: train()
-            T->>Q: claim_train_batch()
+            T->>Q: build_train_batch_reader()
+            T->>Q: claim_train_batch() / next_batch()
             T->>T: forward_only()
             T->>T: forward_backward()
             T->>T: clip_grad_and_step()
@@ -696,15 +705,14 @@ sequenceDiagram
             T-->>P: emit_train_event()
         end
 
-        alt sync_weights
+        alt train_k done
+            opt partial_rollout enabled
+                P->>R: abort_unprotected_active_tasks()
+                R->>R: recycle_partial_state()
+            end
             P->>C: sync_weights()
             C->>R: receive_weights()
-            P->>M: on_parameter_synced()
-        end
-
-        alt clear_partition
             P->>Q: clear_partition()
-            P->>M: on_partition_cleared()
         end
 
         P->>P: log_metrics()
@@ -718,23 +726,19 @@ sequenceDiagram
     P->>P: shutdown()
 ```
 
-`ControlDecision` 是 manager 对本轮控制面的输出。它可以是 dataclass，也可以拆成多项 permit API；关键是 worker 不绕过 manager 自行推进关键阶段。
+`RolloutControl` 是 manager 对 rollout 侧的输出。它可以是 dataclass，也可以拆成多项 API；关键是 manager 不控制 reward/advantage/train 的 batch 额度，也不控制权重同步。
 
 ```python
 @dataclass
-class ControlDecision:
+class RolloutControl:
     rollout_permits: int
-    reward_permits: int
-    advantage_permits: int
-    train_budget: int
     partition_id: str
     policy_version: int
     max_staleness: int
-    sync_weights: bool = False
-    clear_partitions: list[str] = field(default_factory=list)
+    abort_rollout_tasks: bool = False
 ```
 
-`BaseRLPipeline` 是总入口，但它的主循环应围绕 `get_metadata()` 和 `decide()` 展开：
+`BaseRLPipeline` 是总入口，但它的主循环应围绕 `get_metadata()` 和 `allow_rollout()` 展开：
 
 ```python
 class BaseRLPipeline:
@@ -753,11 +757,12 @@ class BaseRLPipeline:
 
         while not self.should_stop():
             metadata = self.tq.get_metadata()
-            decision = self.manager.decide(
+            rollout_control = self.manager.allow_rollout(
                 metadata=metadata,
                 policy_version=self.policy_version,
             )
-            self.dispatch(decision)
+            self.dispatch_rollout(rollout_control)
+            self.sync_and_clear_completed_partitions(metadata)
             self.log_metrics(metadata)
             self.handle_failures(metadata)
             self.maybe_save_checkpoint()
@@ -765,16 +770,21 @@ class BaseRLPipeline:
         self.shutdown()
 ```
 
-`dispatch(decision)` 只负责把 manager 的决策传给对应 worker：
+`dispatch_rollout(rollout_control)` 只负责把 rollout 许可传给 `AsyncRollouter`：
 
 ```text
 rollout_permits > 0    -> AsyncRollouter 可以继续提交 group task
-reward_permits > 0     -> RewardWorker 可以 claim rollout-ready samples
-advantage_permits > 0  -> AdvantageWorker 可以 claim reward-ready groups
-train_budget > 0       -> TrainerWorker 可以 claim train-ready samples
-sync_weights           -> CheckpointEngineManager 执行权重同步
-clear_partitions       -> TransferQueueClient 清理已训练 partition
 ```
+
+RewardWorker、AdvantageWorker、TrainerWorker 是长期运行的消费者。它们按配置项控制吞吐：
+
+```text
+reward.batch_size
+advantage.max_groups_per_batch
+trainer.train_global_batch_size
+```
+
+如果 TQ 中没有 ready 数据，对应 worker 等待或短暂 sleep；不需要 `StalenessManager` 为每个阶段发放调度额度。
 
 ## 背压策略
 
@@ -844,9 +854,9 @@ Manager 内部派生：
 max_live_partitions = max_staleness + 1
 ```
 
-第一版不支持 verl-style 的非整数 stale sample budget，也不支持 mixed-version train batch。trainer 只能从同一个 `train_k` / 同一个 `policy_version` claim 训练数据。
+第一版不支持 verl-style 的非整数 stale sample 控制，也不支持 mixed-version train batch。trainer 只能从同一个 `train_k` / 同一个 `policy_version` claim 训练数据。
 
-当满足下面条件时，`StatelessManager.decide()` 生成的 `ControlDecision.rollout_permits` 应为 `0`：
+当满足下面条件时，`StalenessManager.allow_rollout()` 生成的 `RolloutControl.rollout_permits` 应为 `0`：
 
 ```text
 active_partitions >= max_live_partitions
@@ -874,20 +884,20 @@ trainer sync weights -> policy_version = k + 1
 clear train_k
 ```
 
-如果一个 partition 因为 `max_staleness` 超限而已经不可训练，manager 应整体 drop 或 clear 该 partition，而不是从多个 partition 混合凑 batch。mixed-version batch 不属于第一版目标。
+如果一个 partition 因为 `max_staleness` 超限而已经不可训练，`StalenessManager.is_stale_partition()` 只负责给出判断；具体 drop 或 clear 由 `BaseRLPipeline` / `TransferQueueClient` 执行。第一版不从多个 partition 混合凑 batch，mixed-version batch 不属于第一版目标。
 
 ## 权重同步
 
-权重同步由 trainer 控制，rollout 只接收新版本。
+权重同步不是 `StalenessManager` 的控制项。第一版固定为每个 rollout step / `train_k` 训练完成后同步一次，rollout 只接收新版本。
 
 第一版推荐策略：
 
 ```text
-Trainer 每训练完一个 train_k partition:
-  1. 完成该 partition 内所有 optimizer steps
-  2. checkpoint engine 同步权重到 sampler
+train_k done:
+  1. TrainerWorker 完成该 partition 内所有 optimizer steps
+  2. BaseRLPipeline 调用 checkpoint engine 同步权重到 sampler
   3. current_policy_version += 1
-  4. clear train_k
+  4. BaseRLPipeline 调用 TransferQueueClient.clear_partition(train_k)
 ```
 
 一个 partition 内 optimizer step 数：
@@ -903,7 +913,7 @@ num_steps_per_partition =
 sync_on_partition_done = true
 ```
 
-也就是每个 `train_k` 训练完成后同步一次权重。`trigger_parameter_sync_step`、partial rollout、mixed-version batch 都不属于第一版目标。
+也就是每个 `train_k` 训练完成后同步一次权重。`trigger_parameter_sync_step` 和 mixed-version batch 不属于第一版目标。`partial_rollout` 是可选优化，只影响 rollout 中断和续跑，不改变 trainer batch 的版本一致性。
 
 ## 同步与异步模式
 
@@ -971,6 +981,182 @@ trainer 完成 train_k 后同步权重
 
 这是第一版推荐 fully async 模式。
 
+## TransferQueue 能力利用原则
+
+本设计不能把 TransferQueue 当作普通 FIFO queue 使用。[TransferQueue 官方文档](https://verl.readthedocs.io/en/latest/data/transfer_queue.html)强调它提供控制面 metadata、数据面分布式存储、字段级读写、partition 隔离、Sampler/StreamingDataLoader 和可插拔 storage backend。Twinkle 的接入应显式利用这些能力。
+
+### 控制面：metadata 驱动调度
+
+TransferQueue 控制面会跟踪样本生产状态、消费状态和各计算任务的消费历史。Twinkle 中对应为：
+
+```text
+TransferQueueClient.get_metadata()
+  -> QueueMetadata / PartitionMetadata
+  -> StalenessManager.allow_rollout()
+  -> RolloutControl
+```
+
+设计要求：
+
+- `StalenessManager` 只读 metadata，不读 payload。
+- rollout、reward、advantage、train 的 ready 状态都应进入 metadata。
+- 不同 task 的消费状态应隔离，例如 reward 消费过某条 sample，不影响 trainer 后续消费同一条 sample。
+- `RolloutControl` 应根据 metadata 中的 active partition、oldest partition、policy version 和 `max_staleness` 生成。
+
+### 数据面：按字段追加，而不是整行重写
+
+TransferQueue 数据面是 sample 行和 field 列的结构。Twinkle 需要按阶段追加字段：
+
+```text
+rollout stage:
+  input_ids / labels / old_logps / messages / policy_version / group_id
+
+reward stage:
+  rewards / raw_rewards / reward_breakdown
+
+advantage stage:
+  advantages / returns
+
+trainer stage:
+  trained / dropped / train_metrics
+```
+
+设计要求：
+
+- `put_rollout_batch()` 只写 rollout 字段。
+- `append_rewards()` 只追加 reward 字段。
+- `append_advantages()` 只追加 advantage 字段。
+- `mark_trained()` 只更新训练状态。
+- trainer claim 数据时只读取需要字段，例如 `input_ids`、`labels`、`old_logps`、`advantages`。
+
+这样可以避免在 driver 内搬运完整 trajectory 列表，也能让 reward、advantage、trainer 并发处理不同 ready 字段。
+
+### Partition：用 train_k 做版本和生命周期隔离
+
+TransferQueue 支持逻辑 partition。Twinkle 第一版使用：
+
+```text
+partition_id = train_{rollout_id}
+```
+
+设计要求：
+
+- 一个 `train_k` 对应一个 rollout 参数版本。
+- 一个 `train_k` 内可以多次 append ready groups。
+- trainer batch 只从单个 `train_k` claim，保持 partition-consistent。
+- `clear_partition(train_k)` 是释放存储和推进 staleness 的关键动作。
+
+这比一个全局 queue 更适合 Relax-style 权重同步和 `max_staleness` 控制。
+
+### 数据检索：预留 Sampler / StreamingDataLoader 接口
+
+TransferQueue 支持自定义数据检索逻辑和 StreamingDataLoader。Twinkle 第一版可以先由 `TransferQueueClient.claim_*` 封装检索策略，但 trainer 侧要预留 StreamingDataLoader 实现：
+
+```python
+class TrainDataSampler:
+    def sample(
+        self,
+        ready_indexes: list[int],
+        batch_size: int,
+        *,
+        partition_id: str,
+        num_generations: int,
+    ) -> tuple[list[int], list[int]]:
+        ...
+```
+
+第一版默认策略：
+
+```text
+partition-consistent
+GRPO group complete
+sequential or length-balanced
+```
+
+后续可以替换为：
+
+```text
+GRPOGroupNSampler
+length-balanced sampler
+rank-aware sampler
+StreamingDataLoader-backed trainer dataloader
+```
+
+设计要求：
+
+- `TransferQueueClient.claim_train_batch()` 不应写死具体 sampling 策略。
+- `TrainerWorker` 不应感知底层是 `claim_train_batch()` 还是 `StreamingDataLoader`。
+- GRPO 默认 claim 单位应保持 group 完整，不能把同一 group 拆坏。
+- 是否标记 consumed 应由 claim 逻辑控制，避免同一个 task 重复消费。
+
+推荐抽象：
+
+```python
+class TrainBatchReader:
+    def next_batch(self) -> dict:
+        ...
+
+
+class ClaimBasedTrainBatchReader(TrainBatchReader):
+    """第一版默认实现，内部调用 TransferQueueClient.claim_train_batch()."""
+
+
+class StreamingTrainBatchReader(TrainBatchReader):
+    """可选实现，内部封装 TransferQueue StreamingDataLoader。"""
+```
+
+这样第一版可以保持 partition-consistent 和 GRPO group 完整；当 TQ backend 和 sampler 能力满足训练侧需求时，也可以直接把 trainer reader 配成 TQ 原生 StreamingDataLoader。
+
+### API 层选择
+
+Twinkle 的 `TransferQueueClient` 应屏蔽底层 API 差异：
+
+```text
+native API:
+  高吞吐 tensor payload、metadata-based claim、streaming 调度
+
+KV API:
+  字段级 patch、状态标记、debug、轻量 metadata tag
+
+StreamingDataLoader:
+  trainer 侧未来可选的 rank-aware streaming 消费接口
+```
+
+第一版建议：
+
+- rollout/reward/advantage/train 主路径走 native metadata API。
+- debug、状态修复、小字段 patch 可走 KV API。
+- 不直接在算法代码里调用底层 TQ API，统一通过 Twinkle `TransferQueueClient`。
+
+### 存储后端可插拔
+
+TransferQueue 数据面支持不同 storage backend。Twinkle spec 不绑定具体后端：
+
+```text
+local / CPU memory backend
+KV backend
+HBM / DRAM / SSD hierarchical backend
+RDMA / object-store backend
+```
+
+设计要求：
+
+- `TransferQueueClient` 初始化时由 YAML 选择 backend。
+- Pipeline、Rollouter、Trainer 不感知 backend 类型。
+- 大 tensor 字段和小 metadata 字段可以由 backend 做不同优化。
+
+### 对本 spec 的约束
+
+为了充分利用 TransferQueue，当前设计必须遵守：
+
+```text
+1. 不在 BaseRLPipeline 中传递 all_trajectories 大对象。
+2. 不用 Python list 作为 rollout/reward/advantage/train 的主数据通道。
+3. 不把 TQ 当 FIFO，也不只使用最简单的 put/get。
+4. 所有阶段通过 field ready + metadata claim 协作。
+5. 所有存储释放都通过 clear_partition(train_k) 完成。
+```
+
 ## TransferQueueClient 接口
 
 ```python
@@ -1025,6 +1211,17 @@ class TransferQueueClient:
     ) -> list[dict]:
         ...
 
+    def build_train_batch_reader(
+        self,
+        *,
+        partition_id: str,
+        required_fields: list[str],
+        batch_size: int,
+        sampler: TrainDataSampler,
+        backend: str = "claim",
+    ) -> TrainBatchReader:
+        ...
+
     def mark_trained(self, *, metadata: Metadata) -> None:
         ...
 
@@ -1035,7 +1232,7 @@ class TransferQueueClient:
         ...
 ```
 
-`TransferQueueClient` 的职责是封装底层 TQ API，不让 pipeline 依赖具体实现。高吞吐 tensor 数据优先走 native `put/get_meta/get_data`；细粒度状态更新可以走 KV API。对上层只暴露 sample/group/partition 语义。
+`TransferQueueClient` 的职责是封装底层 TQ API，不让 pipeline 依赖具体实现。高吞吐 tensor 数据优先走 native `put/get_meta/get_data`；细粒度状态更新可以走 KV API；trainer 侧可以通过 `build_train_batch_reader()` 选择 claim-based reader 或 StreamingDataLoader-backed reader。对上层只暴露 sample/group/partition/batch reader 语义。
 
 控制面 metadata 不包含 trajectory/token/reward payload，只包含 manager 做决策需要的状态：
 
@@ -1063,45 +1260,45 @@ class PartitionMetadata:
     is_train_done: bool
 ```
 
-## StatelessManager 接口
+## StalenessManager 接口
 
 ```python
-class StatelessManager:
-    def decide(
+class StalenessManager:
+    def allow_rollout(
         self,
         *,
         metadata: QueueMetadata,
         policy_version: int,
-    ) -> ControlDecision:
-        """控制面唯一入口。根据 TQ metadata 和参数版本返回执行决策。"""
+    ) -> RolloutControl:
+        """根据 TQ metadata、当前参数版本和 max_staleness 返回 rollout 提交许可。"""
         ...
 
     def rollout_partition(self) -> str:
         """返回当前 rollout 应写入的 train_k partition。"""
         ...
 
-    def on_parameter_synced(self, *, new_policy_version: int) -> None:
+    def can_submit_rollout(self, *, metadata: QueueMetadata) -> bool:
         ...
 
-    def on_partition_trained(self, *, partition_id: str) -> None:
-        ...
-
-    def on_partition_cleared(self, *, partition_id: str) -> None:
+    def is_stale_partition(
+        self,
+        *,
+        partition: PartitionMetadata,
+        current_policy_version: int,
+    ) -> bool:
         ...
 ```
 
-`decide()` 内部可以拆 helper，例如：
+`allow_rollout()` 内部可以拆 helper，例如：
 
 ```text
 compute_rollout_permits(metadata)
-compute_reward_permits(metadata)
-compute_advantage_permits(metadata)
-compute_train_budget(metadata)
-compute_sync_decision(metadata)
-compute_clear_decision(metadata)
+compute_oldest_live_partition(metadata)
+compute_live_partition_count(metadata)
+is_stale_partition(partition, current_policy_version)
 ```
 
-Manager 可以保存少量运行时计数，例如当前 `rollout_id`、`policy_version`、`trainer_step`。它不能保存 sample payload，也不能成为 replay buffer。
+Manager 可以保存少量运行时计数，例如当前 `rollout_id`、`policy_version`。它不能保存 sample payload，也不能成为 replay buffer，也不负责权重同步。
 
 ## 用户定制钩子
 
@@ -1122,8 +1319,8 @@ class BaseRLPipeline:
     def create_roles(self) -> None:
         """创建 AsyncRollouter / RewardWorker / AdvantageWorker / TrainerWorker。"""
 
-    def dispatch(self, decision: ControlDecision) -> None:
-        """把 StatelessManager.decide() 的结果分发给各 worker。"""
+    def dispatch_rollout(self, control: RolloutControl) -> None:
+        """把 StalenessManager.allow_rollout() 的结果分发给 AsyncRollouter。"""
 
     def should_stop(self) -> bool:
         """控制训练停止条件，例如 max_steps、max_epochs、外部 stop signal。"""
@@ -1252,29 +1449,27 @@ class TrainerWorker:
 - 可以替换 loss、metric、ref_logps 路径和 batch filter。
 - 不应绕过 `TransferQueueClient.mark_trained()` 更新训练状态。
 
-### StatelessManager 钩子
+### StalenessManager 钩子
 
-面向控制策略定制。第一版默认 Relax-style：整数 `max_staleness`、partition-consistent batch、train_k 完成后 sync。
+面向 staleness 和 rollout 提交策略定制。第一版默认 Relax-style：整数 `max_staleness`、partition-consistent batch、train_k 完成后由 pipeline 固定 sync。
 
 ```python
-class StatelessManager:
-    def decide(self, *, metadata: QueueMetadata, policy_version: int) -> ControlDecision:
-        """根据 metadata 返回 permits、sync、clear 决策。"""
+class StalenessManager:
+    def allow_rollout(self, *, metadata: QueueMetadata, policy_version: int) -> RolloutControl:
+        """根据 metadata 返回 rollout 提交许可。"""
 
     def compute_rollout_permits(self, metadata: QueueMetadata) -> int:
         """根据 max_staleness 和 active partition 数控制 rollout 背压。"""
 
-    def compute_train_budget(self, metadata: QueueMetadata) -> int:
-        """只为单个可训练 partition 发放 train budget。"""
-
-    def compute_sync_decision(self, metadata: QueueMetadata) -> bool:
-        """train_k 完成后触发权重同步。"""
+    def is_stale_partition(self, partition: PartitionMetadata, current_policy_version: int) -> bool:
+        """判断 partition 是否超过 max_staleness。"""
 ```
 
 定制边界：
 
-- 可以调整 permits、清理策略、停止条件和 metric 上报。
+- 可以调整 rollout 背压和 stale partition 判断。
 - 不应持有 sample payload，不应实现 replay buffer。
+- 不应控制权重同步；权重同步固定由 pipeline 在 train_k 完成后执行。
 - 第一版不提供 mixed-version batch 和 sample-level staleness，自定义 manager 也不应绕过这个约束。
 
 ### 用户最小接入面
@@ -1294,7 +1489,7 @@ class StatelessManager:
 ```text
 AdvantageFn
 TrainerWorker
-StatelessManager
+StalenessManager
 BaseRLPipeline
 ```
 
@@ -1308,7 +1503,9 @@ BaseRLPipeline
 status = timeout
 ```
 
-默认策略：
+默认策略分两种。
+
+未开启 `partial_rollout`：
 
 ```text
 abort group
@@ -1316,7 +1513,38 @@ abort group
 超过 max_retries 后 drop group
 ```
 
+开启 `partial_rollout`：
+
+```text
+导出 partial_state
+abort_count += 1
+重新放入 pending_queue
+如果 abort_count >= partial_rollout.max_aborted_count:
+  protected = true
+  后续不再被主动中断
+```
+
 如果 drop group 导致 partition 样本不足，AsyncRollouter 继续从 dataloader 取新的 group 补齐 target。
+
+### partial rollout off-policy mask
+
+partial rollout 续跑后，同一条 trajectory 可能由两个 policy version 生成：
+
+```text
+prefix tokens: old_policy_version
+continued tokens: current_policy_version
+```
+
+第一版不把这种样本视为 mixed-version train batch。处理方式是：
+
+```text
+policy_version 字段记录最终进入训练的 partition 版本
+offpolicy_token_count 记录旧版本 response token 数
+loss_mask[:offpolicy_token_count] = 0
+loss_mask[offpolicy_token_count:] = 1
+```
+
+也就是说，旧权重 token 只作为上下文，不参与 policy loss；trainer batch 仍然从单个 `train_k` claim。
 
 ### reward homogeneous group
 
@@ -1381,9 +1609,16 @@ async_rollout:
   transfer_batch_size_groups: auto
   group_timeout_s: 600
   max_retries: 1
+  partial_rollout:
+    enabled: false
+    max_aborted_count: 3
+    mask_offpolicy_tokens: true
 
 transfer_queue:
   partition_prefix: train
+  backend: auto
+  train_reader: claim          # claim / streaming_dataloader
+  sampler: grpo_group
 
 async_training:
   mode: async
@@ -1412,9 +1647,9 @@ trainer:
 
 第一版不做：
 
-- token-level partial generation resume。
 - 混 policy version trajectory 训练。
-- 在 TransferQueue 内实现 replay buffer 或采样策略。
+- 把 TransferQueue 当作 replay buffer 做跨版本 off-policy 采样。
+- 把 TQ 采样逻辑散落在算法代码中；采样必须封装在 `TrainDataSampler` / `TrainBatchReader`。
 - 重写 vLLM engine。
 - 把 reward 逻辑放入 env；env/tool 交互由 rollout 或用户自定义 agent loop 负责，reward 独立计算。
 
@@ -1430,7 +1665,8 @@ AsyncRollouter:
   prompt group 级异步 rollout producer
 
 TransferQueue:
-  rollout / reward / advantage / trainer 之间的数据容器
+  rollout / reward / advantage / trainer 之间的数据协议层
+  承载 rows、fields、metadata、partition 生命周期和消费状态
 ```
 
 第一版不需要修改 `vLLMSampler` 的核心能力，也不需要新增 `AsyncMultiTurnRollout`。关键改动是把当前 batch-blocking 的 rollout handoff 改成：
@@ -1438,8 +1674,10 @@ TransferQueue:
 ```text
 prompt group ready
   -> transfer buffer
-  -> append train_k
-  -> trainer rolling consume
+  -> put_rollout_batch(train_k)
+  -> reward/advantage append fields
+  -> trainer claim / streaming consume
+  -> mark_trained / clear_partition
 ```
 
 这样可以保留 GRPO group 语义，同时显著缓解 rollout step 内样本间长尾，并为后续 sample-level/trajectory-level streaming runtime 留出扩展空间。
