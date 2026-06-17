@@ -75,6 +75,9 @@ class SequenceParallel:
         self._sp_rank = 0
         self._rp_rank = 0
         self.num_heads = None
+        self.num_attention_heads = None
+        self.num_key_value_heads = None
+        self.gqa_ulysses_all_to_all = False
         self.causal_mask_func = None
         self.extra_kwargs = {}
 
@@ -293,8 +296,15 @@ class SequenceParallel:
                         kwargs['max_length_k'] = max_seqlen
                         if self.extra_kwargs.get('padding_free', False) and len(args) > 0:
                             args = (None, *args[1:])
-                    return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
-                                                                               **kwargs)[0]
+                    original_num_key_value_groups = getattr(module, 'num_key_value_groups', None)
+                    if self.gqa_ulysses_all_to_all and original_num_key_value_groups is not None:
+                        module.num_key_value_groups = query.shape[1] // key.shape[1]
+                    try:
+                        return ALL_ATTENTION_FUNCTIONS['flash_attention_2_origin'](module, query, key, value, *args,
+                                                                                   **kwargs)[0]
+                    finally:
+                        if self.gqa_ulysses_all_to_all and original_num_key_value_groups is not None:
+                            module.num_key_value_groups = original_num_key_value_groups
 
                 dist_attn.local_attn = _attention
 
@@ -323,7 +333,14 @@ class SequenceParallel:
                     value = value.transpose(1, 2)
                     if self.rp_world_size > 1:
                         raise NotImplementedError('SDPA does not support derived ring attention.')
-                    return ALL_ATTENTION_FUNCTIONS['sdpa_origin'](module, query, key, value, *args, **kwargs)[0]
+                    original_num_key_value_groups = getattr(module, 'num_key_value_groups', None)
+                    if self.gqa_ulysses_all_to_all and original_num_key_value_groups is not None:
+                        module.num_key_value_groups = query.shape[1] // key.shape[1]
+                    try:
+                        return ALL_ATTENTION_FUNCTIONS['sdpa_origin'](module, query, key, value, *args, **kwargs)[0]
+                    finally:
+                        if self.gqa_ulysses_all_to_all and original_num_key_value_groups is not None:
+                            module.num_key_value_groups = original_num_key_value_groups
 
                 dist_attn.local_attn = _attention
             return dist_attn(
@@ -473,6 +490,8 @@ class SequenceParallel:
         model: torch.nn.Module,
         tokenizer: PreTrainedTokenizer,
         device_mesh: Optional[DeviceMesh] = None,
+        *,
+        gqa_ulysses_all_to_all: bool = False,
     ):
         llm_model = get_llm_model(model)
         config_candidates = [getattr(model, 'config', None)]
@@ -484,17 +503,39 @@ class SequenceParallel:
             config_candidates.append(text_config)
 
         self.num_heads = None
+        self.num_attention_heads = None
+        self.num_key_value_heads = None
+        self.gqa_ulysses_all_to_all = bool(gqa_ulysses_all_to_all)
         for config in config_candidates:
             if config is None:
                 continue
-            self.num_heads = get_config_attr(config, 'num_key_value_heads')
-            if self.num_heads is None:
-                self.num_heads = get_config_attr(config, 'num_attention_heads')
+            self.num_attention_heads = get_config_attr(config, 'num_attention_heads')
+            self.num_key_value_heads = get_config_attr(config, 'num_key_value_heads')
+            if self.gqa_ulysses_all_to_all:
+                self.num_heads = self.num_attention_heads
+            else:
+                self.num_heads = self.num_key_value_heads
+                if self.num_heads is None:
+                    self.num_heads = self.num_attention_heads
             if self.num_heads is not None:
                 break
         assert self.num_heads is not None, 'Cannot find num_attention_heads/num_key_value_heads in model config'
         self.seq_world_size = sp_size
-        self.sp_world_size, self.rp_world_size = _derive_sequence_parallel_sizes(self.num_heads, self.seq_world_size)
+        if self.gqa_ulysses_all_to_all:
+            if self.num_attention_heads is None or self.num_key_value_heads is None:
+                raise ValueError('GQA-aware Ulysses requires num_attention_heads and num_key_value_heads in config.')
+            if self.num_attention_heads % self.seq_world_size != 0:
+                raise ValueError('GQA-aware Ulysses requires num_attention_heads '
+                                 f'({self.num_attention_heads}) to be divisible by ulysses_size '
+                                 f'({self.seq_world_size}).')
+            if self.num_attention_heads % self.num_key_value_heads != 0:
+                raise ValueError('GQA-aware Ulysses requires num_attention_heads '
+                                 f'({self.num_attention_heads}) to be divisible by num_key_value_heads '
+                                 f'({self.num_key_value_heads}).')
+            self.sp_world_size, self.rp_world_size = self.seq_world_size, 1
+        else:
+            self.sp_world_size, self.rp_world_size = _derive_sequence_parallel_sizes(
+                self.num_heads, self.seq_world_size)
         self.world_size = self.seq_world_size
 
         self.attn_implementation = None
@@ -884,6 +925,7 @@ class SequenceParallelConfig:
     enabled: bool = True
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
+    gqa_ulysses_all_to_all: bool = False
 
 
 class SequenceParallelStrategy:
@@ -940,6 +982,7 @@ class SequenceParallelStrategy:
             self._model_ref,
             tokenizer,
             device_mesh=self.device_mesh,
+            gqa_ulysses_all_to_all=bool(self.sp_config.get('gqa_ulysses_all_to_all', False)),
         )
         self._initialized = True
         return True

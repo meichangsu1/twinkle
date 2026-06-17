@@ -69,6 +69,12 @@ def train():
         model_id=MODEL_ID,
         device_mesh=device_mesh,
         strategy='native_fsdp',
+        sp_config={
+            'enabled': True,
+            'ulysses_size': 8,
+            'gather_logits': True,
+            'gqa_ulysses_all_to_all': True,
+        },
     )
     # npu patch
     if Torch.is_npu_available():

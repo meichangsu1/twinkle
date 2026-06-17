@@ -342,6 +342,77 @@ class _SeqAllToAll(torch.autograd.Function):
         return None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None
 
 
+class _SeqGatherSelectHeads(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        group: dist.ProcessGroup,
+        input: torch.Tensor,
+        head_start: int,
+        head_end: int,
+        total_heads: int,
+    ) -> torch.Tensor:
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        gathered = [torch.empty_like(input) for _ in range(world_size)]
+        dist.all_gather(gathered, input, group=group)
+        full = torch.cat(gathered, dim=1)
+        ctx.group = group
+        ctx.rank = rank
+        ctx.local_seq_len = input.shape[1]
+        ctx.head_start = head_start
+        ctx.head_end = head_end
+        ctx.total_heads = total_heads
+        return full[:, :, head_start:head_end, :].contiguous()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None, None]:
+        full_grad = grad_output.new_zeros(
+            grad_output.shape[0],
+            grad_output.shape[1],
+            ctx.total_heads,
+            grad_output.shape[3],
+        )
+        full_grad[:, :, ctx.head_start:ctx.head_end, :].copy_(grad_output)
+        dist.all_reduce(full_grad, group=ctx.group)
+        seq_start = ctx.rank * ctx.local_seq_len
+        seq_end = seq_start + ctx.local_seq_len
+        return None, full_grad[:, seq_start:seq_end, :, :].contiguous(), None, None, None
+
+
+def gqa_kv_seq_gather_select(
+    tensor: torch.Tensor,
+    sequence_parallel,
+    *,
+    query_heads: int,
+) -> torch.Tensor:
+    sp_world_size = int(getattr(sequence_parallel, 'sp_world_size', 1) or 1)
+    if sp_world_size <= 1:
+        return tensor
+    kv_heads = int(tensor.shape[2])
+    if query_heads % sp_world_size != 0:
+        raise NotImplementedError(f'GQA-aware Ulysses requires num_attention_heads ({query_heads}) to be divisible by '
+                                  f'sp_world_size ({sp_world_size}).')
+    if query_heads % kv_heads != 0:
+        raise NotImplementedError(f'GQA-aware Ulysses requires num_attention_heads ({query_heads}) to be divisible by '
+                                  f'num_key_value_heads ({kv_heads}).')
+    local_query_heads = query_heads // sp_world_size
+    kv_group_size = query_heads // kv_heads
+    sp_rank = int(getattr(sequence_parallel, 'sp_rank', 0) or 0)
+    query_start = sp_rank * local_query_heads
+    query_end = query_start + local_query_heads
+    kv_start = query_start // kv_group_size
+    kv_end = (query_end - 1) // kv_group_size + 1
+    return _SeqGatherSelectHeads.apply(
+        sequence_parallel._sp_group,
+        tensor,
+        kv_start,
+        kv_end,
+        kv_heads,
+    )
+
+
 class DistributedAttention(torch.nn.Module):
 
     def __init__(
@@ -368,8 +439,16 @@ class DistributedAttention(torch.nn.Module):
 
         if self.sequence_parallel.sp_world_size > 1:
             query_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, query, self.scatter_idx, self.gather_idx)
-            key_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, key, self.scatter_idx, self.gather_idx)
-            value_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, value, self.scatter_idx, self.gather_idx)
+            if getattr(self.sequence_parallel, 'gqa_ulysses_all_to_all', False):
+                if int(getattr(self.sequence_parallel, 'rp_world_size', 1) or 1) != 1:
+                    raise NotImplementedError('GQA-aware Ulysses all-to-all does not support ring/CP parallelism.')
+                query_heads = int(query.shape[2])
+                key_layer = gqa_kv_seq_gather_select(key, self.sequence_parallel, query_heads=query_heads)
+                value_layer = gqa_kv_seq_gather_select(value, self.sequence_parallel, query_heads=query_heads)
+            else:
+                key_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, key, self.scatter_idx, self.gather_idx)
+                value_layer = _SeqAllToAll.apply(self.sequence_parallel._sp_group, value, self.scatter_idx,
+                                                 self.gather_idx)
         else:
             query_layer, key_layer, value_layer = query, key, value
 
