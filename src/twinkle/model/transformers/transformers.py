@@ -178,6 +178,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
+            sp_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             **kwargs):
@@ -190,6 +191,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
+        self._sp_config = dict(sp_config or {})
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
@@ -290,7 +292,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
         self.sp_strategy = SequenceParallelStrategy(
             self.device_mesh,
-            {},
+            self._sp_config,
             model=self.model,
             tokenizer_id=self.tokenizer_id,
         )

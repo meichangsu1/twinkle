@@ -404,6 +404,15 @@ def gqa_kv_seq_gather_select(
     query_end = query_start + local_query_heads
     kv_start = query_start // kv_group_size
     kv_end = (query_end - 1) // kv_group_size + 1
+    if kv_end - kv_start > 1:
+        aligned_start = query_start == kv_start * kv_group_size
+        aligned_end = query_end == kv_end * kv_group_size
+        if not (aligned_start and aligned_end):
+            raise NotImplementedError(
+                'GQA-aware Ulysses requires each local query-head range to either stay within one KV head group '
+                'or cover complete KV head groups. '
+                f'Got query_heads={query_heads}, kv_heads={kv_heads}, sp_world_size={sp_world_size}, '
+                f'local_query_range=({query_start}, {query_end}), kv_group_size={kv_group_size}.')
     return _SeqGatherSelectHeads.apply(
         sequence_parallel._sp_group,
         tensor,

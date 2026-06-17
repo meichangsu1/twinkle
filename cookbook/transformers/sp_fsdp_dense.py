@@ -1,9 +1,8 @@
-import numpy as np
 from functools import partial
 from peft import LoraConfig
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, Platform, get_logger
+from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
@@ -15,24 +14,18 @@ logger = get_logger()
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 DATASETS = 'ms://swift/self-cognition'
 
-device_group = [DeviceGroup(
-    name='default',
-    ranks=[0, 1, 2, 3],
-    device_type=Platform.get_platform().device_prefix(),
-)]
-
-# FSDP + sequence-parallel validation over 4 GPUs: dp=2, fsdp=2.
+# FSDP + sequence-parallel validation over 8 GPUs: dp=1, fsdp=8.
 # In Transformers route, ulysses_size is the total sequence-parallel degree.
-device_mesh = DeviceMesh(
+device_mesh = DeviceMesh.from_sizes(
     device_type=Platform.get_platform().device_prefix(),
-    mesh=np.arange(4).reshape(2, 2),
-    mesh_dim_names=('dp', 'fsdp'),
-    ulysses_size=2,
+    world_size=8,
+    fsdp_size=8,
+    ulysses_size=8,
 )
 
 twinkle.initialize(
     mode='local',
-    nproc_per_node=4,
+    nproc_per_node=8,
     global_device_mesh=device_mesh,
     lazy_collect=False,
 )
@@ -71,7 +64,6 @@ def train():
         strategy='native_fsdp',
         sp_config={
             'enabled': True,
-            'ulysses_size': 8,
             'gather_logits': True,
             'gqa_ulysses_all_to_all': True,
         },
