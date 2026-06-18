@@ -66,6 +66,7 @@ def train():
             'enabled': True,
             'gather_logits': True,
             'gqa_ulysses_all_to_all': True,
+            'gqa_ulysses_average_kv_grads': True,
         },
     )
     # npu patch

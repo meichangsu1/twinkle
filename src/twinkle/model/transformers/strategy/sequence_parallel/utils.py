@@ -352,6 +352,7 @@ class _SeqGatherSelectHeads(torch.autograd.Function):
         head_start: int,
         head_end: int,
         total_heads: int,
+        grad_reduce_divisor: int,
     ) -> torch.Tensor:
         input = input.contiguous()
         world_size = dist.get_world_size(group)
@@ -365,10 +366,11 @@ class _SeqGatherSelectHeads(torch.autograd.Function):
         ctx.head_start = head_start
         ctx.head_end = head_end
         ctx.total_heads = total_heads
+        ctx.grad_reduce_divisor = grad_reduce_divisor
         return full[:, :, head_start:head_end, :].contiguous()
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None, None]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None, None, None]:
         grad_output = grad_output.contiguous()
         full_grad = grad_output.new_zeros(
             grad_output.shape[0],
@@ -378,9 +380,11 @@ class _SeqGatherSelectHeads(torch.autograd.Function):
         )
         full_grad[:, :, ctx.head_start:ctx.head_end, :].copy_(grad_output)
         dist.all_reduce(full_grad, group=ctx.group)
+        if ctx.grad_reduce_divisor > 1:
+            full_grad.div_(ctx.grad_reduce_divisor)
         seq_start = ctx.rank * ctx.local_seq_len
         seq_end = seq_start + ctx.local_seq_len
-        return None, full_grad[:, seq_start:seq_end, :, :].contiguous(), None, None, None
+        return None, full_grad[:, seq_start:seq_end, :, :].contiguous(), None, None, None, None
 
 
 def gqa_kv_seq_gather_select(
@@ -407,6 +411,7 @@ def gqa_kv_seq_gather_select(
     query_end = query_start + local_query_heads
     kv_start = query_start // kv_group_size
     kv_end = (query_end - 1) // kv_group_size + 1
+    grad_reduce_divisor = 1
     if kv_end - kv_start > 1:
         aligned_start = query_start == kv_start * kv_group_size
         aligned_end = query_end == kv_end * kv_group_size
@@ -416,12 +421,16 @@ def gqa_kv_seq_gather_select(
                 'or cover complete KV head groups. '
                 f'Got query_heads={query_heads}, kv_heads={kv_heads}, sp_world_size={sp_world_size}, '
                 f'local_query_range=({query_start}, {query_end}), kv_group_size={kv_group_size}.')
+    elif bool(getattr(sequence_parallel, 'gqa_ulysses_average_kv_grads', True)):
+        if kv_group_size % local_query_heads == 0:
+            grad_reduce_divisor = max(1, kv_group_size // local_query_heads)
     return _SeqGatherSelectHeads.apply(
         sequence_parallel._sp_group,
         tensor,
         kv_start,
         kv_end,
         kv_heads,
+        grad_reduce_divisor,
     )
 
 

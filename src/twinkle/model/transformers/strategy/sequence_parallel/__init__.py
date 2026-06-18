@@ -78,6 +78,7 @@ class SequenceParallel:
         self.num_attention_heads = None
         self.num_key_value_heads = None
         self.gqa_ulysses_all_to_all = False
+        self.gqa_ulysses_average_kv_grads = True
         self.causal_mask_func = None
         self.extra_kwargs = {}
 
@@ -492,6 +493,7 @@ class SequenceParallel:
         device_mesh: Optional[DeviceMesh] = None,
         *,
         gqa_ulysses_all_to_all: bool = False,
+        gqa_ulysses_average_kv_grads: bool = True,
     ):
         llm_model = get_llm_model(model)
         config_candidates = [getattr(model, 'config', None)]
@@ -506,6 +508,7 @@ class SequenceParallel:
         self.num_attention_heads = None
         self.num_key_value_heads = None
         self.gqa_ulysses_all_to_all = bool(gqa_ulysses_all_to_all)
+        self.gqa_ulysses_average_kv_grads = bool(gqa_ulysses_average_kv_grads)
         for config in config_candidates:
             if config is None:
                 continue
@@ -926,6 +929,7 @@ class SequenceParallelConfig:
     ulysses_size: Optional[int] = None
     gather_logits: bool = True
     gqa_ulysses_all_to_all: bool = False
+    gqa_ulysses_average_kv_grads: bool = True
 
 
 class SequenceParallelStrategy:
@@ -983,6 +987,7 @@ class SequenceParallelStrategy:
             tokenizer,
             device_mesh=self.device_mesh,
             gqa_ulysses_all_to_all=bool(self.sp_config.get('gqa_ulysses_all_to_all', False)),
+            gqa_ulysses_average_kv_grads=bool(self.sp_config.get('gqa_ulysses_average_kv_grads', True)),
         )
         self._initialized = True
         return True
