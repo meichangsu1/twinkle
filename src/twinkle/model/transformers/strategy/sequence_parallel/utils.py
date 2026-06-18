@@ -353,11 +353,12 @@ class _SeqGatherSelectHeads(torch.autograd.Function):
         head_end: int,
         total_heads: int,
     ) -> torch.Tensor:
+        input = input.contiguous()
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)
         gathered = [torch.empty_like(input) for _ in range(world_size)]
         dist.all_gather(gathered, input, group=group)
-        full = torch.cat(gathered, dim=1)
+        full = torch.cat(gathered, dim=1).contiguous()
         ctx.group = group
         ctx.rank = rank
         ctx.local_seq_len = input.shape[1]
@@ -368,6 +369,7 @@ class _SeqGatherSelectHeads(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None, None]:
+        grad_output = grad_output.contiguous()
         full_grad = grad_output.new_zeros(
             grad_output.shape[0],
             grad_output.shape[1],
@@ -389,7 +391,8 @@ def gqa_kv_seq_gather_select(
 ) -> torch.Tensor:
     sp_world_size = int(getattr(sequence_parallel, 'sp_world_size', 1) or 1)
     if sp_world_size <= 1:
-        return tensor
+        return tensor.contiguous()
+    tensor = tensor.contiguous()
     kv_heads = int(tensor.shape[2])
     if query_heads % sp_world_size != 0:
         raise NotImplementedError(f'GQA-aware Ulysses requires num_attention_heads ({query_heads}) to be divisible by '
