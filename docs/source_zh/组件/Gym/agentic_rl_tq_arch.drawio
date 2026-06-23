@@ -1,0 +1,97 @@
+<mxfile host="app.diagrams.net" modified="2026-06-23T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="agentic-rl-tq-architecture" name="TransferQueue-centered architecture">
+    <mxGraphModel dx="1500" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1280" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="Agentic RL with TransferQueue" style="text;html=1;strokeColor=none;fillColor=none;fontSize=20;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="390" y="10" width="500" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="pipeline" value="BaseRLPipeline / Controller&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;init roles / run loop / sync train_k&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="460" y="60" width="360" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="tqclient" value="TransferQueueDataPlane&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;data-plane boundary for all TQ operations&lt;br&gt;get_metadata / put / claim / append / mark / clear&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="430" y="310" width="420" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="tq" value="TransferQueue&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;partition: train_k&lt;br&gt;rows / fields / metadata&lt;br&gt;ready / consumed / policy_version&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="545" width="280" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="staleness" value="StalenessManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;max_staleness&lt;br&gt;live partition count&lt;br&gt;rollout capacity&lt;br&gt;throttle / sleep hint&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="130" width="250" height="115" as="geometry" />
+        </mxCell>
+        <mxCell id="rolloutworker" value="RolloutWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;AsyncRollouter&lt;br&gt;pending_queue / active_tasks&lt;br&gt;transfer_buffer / max_concurrency&lt;br&gt;decides submit / throttle / sleep&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="55" y="300" width="280" height="135" as="geometry" />
+        </mxCell>
+        <mxCell id="multiturn" value="MultiTurnRollout&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;multi-turn / tool loop&lt;br&gt;user env/tool hooks&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="495" width="250" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="sampler" value="vLLMSampler&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;sample / astream_one&lt;br&gt;receive_weights&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="630" width="250" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="reward" value="RewardWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;claim_reward_batch&lt;br&gt;compute_rewards&lt;br&gt;append_rewards&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="950" y="205" width="250" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="advantage" value="AdvantageWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;claim_reward_ready_groups&lt;br&gt;compute_advantages&lt;br&gt;append_advantages&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="950" y="350" width="250" height="115" as="geometry" />
+        </mxCell>
+        <mxCell id="trainer" value="TrainerWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;train loop&lt;br&gt;forward_backward&lt;br&gt;mark_trained(train_k)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="950" y="520" width="250" height="125" as="geometry" />
+        </mxCell>
+        <mxCell id="streamingdataset" value="StreamingDataset / StreamingDataLoader&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;TQ-backed train batch iterator&lt;br&gt;read samples from train_k&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="910" y="690" width="310" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="ckpt" value="CheckpointEngineManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;sync weights once per train_k&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="675" width="280" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="contract" value="Key boundaries&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;StalenessManager computes capacity only&lt;br&gt;AsyncRollouter decides submit / throttle / sleep&lt;br&gt;Workers access TQ only through TransferQueueDataPlane&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="420" y="790" width="440" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_pipeline_tqc" value="1. init_data_plane()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="pipeline" target="tqclient">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_tqc_tq" value="6/8/9/11/15. TQ read/write" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="tqclient" target="tq">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_tqc_staleness" value="2. get_metadata()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="tqclient" target="staleness">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_staleness_rollout" value="3. get_rollout_capacity()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="staleness" target="rolloutworker">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_rollout_tqc" value="6. put_rollout_batch(train_k)" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rolloutworker" target="tqclient">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_rollout_multiturn" value="4. generate_group()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rolloutworker" target="multiturn">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_multiturn_sampler" value="5. sample()/astream_one()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="multiturn" target="sampler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_reward_tqc" value="8. claim_reward_batch()/append_rewards()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="reward" target="tqclient">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_adv_tqc" value="9. claim_reward_ready()/append_advantages()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="advantage" target="tqclient">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_trainer_streamingdataset" value="10. iter(train_k)" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="trainer" target="streamingdataset">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_streamingdataset_tqc" value="11. read_train_batch()/ack()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="streamingdataset" target="tqclient">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_trainer_pipeline" value="12. mark_trained(train_k)" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="trainer" target="pipeline">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_pipeline_ckpt" value="13. sync_weights(train_k)" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="pipeline" target="ckpt">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_ckpt_sampler" value="14. receive_weights()" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="ckpt" target="sampler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_pipeline_clear" value="15. clear_partition(train_k)" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;dashed=1;" edge="1" parent="1" source="pipeline" target="tqclient">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
