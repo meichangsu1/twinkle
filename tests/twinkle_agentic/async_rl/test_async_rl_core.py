@@ -55,6 +55,10 @@ def test_training_context_namespace_and_metadata_validation():
         context.validate_metadata(metadata)
 
 
+@pytest.mark.skipif(
+    __import__('importlib').util.find_spec('transfer_queue') is not None,
+    reason='transfer_queue is installed',
+)
 def test_default_data_plane_requires_real_transfer_queue_when_not_installed():
     with pytest.raises(RuntimeError, match='transfer_queue is required'):
         TransferQueueDataPlane()

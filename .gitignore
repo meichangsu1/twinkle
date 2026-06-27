@@ -158,3 +158,4 @@ ast_index_file.py
 test_cookbook/
 /test*.py
 swanlog/
+AGENTS.md

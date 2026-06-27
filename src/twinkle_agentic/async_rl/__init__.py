@@ -22,8 +22,10 @@ from .types import (
     ComponentResult,
     PartitionMetadata,
     PartitionStatus,
+    QueueMetadata,
     RolloutCapacity,
     RolloutContextState,
+    TaskName,
     TrainingContext,
 )
 from .workers import AdvantageWorker, AsyncRollouter, RewardWorker, ToolManagerFactory, TrainerScheduler, TrainerWorker
@@ -47,10 +49,12 @@ __all__ = [
     'PartitionStatus',
     'PreferCurrentTrainPolicy',
     'PromptFeeder',
+    'QueueMetadata',
     'RewardWorker',
     'RolloutCapacity',
     'RolloutContextState',
     'StalenessManager',
+    'TaskName',
     'ToolManagerFactory',
     'TrainerScheduler',
     'TrainerWorker',

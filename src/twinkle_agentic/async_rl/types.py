@@ -19,6 +19,13 @@ class PartitionStatus(StrEnum):
     CANCELLED = 'CANCELLED'
 
 
+class TaskName(StrEnum):
+    ROLLOUT = 'rollout'
+    REWARD = 'reward'
+    ADVANTAGE = 'advantage'
+    TRAIN = 'train'
+
+
 class AdapterState(StrEnum):
     LOADING = 'LOADING'
     ACTIVE = 'ACTIVE'
@@ -129,6 +136,37 @@ class PartitionMetadata:
             'num_rows': self.num_rows,
         })
         return tag
+
+
+@dataclass
+class QueueMetadata:
+    """Aggregate metadata for a TrainingScope, returned by get_metadata().
+    Implements __iter__ to yield active_partitions, so it can be used
+    as a drop-in replacement for list[PartitionMetadata] in existing code
+    (e.g. StalenessManager.get_rollout_capacity).
+    """
+
+    context: TrainingContext
+    active_partitions: list[PartitionMetadata]
+    total_rows: int
+    trainer_step: int
+    current_policy_version: int
+
+    @property
+    def live_partition_count(self) -> int:
+        return len(self.active_partitions)
+
+    @property
+    def oldest_partition(self) -> Optional[PartitionMetadata]:
+        if not self.active_partitions:
+            return None
+        return min(self.active_partitions, key=lambda p: (p.created_at, p.partition_id))
+
+    def __iter__(self):
+        return iter(self.active_partitions)
+
+    def __len__(self):
+        return len(self.active_partitions)
 
 
 @dataclass
