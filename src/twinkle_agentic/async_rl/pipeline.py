@@ -30,9 +30,7 @@ class BaseRLPipelineConfig:
     base_model_id: str = ''
     adapter_name: str = 'default'
     reward_type: str = 'default'
-    loss_type: str = 'grpo'
     algorithm: str = 'grpo'
-    env_type: str = 'tool_calling'
     tool_profile: str = 'default'
     max_staleness: int = 0
     max_concurrent_groups: int = 16
@@ -156,9 +154,7 @@ class BaseRLPipeline:
             base_model_id=config.base_model_id,
             adapter_name=config.adapter_name,
             reward_type=config.reward_type,
-            loss_type=config.loss_type,
             algorithm=config.algorithm,
-            env_type=config.env_type,
             tool_profile=config.tool_profile,
         )
 
@@ -192,10 +188,9 @@ class BaseRLPipeline:
             self.staleness_manager = StalenessManager(
                 max_staleness=config.max_staleness,
                 target_groups_per_partition=config.target_groups_per_partition,
-            )
+        )
         for context in self.contexts:
             self.adapter_registry.register(context)
-            self.data_plane.init_namespace(context)
 
     def create_roles(self) -> None:
         """Create runtime roles for the default GRPO pipeline."""
@@ -472,7 +467,7 @@ class BaseRLPipeline:
     def current_context(self, context: TrainingContext | None = None) -> TrainingContext:
         base_context = context or self.context
         record = self.adapter_registry.get(base_context)
-        return base_context.with_policy_version(record.policy_version, record.adapter_revision)
+        return base_context.with_policy_version(record.policy_version, record.adapter_path)
 
     def current_contexts(self) -> list[TrainingContext]:
         return [self.current_context(context) for context in self.contexts]

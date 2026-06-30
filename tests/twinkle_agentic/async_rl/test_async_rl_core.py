@@ -31,7 +31,6 @@ def make_context(name='a', *, tenant='tenant', run='run', version=0):
         adapter_name=name,
         policy_version=version,
         reward_type='constant',
-        loss_type='grpo',
         algorithm='grpo',
     )
 
@@ -63,7 +62,6 @@ def test_default_data_plane_requires_real_transfer_queue_when_not_installed():
 def test_data_plane_rollout_reward_advantage_and_clear():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
-    data_plane.init_namespace(context)
     partition = data_plane.create_partition(context, target_groups=1)
 
     meta = data_plane.put_rollout_batch(context, partition.partition_id, [make_sample(0)], seal=True)
@@ -134,9 +132,9 @@ def test_adapter_registry_blocks_current_adapter_during_sync_only():
     assert not registry.can_accept_rollout(a)
     assert registry.can_accept_rollout(b)
 
-    updated = registry.on_weight_sync_finished(a, adapter_revision='/tmp/a')
+    updated = registry.on_weight_sync_finished(a, adapter_path='/tmp/a')
     assert updated.policy_version == 1
-    assert updated.adapter_revision == '/tmp/a'
+    assert updated.adapter_path == '/tmp/a'
     assert registry.can_accept_rollout(a)
 
 
@@ -173,7 +171,7 @@ def test_staleness_allows_filling_current_open_partition_at_limit():
 
 def test_data_plane_allows_mixed_policy_versions_inside_open_partition():
     context_v0 = make_context('lora', version=0)
-    context_v1 = context_v0.with_policy_version(1, adapter_revision='/tmp/lora-v1')
+    context_v1 = context_v0.with_policy_version(1, adapter_path='/tmp/lora-v1')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
 
     partition = data_plane.create_partition(context_v0, target_groups=2)
@@ -292,7 +290,7 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     def train_fn(ctx, partition_id, dataloader):
         assert ctx == context
         assert len(dataloader) == 1
-        return {'adapter_revision': '/tmp/adapter-lora-v1'}
+        return {'adapter_path': '/tmp/adapter-lora-v1'}
 
     trainer = TrainerWorker(
         data_plane=data_plane,
@@ -306,7 +304,7 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     assert train_result.kind == 'train'
     assert trainer.run_once() is None
     assert received[0].policy_version == 1
-    assert received[0].adapter_revision == '/tmp/adapter-lora-v1'
+    assert received[0].adapter_path == '/tmp/adapter-lora-v1'
     assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
     assert registry.get(context).live_partitions == set()
 

@@ -121,11 +121,11 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
     assert model.save_calls[0]['adapter_name'] == 'lora_a'
     assert model.save_calls[0]['is_sampler'] is True
     assert received[0].policy_version == 1
-    assert received[0].adapter_revision == '/tmp/lora_a-v1'
+    assert received[0].adapter_path == '/tmp/lora_a-v1'
     assert pipeline.data_plane.list_partitions(pipeline.context)[0].status == PartitionStatus.CLEARED
 
 
-def test_base_pipeline_uses_latest_adapter_revision_for_next_rollout():
+def test_base_pipeline_uses_latest_adapter_path_for_next_rollout():
     model = FakeMultiLoraModel()
     rollout = EchoRollout()
     pipeline = FakeGRPOPipeline(
@@ -158,7 +158,6 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
         base_model_id='base',
         adapter_name='lora_a',
         reward_type='constant',
-        loss_type='grpo',
     )
     context_b = TrainingContext(
         tenant_id='tenant_b',
@@ -166,7 +165,6 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
         base_model_id='base',
         adapter_name='lora_b',
         reward_type='constant',
-        loss_type='grpo',
     )
     model = FakeMultiLoraModel()
     rollout = EchoRollout()
@@ -206,7 +204,6 @@ def test_base_pipeline_feeds_prompts_from_prompt_feeders():
         base_model_id='base',
         adapter_name='lora_a',
         reward_type='constant',
-        loss_type='grpo',
     )
     context_b = TrainingContext(
         tenant_id='tenant_b',
@@ -214,7 +211,6 @@ def test_base_pipeline_feeds_prompts_from_prompt_feeders():
         base_model_id='base',
         adapter_name='lora_b',
         reward_type='constant',
-        loss_type='grpo',
     )
     model = FakeMultiLoraModel()
     rollout = EchoRollout()

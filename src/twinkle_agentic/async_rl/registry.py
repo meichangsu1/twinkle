@@ -31,7 +31,7 @@ class AdapterRegistry:
                 base_model_id=context.base_model_id,
                 state=state,
                 policy_version=context.policy_version,
-                adapter_revision=context.adapter_revision,
+                adapter_path=context.adapter_path,
                 weight=weight,
             )
             self._records[key] = record
@@ -112,17 +112,17 @@ class AdapterRegistry:
         self,
         context: TrainingContext,
         *,
-        adapter_revision: str | None = None,
+        adapter_path: str | None = None,
         policy_version: int | None = None,
     ) -> TrainingContext:
         with self._lock:
             record = self.get(context)
             record.sync_in_progress = False
             record.policy_version = record.policy_version + 1 if policy_version is None else policy_version
-            if adapter_revision is not None:
-                record.adapter_revision = adapter_revision
+            if adapter_path is not None:
+                record.adapter_path = adapter_path
             record.touch()
-            return context.with_policy_version(record.policy_version, record.adapter_revision)
+            return context.with_policy_version(record.policy_version, record.adapter_path)
 
     def mark_failed(self, context: TrainingContext, error: str) -> None:
         with self._lock:

@@ -87,7 +87,6 @@ class AsyncRollouter:
         or more trajectories depending on the rollout implementation.
         """
         self.adapter_registry.register(context)
-        self.data_plane.init_namespace(context)
         queue = self.pending_prompt_groups_by_context[context.key]
         for prompt_group in prompt_groups:
             queue.append((context, prompt_group))
@@ -106,7 +105,7 @@ class AsyncRollouter:
             return None
         partitions = self.data_plane.get_metadata(context)
         record = self.adapter_registry.get(context)
-        context = context.with_policy_version(record.policy_version, record.adapter_revision)
+        context = context.with_policy_version(record.policy_version, record.adapter_path)
         capacity = self.staleness_manager.get_rollout_capacity(context, partitions)
         open_partitions = [p for p in partitions if p.status == PartitionStatus.OPEN]
         train_ready = [p for p in partitions if p.status == PartitionStatus.TRAIN_READY]
@@ -188,8 +187,8 @@ class AsyncRollouter:
         self.adapter_registry.on_rollout_started(context)
         try:
             rollout_kwargs = {'tool_manager': tool_manager, 'adapter_name': context.adapter_name}
-            if context.adapter_revision is not None:
-                rollout_kwargs['adapter_path'] = context.adapter_revision
+            if context.adapter_path is not None:
+                rollout_kwargs['adapter_path'] = context.adapter_path
             result = await self.invoke_rollout(trajectories, rollout_kwargs)
             if inspect.isawaitable(result):
                 result = await result
@@ -419,7 +418,7 @@ class TrainerScheduler:
 
 @dataclass
 class TrainerStepResult:
-    adapter_revision: str | None = None
+    adapter_path: str | None = None
     metrics: dict[str, Any] | None = None
 
 
@@ -466,15 +465,15 @@ class TrainerWorker:
         dataloader = self.data_plane.build_streaming_dataloader(context, partition.partition_id)
         try:
             result = self.train_partition_fn(context, partition.partition_id, dataloader)
-            adapter_revision = None
+            adapter_path = None
             if isinstance(result, TrainerStepResult):
-                adapter_revision = result.adapter_revision
+                adapter_path = result.adapter_path
             elif isinstance(result, dict):
-                adapter_revision = result.get('adapter_revision')
+                adapter_path = result.get('adapter_path')
             self.data_plane.mark_trained(context, partition.partition_id)
             self.adapter_registry.on_train_finished(context, partition.partition_id)
             self.adapter_registry.on_weight_sync_started(context)
-            new_context = self.adapter_registry.on_weight_sync_finished(context, adapter_revision=adapter_revision)
+            new_context = self.adapter_registry.on_weight_sync_finished(context, adapter_path=adapter_path)
             if self.receive_weights_fn is not None:
                 self.receive_weights_fn(new_context)
             self.data_plane.clear_partition(context, partition.partition_id)
@@ -554,9 +553,9 @@ class MultiLoraGRPOTrainerWorker(TrainerWorker):
             name=f'{config.save_name_prefix}-{context.training_run_id}-{context.adapter_name}',
             **save_kwargs,
         )
-        adapter_revision = getattr(save_result, 'twinkle_path', None)
-        if adapter_revision is None and isinstance(save_result, str):
-            adapter_revision = save_result
-        if adapter_revision is None and isinstance(save_result, dict):
-            adapter_revision = save_result.get('twinkle_path') or save_result.get('path')
-        return TrainerStepResult(adapter_revision=adapter_revision)
+        adapter_path = getattr(save_result, 'twinkle_path', None)
+        if adapter_path is None and isinstance(save_result, str):
+            adapter_path = save_result
+        if adapter_path is None and isinstance(save_result, dict):
+            adapter_path = save_result.get('twinkle_path') or save_result.get('path')
+        return TrainerStepResult(adapter_path=adapter_path)

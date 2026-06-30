@@ -33,7 +33,6 @@ def build_training_contexts(cfg) -> list[TrainingContext]:
                 base_model_id=context_cfg.base_model_id,
                 adapter_name=context_cfg.adapter_name,
                 reward_type=context_cfg.reward_type,
-                loss_type=context_cfg.loss_type,
                 tool_profile=context_cfg.get('tool_profile', 'default'),
                 algorithm=context_cfg.get('algorithm', cfg.pipeline.get('algorithm', 'grpo')),
             ))
@@ -110,7 +109,6 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         base_model_id=primary_context.base_model_id,
         adapter_name=primary_context.adapter_name,
         reward_type=primary_context.reward_type,
-        loss_type=primary_context.loss_type,
         algorithm=primary_context.algorithm,
         tool_profile=primary_context.tool_profile,
         max_staleness=int(cfg.pipeline.max_staleness),
@@ -479,8 +477,8 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             save_optimizer=bool(self.cfg.pipeline.save_optimizer),
             is_sampler=bool(self.cfg.pipeline.is_sampler_checkpoint),
         )
-        adapter_revision = save_result if isinstance(save_result, str) else getattr(save_result, 'twinkle_path', None)
-        return TrainerStepResult(adapter_revision=adapter_revision)
+        adapter_path = save_result if isinstance(save_result, str) else getattr(save_result, 'twinkle_path', None)
+        return TrainerStepResult(adapter_path=adapter_path)
 
 
 def grpo_advantage_fn(samples: list[dict[str, Any]], context) -> tuple[list[float], list[float]]:

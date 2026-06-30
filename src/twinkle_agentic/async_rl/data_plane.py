@@ -64,9 +64,6 @@ class TransferQueueDataPlane:
             flags={'allow_objects': True},
         )
 
-    def init_namespace(self, context: TrainingContext) -> None:
-        context.metadata()
-
     def next_partition_id(self, context: TrainingContext) -> str:
         with self._lock:
             self._load_partition_meta()
@@ -250,11 +247,11 @@ class TransferQueueDataPlane:
         context: TrainingContext,
         batch_size: int,
         statuses: Iterable[PartitionStatus],
-        task_name: str,
+        stage: str,
     ) -> tuple[PartitionMetadata, list[SampleRecord]]:
         partitions = self.list_partitions(context, statuses=statuses)
         if not partitions:
-            raise LookupError(f'no {task_name}-ready partition for {context.key}')
+            raise LookupError(f'no {stage}-ready partition for {context.key}')
         meta = partitions[0]
         return meta, self._get_samples(meta.partition_id)[:batch_size]
 
@@ -345,12 +342,10 @@ class TransferQueueDataPlane:
                 training_run_id=tag['training_run_id'],
                 base_model_id=tag['base_model_id'],
                 adapter_name=tag['adapter_name'],
-                adapter_revision=tag.get('adapter_revision'),
+                adapter_path=tag.get('adapter_path'),
                 policy_version=int(tag.get('policy_version', 0)),
-                env_type=tag.get('env_type', 'tool_calling'),
                 tool_profile=tag.get('tool_profile', 'default'),
                 reward_type=tag.get('reward_type', 'default'),
-                loss_type=tag.get('loss_type', 'default'),
                 algorithm=tag.get('algorithm', 'grpo'),
             )
             return PartitionMetadata(

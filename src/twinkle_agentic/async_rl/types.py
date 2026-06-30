@@ -33,12 +33,10 @@ class TrainingContext:
     training_run_id: str
     base_model_id: str
     adapter_name: str
-    adapter_revision: str | None = None
+    adapter_path: str | None = None
     policy_version: int = 0
-    env_type: str = 'tool_calling'
     tool_profile: str = 'default'
     reward_type: str = 'default'
-    loss_type: str = 'default'
     algorithm: str = 'grpo'
 
     @property
@@ -49,18 +47,16 @@ class TrainingContext:
         suffix = train_id if isinstance(train_id, str) and train_id.startswith('train_') else f'train_{train_id}'
         return f'{self.key}/{suffix}'
 
-    def with_policy_version(self, policy_version: int, adapter_revision: str | None = None) -> TrainingContext:
+    def with_policy_version(self, policy_version: int, adapter_path: str | None = None) -> TrainingContext:
         return TrainingContext(
             tenant_id=self.tenant_id,
             training_run_id=self.training_run_id,
             base_model_id=self.base_model_id,
             adapter_name=self.adapter_name,
-            adapter_revision=self.adapter_revision if adapter_revision is None else adapter_revision,
+            adapter_path=self.adapter_path if adapter_path is None else adapter_path,
             policy_version=policy_version,
-            env_type=self.env_type,
             tool_profile=self.tool_profile,
             reward_type=self.reward_type,
-            loss_type=self.loss_type,
             algorithm=self.algorithm,
         )
 
@@ -70,19 +66,17 @@ class TrainingContext:
             'training_run_id': self.training_run_id,
             'base_model_id': self.base_model_id,
             'adapter_name': self.adapter_name,
-            'adapter_revision': self.adapter_revision,
+            'adapter_path': self.adapter_path,
             'policy_version': self.policy_version,
-            'env_type': self.env_type,
             'tool_profile': self.tool_profile,
             'reward_type': self.reward_type,
-            'loss_type': self.loss_type,
             'algorithm': self.algorithm,
         }
 
     def validate_metadata(self, metadata: dict[str, Any], *, strict_policy_version: bool = True) -> None:
         expected = self.metadata()
         for key, expected_value in expected.items():
-            if key == 'adapter_revision':
+            if key == 'adapter_path':
                 continue
             if key == 'policy_version' and not strict_policy_version:
                 continue
@@ -102,8 +96,6 @@ class PartitionMetadata:
     status: PartitionStatus = PartitionStatus.OPEN
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
-    owner_worker_id: str | None = None
-    lease_deadline: float | None = None
     num_rows: int = 0
 
     @property
@@ -115,11 +107,11 @@ class PartitionMetadata:
 
     def tag(self) -> dict[str, Any]:
         tag = self.context.metadata()
-        # Sample-level policy_version / adapter_revision must remain attached
+        # Sample-level policy_version / adapter_path must remain attached
         # to each row. Partition tags carry lifecycle state and the version that
         # opened the partition, but must not overwrite row generation metadata.
         tag.pop('policy_version', None)
-        tag.pop('adapter_revision', None)
+        tag.pop('adapter_path', None)
         tag.update({
             'partition_id': self.partition_id,
             'partition_policy_version': self.policy_version,
@@ -139,7 +131,7 @@ class AdapterRecord:
     base_model_id: str
     state: AdapterState = AdapterState.LOADING
     policy_version: int = 0
-    adapter_revision: str | None = None
+    adapter_path: str | None = None
     train_slot_name: str | None = None
     rollout_slot_name: str | None = None
     live_partitions: set[str] = field(default_factory=set)
