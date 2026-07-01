@@ -6,11 +6,14 @@ import re
 from functools import partial
 from typing import Any, List
 
+from twinkle import get_logger
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_loader import PromptLoader
 from .types import LoraContext
 from .workers import TrainerStepResult
+
+logger = get_logger()
 
 _LORA_CONTEXT_MODEL_RESOURCE_KEYS = {
     'mesh',
@@ -121,6 +124,20 @@ def _build_lora_config(lora_cfg):
     if 'lora_dropout' in kwargs:
         kwargs['lora_dropout'] = float(kwargs['lora_dropout'])
     return LoraConfig(**kwargs)
+
+
+def _metric_payload(metric: Any) -> dict[str, Any]:
+    if metric is None:
+        return {}
+    result = getattr(metric, 'result', None)
+    if result is not None:
+        return result
+    if hasattr(metric, 'model_dump'):
+        dumped = metric.model_dump()
+        return dumped.get('result', dumped)
+    if isinstance(metric, dict):
+        return metric.get('result', metric)
+    return {'metric': metric}
 
 
 def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: dict[str, Any]):
@@ -522,6 +539,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         micro_batch_size = int(train_cfg.get('micro_batch_size', 1))
         context_model_cfg = lora_model_config_for_context(self.cfg, context)
         max_length = int(context_model_cfg.template.max_length)
+        last_metrics: dict[str, Any] = {}
         for mb_start in range(0, len(batch), mini_batch_size):
             mini_batch = batch[mb_start:mb_start + mini_batch_size]
             inputs = [model_input_from_training_sample(sample) for sample in mini_batch]
@@ -546,8 +564,21 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 max_grad_norm=float(self.cfg.pipeline.max_grad_norm),
                 norm_type=int(self.cfg.pipeline.norm_type),
             )
+            last_metrics = _metric_payload(
+                self.model.calculate_metric(
+                    is_training=True,
+                    adapter_name=context.adapter_name,
+                ))
+            logger.info(
+                'async_multi_lora_grpo train metrics: context=%s partition=%s mini_batch=%s/%s metrics=%s',
+                context.key,
+                partition_id,
+                mb_start // mini_batch_size + 1,
+                (len(batch) + mini_batch_size - 1) // mini_batch_size,
+                last_metrics,
+            )
 
-        return TrainerStepResult()
+        return TrainerStepResult(metrics=last_metrics)
 
     def save_adapter(self, context, partition_id: str) -> TrainerStepResult:
         save_name = (f'{self.cfg.pipeline.save_name_prefix}-{context.training_run_id}-'
