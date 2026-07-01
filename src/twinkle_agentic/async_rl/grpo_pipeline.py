@@ -140,6 +140,77 @@ def _metric_payload(metric: Any) -> dict[str, Any]:
     return {'metric': metric}
 
 
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        if len(value) == 1:
+            return _as_float(value[0])
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stats(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    count = len(values)
+    mean = sum(values) / count
+    variance = sum((value - mean)**2 for value in values) / count
+    return {
+        'mean': mean,
+        'std': variance**0.5,
+        'min': min(values),
+        'max': max(values),
+    }
+
+
+def _prefixed_stats(prefix: str, values: list[float]) -> dict[str, float]:
+    return {f'{prefix}_{key}': value for key, value in _stats(values).items()}
+
+
+def _training_batch_diagnostics(samples: list[dict[str, Any]], inputs: list[dict[str, Any]]) -> dict[str, Any]:
+    rewards = []
+    advantages = []
+    old_logps_lens = []
+    input_lens = []
+    group_ids = set()
+    generation_ids = set()
+
+    for sample, model_input in zip(samples, inputs):
+        reward = _as_float(sample.get('rewards', sample.get('reward')))
+        if reward is not None:
+            rewards.append(reward)
+        advantage = _as_float(sample.get('advantages', sample.get('advantage')))
+        if advantage is not None:
+            advantages.append(advantage)
+        old_logps = sample.get('old_logps') or []
+        old_logps_lens.append(float(len(old_logps)))
+        input_ids = model_input.get('input_ids') or []
+        input_lens.append(float(len(input_ids)))
+        group_id = sample.get('group_id')
+        if group_id is not None:
+            group_ids.add(group_id)
+        generation_idx = sample.get('generation_idx')
+        if generation_idx is not None:
+            generation_ids.add(generation_idx)
+
+    diagnostics: dict[str, Any] = {
+        'sample_count': len(samples),
+        'group_count': len(group_ids),
+        'generation_count': len(generation_ids),
+    }
+    diagnostics.update(_prefixed_stats('reward', rewards))
+    diagnostics.update(_prefixed_stats('advantage', advantages))
+    diagnostics.update(_prefixed_stats('old_logps_len', old_logps_lens))
+    diagnostics.update(_prefixed_stats('input_len', input_lens))
+    return diagnostics
+
+
 def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: dict[str, Any]):
     """Build a prompt dataset inside the DataLoader worker.
 
@@ -419,6 +490,13 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 adapter_name=adapter_name,
                 **_config_kwargs(adapter_model_cfg.loss),
             )
+            if adapter_model_cfg.loss.cls == 'GRPOLoss':
+                model.add_metric(
+                    'GRPOMetric',
+                    adapter_name=adapter_name,
+                    epsilon=float(adapter_model_cfg.loss.get('epsilon', 0.2)),
+                    epsilon_high=adapter_model_cfg.loss.get('epsilon_high'),
+                )
             processor_cfg = adapter_model_cfg.get('processor')
             processor_cls = processor_cfg.get('cls', InputProcessor) if processor_cfg is not None else InputProcessor
             processor_kwargs = _config_kwargs(processor_cfg) if processor_cfg is not None else {}
@@ -552,6 +630,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 )
             old_logps = [sample.get('old_logps', []) for sample in mini_batch]
             advantages = [sample.get('advantages', 0.0) for sample in mini_batch]
+            batch_diagnostics = _training_batch_diagnostics(mini_batch, inputs)
             self.model.forward_backward(
                 inputs=inputs,
                 old_logps=old_logps,
@@ -569,6 +648,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                     is_training=True,
                     adapter_name=context.adapter_name,
                 ))
+            last_metrics.update(batch_diagnostics)
             logger.info(
                 'async_multi_lora_grpo train metrics: context=%s partition=%s mini_batch=%s/%s metrics=%s',
                 context.key,
