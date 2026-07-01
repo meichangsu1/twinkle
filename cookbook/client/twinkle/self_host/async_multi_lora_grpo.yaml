@@ -2,29 +2,18 @@ client:
   base_url: http://127.0.0.1:8000
   api_key: EMPTY_TOKEN
 
-training_context:
-  tenant_id: tenant_a
-  training_run_id: gsm8k_grpo_run_001
-  base_model_id: ms://Qwen/Qwen3.5-4B
-  adapter_name: tenant_a_gsm8k_lora
-  reward_type: gsm8k
-  loss_type: grpo
-  tool_profile: default
-
-training_contexts:
+lora_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_grpo_run_001
     base_model_id: ms://Qwen/Qwen3.5-4B
     adapter_name: tenant_a_gsm8k_lora
     reward_type: gsm8k
-    loss_type: grpo
     tool_profile: default
   - tenant_id: tenant_b
     training_run_id: gsm8k_grpo_run_002
     base_model_id: ms://Qwen/Qwen3.5-4B
     adapter_name: tenant_b_gsm8k_lora
     reward_type: gsm8k
-    loss_type: grpo
     tool_profile: default
 
 model:
@@ -58,14 +47,12 @@ sampler:
     temperature: 1.0
     top_p: 0.95
     logprobs: 1
-  num_generations: 4
 
 dataset:
   dataset_id: ms://modelscope/gsm8k
   subset_name: main
   split: train
   data_num: 2000
-  batch_size: 2
   system_prompt: >-
     You are a helpful math assistant. Solve the problem with minimal but
     correct reasoning and put your final answer within \boxed{}.
@@ -73,9 +60,10 @@ dataset:
 pipeline:
   max_steps: 10
   max_staleness: 1
-  target_groups_per_partition: 1
-  max_concurrent_groups: 16
-  max_submit_groups: 1
+  rollout:
+    batch_size: 1
+    num_generations: 4
+    max_concurrent_groups: 16
   save_name_prefix: async-grpo-sampler-weights
   is_sampler_checkpoint: true
   save_optimizer: false

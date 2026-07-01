@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional
 
-from .types import PartitionMetadata, RolloutContextState, TrainingContext
+from .types import LoraContext, PartitionMetadata, RolloutContextState
 
 
 def _oldest_partition(partitions: Iterable[PartitionMetadata]) -> PartitionMetadata:
@@ -14,7 +14,7 @@ def _oldest_partition(partitions: Iterable[PartitionMetadata]) -> PartitionMetad
 class WorkConservingRolloutPolicy:
     """Prefer contexts that are most likely to keep trainer fed."""
 
-    def pick_next_context(self, candidates: list[RolloutContextState]) -> TrainingContext | None:
+    def pick_next_context(self, candidates: list[RolloutContextState]) -> LoraContext | None:
         candidates = [c for c in candidates if c.pending_groups > 0 and c.rollout_capacity > 0]
         if not candidates:
             return None
@@ -30,15 +30,19 @@ class WorkConservingRolloutPolicy:
         ).context
 
 
-class DeficitFairRolloutPolicy:
-    """Weighted deficit round-robin over rollout prompt groups."""
+class WeightedFairRolloutPolicy:
+    """Weighted fair scheduling over rollout prompt groups.
+
+    Implemented with deficit round-robin accounting: each context accrues
+    `weight * quantum` credit and one prompt-group rollout costs 1 credit.
+    """
 
     def __init__(self, quantum: float = 1.0):
         self.quantum = quantum
         self.deficit: dict[str, float] = defaultdict(float)
         self._cursor = 0
 
-    def pick_next_context(self, candidates: list[RolloutContextState]) -> TrainingContext | None:
+    def pick_next_context(self, candidates: list[RolloutContextState]) -> LoraContext | None:
         candidates = [c for c in candidates if c.pending_groups > 0 and c.rollout_capacity > 0]
         if not candidates:
             return None
@@ -64,7 +68,7 @@ class PreferCurrentTrainPolicy:
     def pick_next_partition(
         self,
         candidates: list[PartitionMetadata],
-        current_context: TrainingContext | None = None,
+        current_context: LoraContext | None = None,
     ) -> PartitionMetadata | None:
         if not candidates:
             return None
@@ -83,8 +87,13 @@ class PreferCurrentTrainPolicy:
         return _oldest_partition(selected_group)
 
 
-class DeficitFairTrainPolicy:
-    """Weighted deficit round-robin over train_k partitions."""
+class WeightedFairTrainPolicy:
+    """Weighted fair scheduling over train candidates.
+
+    Implemented with deficit round-robin accounting. The current MVP uses
+    equal context weights and returns the oldest partition for the selected
+    context.
+    """
 
     def __init__(self, quantum: float = 1.0):
         self.quantum = quantum
@@ -94,7 +103,7 @@ class DeficitFairTrainPolicy:
     def pick_next_partition(
         self,
         candidates: list[PartitionMetadata],
-        current_context: TrainingContext | None = None,
+        current_context: LoraContext | None = None,
     ) -> PartitionMetadata | None:
         if not candidates:
             return None

@@ -4,34 +4,37 @@
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .grpo_pipeline import AsyncMultiLoraGRPOPipeline
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
-from .prompt_feeder import PromptFeeder
-from .registry import AdapterRegistry
-from .scheduling import (DeficitFairRolloutPolicy, DeficitFairTrainPolicy, PreferCurrentTrainPolicy,
+from .prompt_loader import PromptLoader
+from .registry import LoraAdapterRegistry
+from .scheduling import (PreferCurrentTrainPolicy, WeightedFairRolloutPolicy, WeightedFairTrainPolicy,
                          WorkConservingRolloutPolicy)
 from .staleness import StalenessManager
-from .types import (AdapterRecord, AdapterState, ComponentResult, PartitionMetadata, PartitionStatus, RolloutCapacity,
-                    RolloutContextState, TrainingContext)
+from .types import (AdapterRecord, GroupBatch, GroupMetadata, GroupStatus, LoraAdapterState, LoraContext,
+                    PartitionMetadata, PartitionStatus, RolloutCapacity, RolloutContextState, WorkerResult)
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
                       RewardWorker, ToolManagerFactory, TrainerScheduler, TrainerWorker)
 
 __all__ = [
     'AdapterRecord',
-    'AdapterRegistry',
-    'AdapterState',
+    'LoraAdapterRegistry',
+    'LoraAdapterState',
     'AdvantageWorker',
     'AsyncRollouter',
     'AsyncMultiLoraGRPOPipeline',
     'BaseRLPipeline',
     'BaseRLPipelineConfig',
-    'ComponentResult',
-    'DeficitFairRolloutPolicy',
-    'DeficitFairTrainPolicy',
+    'WorkerResult',
+    'WeightedFairRolloutPolicy',
+    'WeightedFairTrainPolicy',
+    'GroupBatch',
+    'GroupMetadata',
+    'GroupStatus',
     'MultiLoraGRPOTrainConfig',
     'MultiLoraGRPOTrainerWorker',
     'PartitionMetadata',
     'PartitionStatus',
     'PreferCurrentTrainPolicy',
-    'PromptFeeder',
+    'PromptLoader',
     'RewardWorker',
     'RolloutCapacity',
     'RolloutContextState',
@@ -39,7 +42,7 @@ __all__ = [
     'ToolManagerFactory',
     'TrainerScheduler',
     'TrainerWorker',
-    'TrainingContext',
+    'LoraContext',
     'TransferQueueDataPlane',
     'TransferQueueRuntimeConfig',
     'WorkConservingRolloutPolicy',

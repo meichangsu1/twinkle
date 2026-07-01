@@ -5,7 +5,7 @@ runtime:
   sampler_tp: 1
   lazy_collect: false
 
-training_context:
+lora_context:
   tenant_id: tenant_a
   training_run_id: gsm8k_grpo_server_run_001
   base_model_id: ms://Qwen/Qwen3.5-0.8B
@@ -13,19 +13,21 @@ training_context:
   reward_type: gsm8k
   tool_profile: default
 
-training_contexts:
+lora_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_grpo_server_run_001
     base_model_id: ms://Qwen/Qwen3.5-0.8B
     adapter_name: tenant_a_gsm8k_lora
     reward_type: gsm8k
     tool_profile: default
+    model:
+      optimizer:
+        lr: 5.0e-5
     dataset:
       dataset_id: ms://modelscope/gsm8k
       subset_name: main
       split: train
       data_num: 2000
-      batch_size: 4
       max_length: 3072
       processor:
         cls: GSM8KProcessor
@@ -38,12 +40,17 @@ training_contexts:
     adapter_name: tenant_b_gsm8k_lora
     reward_type: gsm8k
     tool_profile: default
+    model:
+      lora:
+        r: 8
+        lora_alpha: 16
+      optimizer:
+        lr: 3.0e-5
     dataset:
       dataset_id: ms://modelscope/gsm8k
       subset_name: main
       split: train
       data_num: 2000
-      batch_size: 4
       max_length: 3072
       processor:
         cls: GSM8KProcessor
@@ -99,18 +106,19 @@ sampler:
     logprobs: 1
     temperature: 1.0
     top_p: 0.95
-  num_generations: 8
 
 pipeline:
   max_steps: 1000
   max_staleness: 1
-  target_groups_per_partition: 1
-  max_concurrent_groups: 16
-  max_submit_groups: 1
+  rollout:
+    batch_size: 1
+    num_generations: 8
+    max_concurrent_groups: 16
   reward_batch_size: 1024
   advantage_batch_size: 1024
-  mini_batch_size: 1
-  micro_batch_size: 1
+  train:
+    mini_batch_size: 1
+    micro_batch_size: 1
   save_name_prefix: async-grpo-lora-sync
   save_optimizer: false
   is_sampler_checkpoint: false

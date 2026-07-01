@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .types import PartitionMetadata, PartitionStatus, RolloutCapacity, TrainingContext
+from .types import GroupMetadata, GroupStatus, LoraContext, PartitionMetadata, PartitionStatus, RolloutCapacity
 
 
 @dataclass
@@ -19,11 +19,28 @@ class StalenessManager:
 
     def get_rollout_capacity(
         self,
-        context: TrainingContext,
+        context: LoraContext,
         partitions: list[PartitionMetadata],
+        groups: list[GroupMetadata] | None = None,
     ) -> RolloutCapacity:
         scoped = [p for p in partitions if p.context.key == context.key and p.status != PartitionStatus.CLEARED]
         live_count = len(scoped)
+        live_groups = [
+            group for group in groups or [] if group.context.key == context.key and group.status not in {
+                GroupStatus.TRAIN_DONE,
+                GroupStatus.FAILED,
+                GroupStatus.DROPPED,
+            }
+        ]
+        if live_groups:
+            oldest_policy_version = min(group.policy_version for group in live_groups)
+            if context.policy_version - oldest_policy_version > self.max_staleness:
+                return RolloutCapacity(
+                    0,
+                    action='sleep',
+                    reason='max_staleness_reached',
+                    sleep_seconds=self.sleep_seconds,
+                )
 
         open_partitions = [p for p in scoped if p.status == PartitionStatus.OPEN]
         if open_partitions:

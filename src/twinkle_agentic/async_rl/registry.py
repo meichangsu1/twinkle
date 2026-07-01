@@ -4,10 +4,10 @@ from __future__ import annotations
 import threading
 from typing import Dict, Iterable, Optional
 
-from .types import AdapterRecord, AdapterState, TrainingContext
+from .types import AdapterRecord, LoraAdapterState, LoraContext
 
 
-class AdapterRegistry:
+class LoraAdapterRegistry:
     """Runtime state table for one-LoRA-per-training-run async RL."""
 
     def __init__(self):
@@ -15,10 +15,10 @@ class AdapterRegistry:
         self._lock = threading.RLock()
 
     def register(self,
-                 context: TrainingContext,
+                 context: LoraContext,
                  *,
                  weight: float = 1.0,
-                 state: AdapterState = AdapterState.ACTIVE) -> AdapterRecord:
+                 state: LoraAdapterState = LoraAdapterState.ACTIVE) -> AdapterRecord:
         with self._lock:
             key = context.key
             existing = self._records.get(key)
@@ -37,7 +37,7 @@ class AdapterRegistry:
             self._records[key] = record
             return record
 
-    def get(self, context: TrainingContext | str) -> AdapterRecord:
+    def get(self, context: LoraContext | str) -> AdapterRecord:
         key = context if isinstance(context, str) else context.key
         with self._lock:
             if key not in self._records:
@@ -52,34 +52,34 @@ class AdapterRegistry:
         with self._lock:
             return tuple(self._records)
 
-    def can_accept_rollout(self, context: TrainingContext) -> bool:
+    def can_accept_rollout(self, context: LoraContext) -> bool:
         record = self.get(context)
-        return record.state == AdapterState.ACTIVE and not record.sync_in_progress
+        return record.state == LoraAdapterState.ACTIVE and not record.sync_in_progress
 
-    def can_train(self, context: TrainingContext) -> bool:
+    def can_train(self, context: LoraContext) -> bool:
         record = self.get(context)
-        return (record.state == AdapterState.ACTIVE and not record.sync_in_progress
+        return (record.state == LoraAdapterState.ACTIVE and not record.sync_in_progress
                 and record.training_partition is None)
 
-    def on_rollout_started(self, context: TrainingContext) -> None:
+    def on_rollout_started(self, context: LoraContext) -> None:
         with self._lock:
             record = self.get(context)
             record.in_flight_rollouts += 1
             record.touch()
 
-    def on_rollout_finished(self, context: TrainingContext) -> None:
+    def on_rollout_finished(self, context: LoraContext) -> None:
         with self._lock:
             record = self.get(context)
             record.in_flight_rollouts = max(0, record.in_flight_rollouts - 1)
             record.touch()
 
-    def on_partition_created(self, context: TrainingContext, partition_id: str) -> None:
+    def on_partition_created(self, context: LoraContext, partition_id: str) -> None:
         with self._lock:
             record = self.get(context)
             record.live_partitions.add(partition_id)
             record.touch()
 
-    def on_partition_cleared(self, context: TrainingContext, partition_id: str) -> None:
+    def on_partition_cleared(self, context: LoraContext, partition_id: str) -> None:
         with self._lock:
             record = self.get(context)
             record.live_partitions.discard(partition_id)
@@ -87,7 +87,7 @@ class AdapterRegistry:
                 record.training_partition = None
             record.touch()
 
-    def on_train_started(self, context: TrainingContext, partition_id: str) -> None:
+    def on_train_started(self, context: LoraContext, partition_id: str) -> None:
         with self._lock:
             record = self.get(context)
             if record.training_partition is not None and record.training_partition != partition_id:
@@ -95,14 +95,14 @@ class AdapterRegistry:
             record.training_partition = partition_id
             record.touch()
 
-    def on_train_finished(self, context: TrainingContext, partition_id: str) -> None:
+    def on_train_finished(self, context: LoraContext, partition_id: str) -> None:
         with self._lock:
             record = self.get(context)
             if record.training_partition == partition_id:
                 record.training_partition = None
             record.touch()
 
-    def on_weight_sync_started(self, context: TrainingContext) -> None:
+    def on_weight_sync_started(self, context: LoraContext) -> None:
         with self._lock:
             record = self.get(context)
             record.sync_in_progress = True
@@ -110,11 +110,11 @@ class AdapterRegistry:
 
     def on_weight_sync_finished(
         self,
-        context: TrainingContext,
+        context: LoraContext,
         *,
         adapter_path: str | None = None,
         policy_version: int | None = None,
-    ) -> TrainingContext:
+    ) -> LoraContext:
         with self._lock:
             record = self.get(context)
             record.sync_in_progress = False
@@ -124,9 +124,9 @@ class AdapterRegistry:
             record.touch()
             return context.with_policy_version(record.policy_version, record.adapter_path)
 
-    def mark_failed(self, context: TrainingContext, error: str) -> None:
+    def mark_failed(self, context: LoraContext, error: str) -> None:
         with self._lock:
             record = self.get(context)
-            record.state = AdapterState.FAILED
+            record.state = LoraAdapterState.FAILED
             record.last_error = error
             record.touch()

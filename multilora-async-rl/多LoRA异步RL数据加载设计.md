@@ -18,9 +18,9 @@ trainer 前:
 twinkle.dataloader.DataLoader:
   Twinkle 现有原始 dataset 加载器。
 
-PromptFeeder:
+PromptLoader:
   pipeline source component，包装 twinkle.dataloader.DataLoader，
-  把原始 prompt groups 按 TrainingContext 投递给 AsyncRollouter。
+  把原始 prompt groups 按 LoraContext 投递给 AsyncRollouter。
 
 TransferQueue-backed dataloader:
   TrainerWorker 通过 TransferQueueDataPlane 构建的训练数据读取器。
@@ -53,12 +53,12 @@ task metadata
 group_id
 ```
 
-### 2.2 PromptFeeder
+### 2.2 PromptLoader
 
-`PromptFeeder` 是异步 RL pipeline 中的 source component，职责很薄：
+`PromptLoader` 是异步 RL pipeline 中的 source component，职责很薄：
 
 ```text
-PromptFeeder(context, twinkle_dataloader, rollouter)
+PromptLoader(context, twinkle_dataloader, rollouter)
   -> next(dataloader)
   -> normalize batch into prompt groups
   -> AsyncRollouter.enqueue_prompt_groups(context, prompt_groups)
@@ -69,15 +69,15 @@ PromptFeeder(context, twinkle_dataloader, rollouter)
 第一版接口：
 
 ```python
-class PromptFeeder:
-    context: TrainingContext
+class PromptLoader:
+    context: LoraContext
     dataloader: Iterable
     rollouter: AsyncRollouter
     max_pending_groups: int | None
     exhausted: bool
     submitted_groups: int
 
-    def can_feed(self) -> bool: ...
+    def can_load(self) -> bool: ...
     def step(self) -> ComponentResult | None: ...
     def is_idle(self) -> bool: ...
     def shutdown(self) -> None: ...
@@ -87,7 +87,7 @@ class PromptFeeder:
 
 ### 2.3 AsyncRollouter
 
-`AsyncRollouter` 只接收已经绑定 `TrainingContext` 的 prompt groups：
+`AsyncRollouter` 只接收已经绑定 `LoraContext` 的 prompt groups：
 
 ```text
 pending_prompt_groups_by_context:
@@ -102,18 +102,17 @@ completed_rollout_results:
 
 ```text
 StalenessManager capacity
-AdapterRegistry state
+LoraAdapterRegistry state
 TransferQueueDataPlane.check_capacity(context)
 rollout policy
 max_concurrent_groups
-max_submit_groups
 ```
 
-决定下一个要 rollout 的 LoRA。选中 context 后，`AsyncRollouter` 会从该 context 的 pending queue 中取出最多 `max_submit_groups` 个 prompt groups，组成一次同 context 的 rollout submit batch，并用 `asyncio.create_task` 放入 `active_rollout_tasks` 后立即返回。已经完成的 task 会进入 `completed_rollout_results`，下一轮 `step()` 返回 `kind="rollout"`，对应数据已经写入 TQ。也就是说，`PromptFeeder` 只负责“喂数据”，真正的 LoRA rollout 调度、异步提交和完成回收仍然在 `AsyncRollouter` 内部完成。
+决定下一个要 rollout 的 LoRA。选中 context 后，`AsyncRollouter` 会从该 context 的 pending queue 中取出一个 prompt group，创建一个 rollout task，并用 `asyncio.create_task` 放入 `active_rollout_tasks` 后立即返回。已经完成的 task 会进入 `completed_rollout_results`，下一轮 `step()` 返回 `kind="rollout"`，对应数据已经写入 TQ。也就是说，`PromptLoader` 只负责“喂数据”，真正的 LoRA rollout 调度、异步提交和完成回收仍然在 `AsyncRollouter` 内部完成。
 
 ### 2.4 TrainerWorker 的 dataloader
 
-Trainer 侧不使用原始 dataset，也不使用 rollout-side `PromptFeeder`。
+Trainer 侧不使用原始 dataset，也不使用 rollout-side `PromptLoader`。
 
 Trainer 只能读取 TransferQueue 中已经完成处理的训练数据：
 
@@ -135,10 +134,10 @@ dataloader = TransferQueueDataPlane.build_streaming_dataloader(context, partitio
 
 ## 3. 多 LoRA 数据加载方式
 
-每个 LoRA / `TrainingContext` 可以绑定自己的 dataset 配置：
+每个 LoRA / `LoraContext` 可以绑定自己的 dataset 配置：
 
 ```yaml
-training_contexts:
+lora_contexts:
   - tenant_id: tenant_a
     training_run_id: run_a
     base_model_id: ms://Qwen/Qwen3.5-4B
@@ -172,30 +171,30 @@ training_contexts:
 初始化逻辑：
 
 ```text
-BaseRLPipeline.build_training_contexts()
+BaseRLPipeline.build_lora_contexts()
   -> context_a, context_b
 
 BaseRLPipeline.create_roles()
-  -> PromptFeeder
+  -> PromptLoader
   -> AsyncRollouter
   -> RewardWorker
   -> AdvantageWorker
   -> TrainerWorker
-  -> build_prompt_feeders()
+  -> build_prompt_loaders()
   -> build_pipeline_components()
 
-build_prompt_feeders()
-  -> DataLoader(dataset_a) -> PromptFeeder(context_a)
-  -> DataLoader(dataset_b) -> PromptFeeder(context_b)
+build_prompt_loaders()
+  -> DataLoader(dataset_a) -> PromptLoader(context_a)
+  -> DataLoader(dataset_b) -> PromptLoader(context_b)
 ```
 
 运行时：
 
 ```text
-PromptFeeder(context_a).step()
+PromptLoader(context_a).step()
   -> AsyncRollouter.enqueue_prompt_groups(context_a, prompt_groups_a)
 
-PromptFeeder(context_b).step()
+PromptLoader(context_b).step()
   -> AsyncRollouter.enqueue_prompt_groups(context_b, prompt_groups_b)
 
 AsyncRollouter.step()
@@ -223,7 +222,7 @@ group_id / generation_idx
 
 ```text
 twinkle.dataloader.DataLoader
-  -> PromptFeeder
+  -> PromptLoader
   -> AsyncRollouter
   -> TransferQueueDataPlane
   -> RewardWorker
@@ -236,25 +235,25 @@ twinkle.dataloader.DataLoader
 ## 5. 第一版落地约束
 
 ```text
-1. PromptFeeder 使用 twinkle.dataloader.DataLoader，不自建新的 dataset 系统。
-2. 每个 TrainingContext 可以有一个独立 DataLoader。
-3. PromptFeeder 只向 AsyncRollouter 入队，不直接写 TQ。
+1. PromptLoader 使用 twinkle.dataloader.DataLoader，不自建新的 dataset 系统。
+2. 每个 LoraContext 可以有一个独立 DataLoader。
+3. PromptLoader 只向 AsyncRollouter 入队，不直接写 TQ。
 4. AsyncRollouter 统一做 multi-LoRA rollout 调度。
 5. TrainerWorker 只通过 TransferQueueDataPlane 读取 train_k。
 6. 一个 train_k 不混 adapter；可以包含多个 policy_version rows。
-7. 某个 PromptFeeder exhausted 只影响对应 LoRA，不影响其他 LoRA。
+7. 某个 PromptLoader exhausted 只影响对应 LoRA，不影响其他 LoRA。
 ```
 
 ## 6. 与当前代码的对应关系
 
 ```text
-src/twinkle_agentic/async_rl/prompt_feeder.py
-  PromptFeeder:
+src/twinkle_agentic/async_rl/prompt_loader.py
+  PromptLoader:
     pipeline source component
     step() -> ComponentResult(kind="prompt")
 
 src/twinkle_agentic/async_rl/pipeline.py
-  BaseRLPipeline.build_prompt_feeders()
+  BaseRLPipeline.build_prompt_loaders()
   BaseRLPipeline.components
   BaseRLPipeline.run_async()
 
@@ -269,12 +268,12 @@ src/twinkle_agentic/async_rl/workers.py
 
 cookbook/rl/async_multi_lora_grpo.py
   server-side multi-LoRA 示例：
-    每个 TrainingContext 创建一个 twinkle.dataloader.DataLoader
-    每个 DataLoader 包成一个 PromptFeeder
+    每个 LoraContext 创建一个 twinkle.dataloader.DataLoader
+    每个 DataLoader 包成一个 PromptLoader
 
 cookbook/client/twinkle/self_host/async_multi_lora_grpo.py
   client/self-host 示例：
-    同样使用 PromptFeeder 封装 twinkle.dataloader.DataLoader
+    同样使用 PromptLoader 封装 twinkle.dataloader.DataLoader
 ```
 
 ## 7. Pipeline Component 视角
@@ -291,7 +290,7 @@ shutdown() -> None
 
 | 组件 | 类型 | 输入 | 输出 | multi-LoRA 支撑方式 |
 |---|---|---|---|---|
-| `PromptFeeder` | source component | `twinkle.dataloader.DataLoader` | `AsyncRollouter` pending queue | 每个 `TrainingContext` 一个 feeder |
+| `PromptLoader` | source component | `twinkle.dataloader.DataLoader` | `AsyncRollouter` pending queue | 每个 `LoraContext` 一个 loader |
 | `AsyncRollouter` | rollout producer | pending prompt groups | TQ `train_k` rollout rows | `pending_by_context` + rollout policy |
 | `RewardWorker` | TQ transformer | rollout-ready partition | reward fields | 按 context 轮询 claim |
 | `AdvantageWorker` | TQ transformer | reward-ready partition | advantages / returns | 按 context 轮询 claim |
@@ -300,15 +299,15 @@ shutdown() -> None
 `BaseRLPipeline` 只负责根据 `algorithm` 创建角色图，并按顺序调用 `component.step()` 推进系统。组件之间的数据交换不通过 pipeline 传递业务数据：
 
 ```text
-PromptFeeder -> AsyncRollouter pending queue
+PromptLoader -> AsyncRollouter pending queue
 AsyncRollouter / RewardWorker / AdvantageWorker / TrainerWorker -> TransferQueueDataPlane
-TrainerWorker -> AdapterRegistry / receive_weights
+TrainerWorker -> LoraAdapterRegistry / receive_weights
 ```
 
 默认 GRPO 组件图是：
 
 ```text
-PromptFeeder
+PromptLoader
   -> AsyncRollouter
   -> RewardWorker
   -> AdvantageWorker
@@ -322,4 +321,4 @@ PairFeeder
   -> DPOTrainerWorker
 ```
 
-这样 `PromptFeeder` 仍然是正式 pipeline component；只是它只属于需要 rollout prompt source 的算法链路。
+这样 `PromptLoader` 仍然是正式 pipeline component；只是它只属于需要 rollout prompt source 的算法链路。

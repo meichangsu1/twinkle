@@ -39,8 +39,8 @@ from twinkle.reward.base import Reward
 from twinkle_agentic.async_rl import (
     BaseRLPipeline,
     BaseRLPipelineConfig,
-    PromptFeeder,
-    TrainingContext,
+    PromptLoader,
+    LoraContext,
     TransferQueueDataPlane,
     TransferQueueRuntimeConfig,
 )
@@ -89,7 +89,7 @@ class SingleTurnClientRollout:
     """One-turn rollout adapter for twinkle_client vLLMSampler.
 
     It accepts one prompt group and returns `num_generations` train rows.
-    `adapter_path` from AdapterRegistry is mapped to client sampler's
+    `adapter_path` from LoraAdapterRegistry is mapped to client sampler's
     `adapter_uri` argument.
     """
 
@@ -137,27 +137,26 @@ def load_config(path: str):
     return OmegaConf.load(path)
 
 
-def training_context_configs(cfg):
-    if cfg.get('training_contexts'):
-        return list(cfg.training_contexts)
-    return [cfg.training_context]
+def lora_context_configs(cfg):
+    if cfg.get('lora_contexts'):
+        return list(cfg.lora_contexts)
+    return [cfg.lora_context]
 
 
-def primary_training_context(cfg):
-    return training_context_configs(cfg)[0]
+def primary_lora_context(cfg):
+    return lora_context_configs(cfg)[0]
 
 
-def build_training_contexts(cfg) -> list[TrainingContext]:
+def build_lora_contexts(cfg) -> list[LoraContext]:
     contexts = []
-    for context_cfg in training_context_configs(cfg):
+    for context_cfg in lora_context_configs(cfg):
         contexts.append(
-            TrainingContext(
+            LoraContext(
                 tenant_id=context_cfg.tenant_id,
                 training_run_id=context_cfg.training_run_id,
                 base_model_id=context_cfg.base_model_id,
                 adapter_name=context_cfg.adapter_name,
                 reward_type=context_cfg.reward_type,
-                loss_type=context_cfg.loss_type,
                 tool_profile=context_cfg.get('tool_profile', 'default'),
             )
         )
@@ -207,7 +206,7 @@ def create_dataset(cfg, context_cfg):
 def build_model(cfg):
     from twinkle_client.model import MultiLoraTransformersModel
 
-    primary_context = primary_training_context(cfg)
+    primary_context = primary_lora_context(cfg)
     lora_cfg = cfg.model.lora
     lora_config = LoraConfig(
         target_modules=lora_cfg.target_modules,
@@ -219,7 +218,7 @@ def build_model(cfg):
     loss_kwargs = {k: v for k, v in cfg.model.loss.items() if k != 'cls'}
     optimizer_params = {'lr': float(cfg.model.optimizer.lr)}
     template_kwargs = {k: v for k, v in cfg.model.template.items() if k != 'cls'}
-    for context_cfg in training_context_configs(cfg):
+    for context_cfg in lora_context_configs(cfg):
         adapter_name = context_cfg.adapter_name
         model.add_adapter_to_model(
             adapter_name,
@@ -239,7 +238,7 @@ def build_model(cfg):
 
 
 def build_sampler(cfg):
-    primary_context = primary_training_context(cfg)
+    primary_context = primary_lora_context(cfg)
     sampler = vLLMSampler(model_id=primary_context.base_model_id)
     sampler.set_template(
         cfg.sampler.template.cls,
@@ -280,22 +279,20 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
 
     def __init__(self, cfg):
         self.cfg = cfg
-        contexts = build_training_contexts(cfg)
+        contexts = build_lora_contexts(cfg)
         primary_context = contexts[0]
         super().__init__(
             config=BaseRLPipelineConfig(
-                training_contexts=contexts,
+                lora_contexts=contexts,
                 tenant_id=primary_context.tenant_id,
                 training_run_id=primary_context.training_run_id,
                 base_model_id=primary_context.base_model_id,
                 adapter_name=primary_context.adapter_name,
                 reward_type=primary_context.reward_type,
-                loss_type=primary_context.loss_type,
                 tool_profile=primary_context.tool_profile,
                 max_staleness=int(cfg.pipeline.max_staleness),
-                target_groups_per_partition=int(cfg.pipeline.target_groups_per_partition),
-                max_concurrent_groups=int(cfg.pipeline.max_concurrent_groups),
-                max_submit_groups=cfg.pipeline.get('max_submit_groups'),
+                target_groups_per_partition=int(cfg.pipeline.rollout.batch_size),
+                max_concurrent_groups=int(cfg.pipeline.rollout.max_concurrent_groups),
                 max_train_partitions=int(cfg.pipeline.max_steps),
                 save_name_prefix=cfg.pipeline.save_name_prefix,
                 is_sampler_checkpoint=bool(cfg.pipeline.is_sampler_checkpoint),
@@ -306,38 +303,38 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
     def build_model(self):
         return build_model(self.cfg)
 
-    def build_prompt_feeders(self):
-        feeders = []
-        max_pending_groups = self.cfg.pipeline.get('prompt_max_pending_groups')
-        for context_cfg, context in zip(training_context_configs(self.cfg), self.contexts):
-            dataset_cfg = context_dataset_config(self.cfg, context_cfg)
+    def build_prompt_loaders(self):
+        loaders = []
+        max_pending_groups = self.cfg.pipeline.rollout.get('max_pending_groups')
+        prompt_batch_size = int(self.cfg.pipeline.rollout.batch_size)
+        for context_cfg, context in zip(lora_context_configs(self.cfg), self.contexts):
             dataloader = DataLoader(
                 dataset=create_dataset(self.cfg, context_cfg),
-                batch_size=int(dataset_cfg.batch_size),
+                batch_size=prompt_batch_size,
                 num_workers=0,
             )
-            feeders.append(
-                PromptFeeder(
+            loaders.append(
+                PromptLoader(
                     context=context,
                     dataloader=dataloader,
                     rollouter=self.rollouter,
                     max_pending_groups=max_pending_groups,
                 )
             )
-        return feeders
+        return loaders
 
     def build_rollout(self):
         return SingleTurnClientRollout(
             build_sampler(self.cfg),
             sampling_params=OmegaConf.to_container(self.cfg.sampler.sampling_params, resolve=True),
-            num_generations=int(self.cfg.sampler.num_generations),
+            num_generations=int(self.cfg.pipeline.rollout.num_generations),
         )
 
     def build_data_plane(self):
         return build_data_plane(self.cfg)
 
     def build_reward_registry(self):
-        return {context_cfg.reward_type: GSM8KReward() for context_cfg in training_context_configs(self.cfg)}
+        return {context_cfg.reward_type: GSM8KReward() for context_cfg in lora_context_configs(self.cfg)}
 
     def build_advantage_fn(self):
         return grpo_advantage_fn

@@ -3,10 +3,10 @@ from types import SimpleNamespace
 from twinkle_agentic.async_rl import (
     BaseRLPipeline,
     BaseRLPipelineConfig,
-    ComponentResult,
+    WorkerResult,
     PartitionStatus,
-    PromptFeeder,
-    TrainingContext,
+    PromptLoader,
+    LoraContext,
     TransferQueueDataPlane,
 )
 
@@ -152,14 +152,14 @@ def test_base_pipeline_uses_latest_adapter_path_for_next_rollout():
 
 
 def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
-    context_a = TrainingContext(
+    context_a = LoraContext(
         tenant_id='tenant_a',
         training_run_id='run_a',
         base_model_id='base',
         adapter_name='lora_a',
         reward_type='constant',
     )
-    context_b = TrainingContext(
+    context_b = LoraContext(
         tenant_id='tenant_b',
         training_run_id='run_b',
         base_model_id='base',
@@ -171,7 +171,7 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
     received = []
     pipeline = FakeGRPOPipeline(
         config=BaseRLPipelineConfig(
-            training_contexts=[context_a, context_b],
+            lora_contexts=[context_a, context_b],
             reward_type='constant',
             target_groups_per_partition=1,
             max_train_partitions=2,
@@ -193,19 +193,21 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
     assert {call['adapter_name'] for call in model.step_calls} == {'lora_a', 'lora_b'}
     assert {call['adapter_name'] for call in model.save_calls} == {'lora_a', 'lora_b'}
     assert {context.adapter_name for context in received} == {'lora_a', 'lora_b'}
-    assert all(partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_a))
-    assert all(partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_b))
+    assert all(
+        partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_a))
+    assert all(
+        partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_b))
 
 
-def test_base_pipeline_feeds_prompts_from_prompt_feeders():
-    context_a = TrainingContext(
+def test_base_pipeline_feeds_prompts_from_prompt_loaders():
+    context_a = LoraContext(
         tenant_id='tenant_a',
         training_run_id='run_a',
         base_model_id='base',
         adapter_name='lora_a',
         reward_type='constant',
     )
-    context_b = TrainingContext(
+    context_b = LoraContext(
         tenant_id='tenant_b',
         training_run_id='run_b',
         base_model_id='base',
@@ -218,15 +220,15 @@ def test_base_pipeline_feeds_prompts_from_prompt_feeders():
 
     class FeederPipeline(FakeGRPOPipeline):
 
-        def build_prompt_feeders(self):
+        def build_prompt_loaders(self):
             return [
-                PromptFeeder(context=context_a, dataloader=[[make_sample(0)]], rollouter=self.rollouter),
-                PromptFeeder(context=context_b, dataloader=[[make_sample(1)]], rollouter=self.rollouter),
+                PromptLoader(context=context_a, dataloader=[[make_sample(0)]], rollouter=self.rollouter),
+                PromptLoader(context=context_b, dataloader=[[make_sample(1)]], rollouter=self.rollouter),
             ]
 
     pipeline = FeederPipeline(
         config=BaseRLPipelineConfig(
-            training_contexts=[context_a, context_b],
+            lora_contexts=[context_a, context_b],
             reward_type='constant',
             target_groups_per_partition=1,
             max_train_partitions=2,
@@ -242,7 +244,7 @@ def test_base_pipeline_feeds_prompts_from_prompt_feeders():
     trained = [step['train'] for step in history if step['train'] is not None]
     assert len(trained) == 2
     assert {call['adapter_name'] for call in model.forward_backward_calls} == {'lora_a', 'lora_b'}
-    assert all(feeder.exhausted for feeder in pipeline.prompt_feeders)
+    assert all(loader.exhausted for loader in pipeline.prompt_loaders)
 
 
 def test_algorithm_pipeline_can_define_roles_directly():
@@ -256,7 +258,7 @@ def test_algorithm_pipeline_can_define_roles_directly():
             if self.calls > 0:
                 return None
             self.calls += 1
-            return ComponentResult(component='dummy', kind='dummy', count=1)
+            return WorkerResult(component='dummy', kind='dummy', count=1)
 
         def is_idle(self):
             return self.calls > 0

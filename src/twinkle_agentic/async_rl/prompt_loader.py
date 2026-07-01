@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
-from .types import ComponentResult, SampleRecord, TrainingContext
+from .types import LoraContext, SampleRecord, WorkerResult
 from .workers import AsyncRollouter
 
 
-class PromptFeeder:
-    """Feed raw prompt groups from a Twinkle DataLoader into AsyncRollouter.
+class PromptLoader:
+    """Load raw prompt groups from a Twinkle DataLoader into AsyncRollouter.
 
     This is the rollout-side data ingress. It wraps an iterable such as
     `twinkle.dataloader.DataLoader` and never reads training samples from
@@ -18,7 +18,7 @@ class PromptFeeder:
     def __init__(
         self,
         *,
-        context: TrainingContext,
+        context: LoraContext,
         dataloader: Iterable[Any],
         rollouter: AsyncRollouter,
         max_pending_groups: int | None = None,
@@ -31,7 +31,7 @@ class PromptFeeder:
         self.exhausted = False
         self.submitted_groups = 0
 
-    def can_feed(self) -> bool:
+    def can_load(self) -> bool:
         if self.exhausted:
             return False
         if self.max_pending_groups is None:
@@ -39,9 +39,9 @@ class PromptFeeder:
         pending = self.rollouter.pending_prompt_group_count(self.context)
         return pending < self.max_pending_groups
 
-    def step(self) -> ComponentResult | None:
+    def step(self) -> WorkerResult | None:
         """Read one dataloader batch and enqueue it as rollout prompt groups."""
-        if not self.can_feed():
+        if not self.can_load():
             return None
         if self._iterator is None:
             self._iterator = iter(self.dataloader)
@@ -56,10 +56,10 @@ class PromptFeeder:
             return None
         self.rollouter.enqueue_prompt_groups(self.context, prompt_groups)
         self.submitted_groups += len(prompt_groups)
-        return ComponentResult(component='prompt_feeder', kind='prompt', count=len(prompt_groups))
+        return WorkerResult(component='prompt_loader', kind='prompt', count=len(prompt_groups))
 
     def is_idle(self) -> bool:
-        return not self.can_feed()
+        return not self.can_load()
 
     def shutdown(self) -> None:
         for method_name in ('shutdown', 'close'):

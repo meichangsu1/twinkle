@@ -627,4 +627,3 @@ client.clear_partition(partition_id)
 ```
 
 推荐按数据生命周期组织 partition，例如 `rollout_100`，用完后 `clear_partition()`。
-

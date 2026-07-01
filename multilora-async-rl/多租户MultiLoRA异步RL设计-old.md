@@ -201,7 +201,7 @@ RewardRegistry / LossRegistry:
 | `BaseRLPipeline / Controller` | 训练任务准入、构造 `TrainingContext`、初始化 TQ namespace、创建角色、接收 `train_k done` 事件、触发权重同步和 partition 清理。 | 不执行 rollout 细节，不计算 reward/advantage，不做 trainer 侧 batch 调度。 |
 | `TransferQueueDataPlane` | TQ 的唯一数据面入口，负责 namespace 拼接、metadata 校验、容量检查、put/claim/append/ack/clear。 | 不决定 rollout 速度，不决定下一个训练哪个 LoRA。 |
 | `TransferQueue Backend` | 存储 partition、rows、metadata 和字段列。 | 不理解业务语义，不做 staleness 或 adapter 状态决策。 |
-| `AdapterRegistry` | 维护每个 `(tenant_id, training_run_id, adapter_name)` 的运行时状态，包括 `policy_version`、`live_partitions`、`in_flight_rollouts`、训练/同步状态。 | 不读写样本数据，不执行权重同步。 |
+| `LoraAdapterRegistry` | 维护每个 `(tenant_id, training_run_id, adapter_name)` 的运行时状态，包括 `policy_version`、`live_partitions`、`in_flight_rollouts`、训练/同步状态。 | 不读写样本数据，不执行权重同步。 |
 | `StalenessManager` | 基于 TQ metadata 和 adapter 状态计算 per-adapter rollout capacity、throttle/sleep hint。 | 不写 TQ，不清理 partition，不同步权重。 |
 | `AsyncRollouter` | 维护 `pending_by_context` 和 `active_tasks`，在多个 LoRA 训练任务之间选择下一批 rollout；每次提交的 rollout batch 只属于一个 `TrainingContext`。 | 不在单次 submit batch 中混多个 LoRA，不计算 reward/advantage。 |
 | `MultiTurnRollout` | 执行多轮 agent loop，组织 messages、调用 sampler、处理 tool 调用结果，产出 trajectory group。 | 不直接管理多租户容量和权重版本。 |
@@ -341,7 +341,7 @@ TTL 只用于异常检测和终态回收：
 
 ### 4.4 adapter record
 
-`AdapterRegistry` 的一条 record 代表一个 `(tenant_id, training_run_id, adapter_name)` 的运行时状态。它不是样本，也不是 partition，而是一个 LoRA adapter 在当前训练任务中的生命周期记录。
+`LoraAdapterRegistry` 的一条 record 代表一个 `(tenant_id, training_run_id, adapter_name)` 的运行时状态。它不是样本，也不是 partition，而是一个 LoRA adapter 在当前训练任务中的生命周期记录。
 
 ```python
 @dataclass
@@ -991,11 +991,11 @@ quota:
 | 序号 | 调用 | 说明 |
 |---:|---|---|
 | 1 | `submit_training_job(config)` | `Client` 提交训练任务配置。配置里包含租户、基础模型、LoRA adapter、数据源、tool profile、reward/loss、异步训练参数等。 |
-| 2 | `register_adapter(context)` | `BaseRLPipeline` 构造 `TrainingContext` 后，把当前训练任务的 LoRA 注册到 `AdapterRegistry`。一个 `training_run_id` 固定对应一个 `adapter_name`。 |
+| 2 | `register_adapter(context)` | `BaseRLPipeline` 构造 `TrainingContext` 后，把当前训练任务的 LoRA 注册到 `LoraAdapterRegistry`。一个 `training_run_id` 固定对应一个 `adapter_name`。 |
 | 3 | `init_namespace(context)` | `BaseRLPipeline` 让 `TransferQueueDataPlane` 初始化 TQ namespace，例如 `{tenant_id}/{training_run_id}/{adapter_name}/train_k`，并写入基础 metadata 约束。 |
 | 4 | `get_metadata()` | `TransferQueueDataPlane` 向 `StalenessManager` 提供当前 live partitions、oldest partition、partition 状态和 policy_version 等容量事实。 |
 | 5 | `capacity / throttle hint` | `StalenessManager` 按当前 adapter 的 `max_staleness` 计算还能继续提交多少 rollout，以及是否需要 throttle 或 sleep。 |
-| 6 | `can_accept_rollout(context)` | `AsyncRollouter` 询问 `AdapterRegistry` 当前 adapter 是否处于可 rollout 状态，并检查 `in_flight_rollouts`、`live_partitions`、同步状态等运行时状态。 |
+| 6 | `can_accept_rollout(context)` | `AsyncRollouter` 询问 `LoraAdapterRegistry` 当前 adapter 是否处于可 rollout 状态，并检查 `in_flight_rollouts`、`live_partitions`、同步状态等运行时状态。 |
 | 7 | `check_capacity(context)` | `AsyncRollouter` 在提交前向 `TransferQueueDataPlane` 检查目标 namespace 的 TQ 容量是否还能接收新的 rollout rows。 |
 | 8 | `run_rollout(context)` | `AsyncRollouter` 选择一个 `TrainingContext` 后启动 rollout task。一次 submit batch 内只包含同一个 tenant/run/adapter/policy_version。 |
 | 9 | `call native / remote tool` | `MultiTurnRollout` 在多轮交互中通过 `ToolManager` 调用 native tool 或 remote tool API。第一版不 import 用户 Env Python 代码。 |
@@ -1035,7 +1035,7 @@ partition 清理:
 sequenceDiagram
     participant C as Client
     participant P as BaseRLPipeline
-    participant AR as AdapterRegistry
+    participant AR as LoraAdapterRegistry
     participant Q as TransferQueueDataPlane
     participant SM as StalenessManager
     participant R as AsyncRollouter
@@ -1097,13 +1097,13 @@ sequenceDiagram
 
 ```text
 Rollout 侧:
-  AdapterRegistry 判断 adapter 是否 ACTIVE；
+  LoraAdapterRegistry 判断 adapter 是否 ACTIVE；
   StalenessManager 判断当前 context 是否还有 rollout capacity；
   AsyncRollouter 才决定 submit / throttle / sleep。
 
 Trainer 侧:
   TransferQueueDataPlane 提供 TRAIN_READY partitions；
-  AdapterRegistry 过滤当前可训练 adapter；
+  LoraAdapterRegistry 过滤当前可训练 adapter；
   TrainerScheduler 选择下一个 train_k；
   TrainerWorker 根据 train_k.context.adapter_name 在 partition 边界切换 LoRA。
 ```
