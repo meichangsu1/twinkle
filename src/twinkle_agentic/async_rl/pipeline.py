@@ -8,10 +8,19 @@ from typing import Any, Callable, Dict, Iterable, Optional
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .prompt_feeder import PromptFeeder
 from .registry import AdapterRegistry
+from .scheduler import TrainerScheduler, TrainerSchedulerConfig
 from .staleness import StalenessManager
 from .types import PartitionMetadata, RolloutCallable, SampleRecord, TrainingContext
-from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
-                      RewardWorker, ToolManagerFactory, TrainerScheduler, TrainerStepResult, TrainerWorker)
+from .workers import (
+    AdvantageWorker,
+    AsyncRollouter,
+    MultiLoraGRPOTrainConfig,
+    MultiLoraGRPOTrainerWorker,
+    RewardWorker,
+    ToolManagerFactory,
+    TrainerStepResult,
+    TrainerWorker,
+)
 
 
 @dataclass
@@ -47,8 +56,16 @@ class BaseRLPipelineConfig:
     is_sampler_checkpoint: bool = True
     max_grad_norm: float = 1.0
     norm_type: int = 2
-    train_kwargs: dict[str, Any] = field(default_factory=dict)
-    tq_config: TransferQueueRuntimeConfig | None = None
+    train_kwargs: Dict[str, Any] = field(default_factory=dict)
+    tq_config: Optional[TransferQueueRuntimeConfig] = None
+    train_schedule_policy: str = 'prefer_current'
+    train_schedule_switch_penalty: float = 0.0
+    train_schedule_switch_cost: float = 1.0
+    train_schedule_fairness_quantum: float = 1.0
+    train_schedule_aging_rate: float = 0.1
+    train_schedule_adaptive_high_load_threshold: float = 3.0
+    train_schedule_adaptive_switch_rate_threshold: float = 0.7
+    train_schedule_weights: Dict[str, float] = field(default_factory=dict)
 
 
 class BaseRLPipeline:
@@ -267,8 +284,24 @@ class BaseRLPipeline:
             advantage_fn=advantage_fn,
         )
 
-    def build_trainer_scheduler(self, *, train_policy: Any | None) -> TrainerScheduler:
-        return TrainerScheduler(adapter_registry=self.adapter_registry, train_policy=train_policy)
+    def build_trainer_scheduler(self, *, train_policy: Optional[Any]) -> TrainerScheduler:
+        config = TrainerSchedulerConfig(
+            policy=self.config.train_schedule_policy,
+            switch_penalty=self.config.train_schedule_switch_penalty,
+            switch_cost=self.config.train_schedule_switch_cost,
+            fairness_quantum=self.config.train_schedule_fairness_quantum,
+            aging_rate=self.config.train_schedule_aging_rate,
+            max_staleness=self.config.max_staleness,
+            adaptive_high_load_threshold=self.config.train_schedule_adaptive_high_load_threshold,
+            adaptive_switch_rate_threshold=self.config.train_schedule_adaptive_switch_rate_threshold,
+            weights=self.config.train_schedule_weights,
+        )
+        return TrainerScheduler(
+            adapter_registry=self.adapter_registry,
+            data_plane=self.data_plane,
+            train_policy=train_policy,
+            config=config,
+        )
 
     def build_trainer_worker(self) -> TrainerWorker:
         if self.train_partition_fn is not None:

@@ -1,0 +1,117 @@
+runtime:
+  mode: ray
+  model_gpus: 1
+  sampler_gpus: 1
+  sampler_tp: 1
+  lazy_collect: false
+
+training_context:
+  tenant_id: tenant_a
+  training_run_id: gsm8k_grpo_server_run_001
+  base_model_id: /data/model/Qwen3.5-0.8B
+  adapter_name: tenant_a_gsm8k_lora
+  reward_type: gsm8k
+  loss_type: grpo
+  tool_profile: default
+
+training_contexts:
+  - tenant_id: tenant_a
+    training_run_id: gsm8k_grpo_server_run_001
+    base_model_id: /data/model/Qwen3.5-0.8B
+    adapter_name: tenant_a_gsm8k_lora
+    reward_type: gsm8k
+    loss_type: grpo
+    tool_profile: default
+    dataset:
+      dataset_id: /data/gsm8k_train.parquet
+      split: train
+      data_num: 64
+      batch_size: 4
+      max_length: 3072
+  - tenant_id: tenant_b
+    training_run_id: gsm8k_grpo_server_run_002
+    base_model_id: /data/model/Qwen3.5-0.8B
+    adapter_name: tenant_b_gsm8k_lora
+    reward_type: gsm8k
+    loss_type: grpo
+    tool_profile: default
+    dataset:
+      dataset_id: /data/gsm8k_train.parquet
+      split: train
+      data_num: 64
+      batch_size: 4
+      max_length: 3072
+
+model:
+  mesh:
+    tp_size: 1
+    ep_size: 1
+    pp_size: 1
+    sequence_parallel: false
+  mixed_precision: bf16
+  lora:
+    target_modules: all-linear
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+  gradient_accumulation_steps: 4
+  loss:
+    cls: GRPOLoss
+    epsilon: 0.2
+  optimizer:
+    cls: AdamW
+    lr: 5.0e-5
+  lr_scheduler:
+    cls: LinearWarmupScheduler
+    num_warmup_steps: 0
+    num_training_steps: 1000
+  processor:
+    cls: InputProcessor
+  template:
+    cls: Qwen3_5Template
+    max_length: 4096
+    truncation_strategy: delete
+    enable_thinking: false
+  adapter_checkpoint_dir: output/async_multi_lora_grpo_local/lora_sync
+
+sampler:
+  engine_args:
+    gpu_memory_utilization: 0.8
+    max_model_len: 8192
+    max_lora_rank: 16
+    enable_lora: true
+    enable_tower_connector_lora: true
+  template:
+    cls: Qwen3_5Template
+    enable_thinking: false
+  sampling_params:
+    max_tokens: 1024
+    num_samples: 1
+    logprobs: 1
+    temperature: 1.0
+    top_p: 0.95
+  num_generations: 8
+
+pipeline:
+  max_steps: 4
+  max_staleness: 1
+  target_groups_per_partition: 1
+  max_concurrent_groups: 16
+  max_submit_groups: 1
+  reward_batch_size: 1024
+  advantage_batch_size: 1024
+  mini_batch_size: 1
+  micro_batch_size: 1
+  save_name_prefix: async-grpo-lora-local
+  save_optimizer: false
+  is_sampler_checkpoint: false
+  max_grad_norm: 1.0
+  norm_type: 2
+
+transfer_queue:
+  init: true
+  total_storage_size: 200000
+  max_rows: 4096
+  max_rows_per_context: 2048
+  num_data_storage_units: 4
+  storage_backend: SimpleStorage

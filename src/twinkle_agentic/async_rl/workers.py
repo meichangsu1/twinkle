@@ -11,7 +11,8 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Optional
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
-from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
+from .scheduler import TrainerScheduler
+from .rollout_scheduling import WorkConservingRolloutPolicy
 from .staleness import StalenessManager
 from .types import (ComponentResult, PartitionMetadata, PartitionStatus, RolloutCallable, RolloutContextState,
                     SampleRecord, TrainingContext)
@@ -396,27 +397,6 @@ class AdvantageWorker:
         return None
 
 
-class TrainerScheduler:
-
-    def __init__(self, *, adapter_registry: AdapterRegistry, train_policy: Any | None = None):
-        self.adapter_registry = adapter_registry
-        self.train_policy = train_policy or PreferCurrentTrainPolicy()
-
-    def next_partition(
-        self,
-        candidates: list[PartitionMetadata],
-        current_context: TrainingContext | None = None,
-    ) -> PartitionMetadata | None:
-        filtered = []
-        for partition in candidates:
-            if partition.status != PartitionStatus.TRAIN_READY:
-                continue
-            if not self.adapter_registry.can_train(partition.context):
-                continue
-            filtered.append(partition)
-        return self.train_policy.pick_next_partition(filtered, current_context)
-
-
 @dataclass
 class TrainerStepResult:
     adapter_revision: str | None = None
@@ -452,11 +432,8 @@ class TrainerWorker:
         self.receive_weights_fn = receive_weights_fn
         self.current_context: TrainingContext | None = None
 
-    def step(self) -> ComponentResult | None:
-        partition = self.scheduler.next_partition(
-            self.data_plane.list_train_ready_partitions(),
-            self.current_context,
-        )
+    def step(self) -> Optional[ComponentResult]:
+        partition = self.scheduler.next_partition(current_context=self.current_context)
         if partition is None:
             return None
         context = partition.context

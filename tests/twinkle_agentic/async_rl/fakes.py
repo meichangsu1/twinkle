@@ -21,6 +21,19 @@ class FakeTransferQueueClient:
             current_tag.update(dict(tag))
             self.tags[partition_id][key] = current_tag
 
+    def kv_batch_put(self, keys, partition_id: str, fields=None, tags=None):
+        if isinstance(keys, str):
+            keys = [keys]
+        for i, key in enumerate(keys):
+            f = None
+            if fields is not None:
+                if isinstance(fields, dict):
+                    f = {k: v[i] if isinstance(v, list) else v for k, v in fields.items()}
+                elif hasattr(fields, 'batch_size'):
+                    f = {k: fields[k][i] for k in fields.keys()}
+            t = tags[i] if tags is not None else None
+            self.kv_put(key, partition_id, fields=f, tag=t)
+
     def kv_batch_get(self, keys, partition_id: str, select_fields=None):
         if isinstance(keys, str):
             keys = [keys]

@@ -19,6 +19,13 @@ class PartitionStatus(StrEnum):
     CANCELLED = 'CANCELLED'
 
 
+class TaskName(StrEnum):
+    ROLLOUT = 'rollout'
+    REWARD = 'reward'
+    ADVANTAGE = 'advantage'
+    TRAIN = 'train'
+
+
 class AdapterState(StrEnum):
     LOADING = 'LOADING'
     ACTIVE = 'ACTIVE'
