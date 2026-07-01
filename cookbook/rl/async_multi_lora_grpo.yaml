@@ -1,6 +1,6 @@
 runtime:
   mode: ray
-  model_gpus: 1
+  model_gpus: 2
   sampler_gpus: 1
   sampler_tp: 1
   lazy_collect: false
@@ -60,6 +60,7 @@ lora_contexts:
 
 model:
   mesh:
+    dp_size: 2
     tp_size: 1
     ep_size: 1
     pp_size: 1

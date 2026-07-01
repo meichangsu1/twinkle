@@ -51,11 +51,21 @@ def build_device_meshes(cfg):
             ),
         ]
     model_mesh_cfg = cfg.model.mesh
+    model_tp = int(model_mesh_cfg.get('tp_size', 1))
+    model_ep = int(model_mesh_cfg.get('ep_size', 1))
+    model_pp = int(model_mesh_cfg.get('pp_size', 1))
+    model_parallel_size = model_tp * model_ep * model_pp
+    if model_gpus % model_parallel_size != 0:
+        raise ValueError(
+            f'model_gpus={model_gpus} must be divisible by '
+            f'tp_size*ep_size*pp_size={model_parallel_size}')
+    model_dp = int(model_mesh_cfg.get('dp_size', model_gpus // model_parallel_size))
     model_mesh = DeviceMesh.from_sizes(
         world_size=model_gpus,
-        tp_size=int(model_mesh_cfg.get('tp_size', 1)),
-        ep_size=int(model_mesh_cfg.get('ep_size', 1)),
-        pp_size=int(model_mesh_cfg.get('pp_size', 1)),
+        dp_size=model_dp,
+        tp_size=model_tp,
+        ep_size=model_ep,
+        pp_size=model_pp,
         sequence_parallel=bool(model_mesh_cfg.get('sequence_parallel', False)),
     )
     sampler_mesh = DeviceMesh.from_sizes(
