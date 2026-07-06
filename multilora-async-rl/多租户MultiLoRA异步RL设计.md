@@ -253,7 +253,7 @@ train_id = 3
   -> partition_id = {tenant_id}/{training_run_id}/{adapter_name}/train_3
 ```
 
-因此同一个 `(tenant_id, training_run_id, adapter_name, train_k)` 只能存在一个 live partition。该 partition 处于 `OPEN` 时，AsyncRollouter 可以继续向其中追加 prompt groups；一旦达到 `pipeline.rollout.batch_size` 并 seal，不能继续追加 rollout 数据。
+因此同一个 `(tenant_id, training_run_id, adapter_name, train_k)` 只能存在一个 live partition。该 partition 处于 `OPEN` 时，AsyncRollouter 可以继续向其中追加 prompt groups；一旦达到该 LoRA 的 `lora_contexts[].rollout.batch_size`，或未配置时达到 `pipeline.default_rollout_batch_size`，就会关闭生产侧写入。
 
 `policy_version` 不决定 partition id。它记录每条 sample 由哪个 rollout 权重版本生成。同一个 `train_k` 可以混合多个 `policy_version`，但 partition 内仍然不能混 tenant、training_run、adapter、reward_type、loss_type 或 algorithm。
 
@@ -555,7 +555,7 @@ StalenessManager.rollout_capacity
 默认建议：
 
 ```text
-pipeline.rollout.batch_size 表示一个 train_k 收集多少个 prompt group。
+`pipeline.default_rollout_batch_size` 表示一个 train_k 默认收集多少个 prompt group；单个 LoRA 可以通过 `lora_contexts[].rollout.batch_size` 覆盖。
 一个 rollout task 始终只处理一个 prompt group。
 ```
 

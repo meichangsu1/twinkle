@@ -60,10 +60,11 @@ dataset:
 pipeline:
   max_steps: 10
   max_staleness: 1
+  default_rollout_batch_size: 1
+  default_mini_batch_size: 1
   rollout:
-    batch_size: 1
     num_generations: 4
-    max_concurrent_groups: 16
+    max_concurrency: 16
   save_name_prefix: async-grpo-sampler-weights
   is_sampler_checkpoint: true
   save_optimizer: false
@@ -72,7 +73,5 @@ transfer_queue:
   init_ray: true
   ray_namespace: TransferQueueApp
   total_storage_size: 200000
-  max_rows: 4096
-  max_rows_per_context: 2048
   num_data_storage_units: 4
   storage_backend: SimpleStorage

@@ -33,7 +33,8 @@ vllm = ["vllm>=0.11"]
 ray = ["ray[serve]"]
 datajuicer = ["py-data-juicer"]
 tinker = ["tinker==0.16.1"]
-test = ["hypothesis>=6.0", "pytest", "pytest-asyncio"]
+async-rl = ["TransferQueue>=0.1.8"]
+test = ["hypothesis>=6.0", "pytest", "pytest-asyncio", "TransferQueue>=0.1.8"]
 server = [
   "redis>=5.0",
   "psutil>=5.9.0",

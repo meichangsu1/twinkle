@@ -21,6 +21,12 @@ class FakeTransferQueueClient:
             current_tag.update(dict(tag))
             self.tags[partition_id][key] = current_tag
 
+    def kv_batch_put(self, keys, partition_id: str, fields=None, tags=None):
+        fields = self._rows_from_fields(fields, len(keys))
+        tags = tags or [{} for _ in keys]
+        for key, row_fields, tag in zip(keys, fields, tags):
+            self.kv_put(key=key, partition_id=partition_id, fields=row_fields, tag=tag)
+
     def kv_batch_get(self, keys, partition_id: str, select_fields=None):
         if isinstance(keys, str):
             keys = [keys]
@@ -46,3 +52,36 @@ class FakeTransferQueueClient:
         for key in keys:
             self.fields.get(partition_id, {}).pop(key, None)
             self.tags.get(partition_id, {}).pop(key, None)
+
+    @staticmethod
+    def _rows_from_fields(fields, size: int):
+        if fields is None:
+            return [{} for _ in range(size)]
+        if hasattr(fields, 'to_dict'):
+            fields = fields.to_dict()
+        if isinstance(fields, list):
+            return [dict(item) for item in fields]
+        if isinstance(fields, dict):
+            rows = [dict() for _ in range(size)]
+            for field_name, value in fields.items():
+                values = FakeTransferQueueClient._field_values(value, size)
+                for row, item in zip(rows, values):
+                    row[field_name] = item
+            return rows
+        return [{'data': fields} for _ in range(size)]
+
+    @staticmethod
+    def _field_values(value, size: int):
+        if hasattr(value, 'unbind'):
+            return list(value.unbind(0))
+        if hasattr(value, 'tolist'):
+            value = value.tolist()
+        if isinstance(value, list) and len(value) == size:
+            return value
+        try:
+            values = list(value)
+            if len(values) == size:
+                return values
+        except TypeError:
+            pass
+        return [value for _ in range(size)]

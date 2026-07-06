@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
-from .types import LoraContext, SampleRecord, WorkerResult
+from twinkle.data_format import Trajectory
+from .types import ComponentResult, LoraContext
 from .workers import AsyncRollouter
 
 
@@ -39,7 +40,7 @@ class PromptLoader:
         pending = self.rollouter.pending_prompt_group_count(self.context)
         return pending < self.max_pending_groups
 
-    def step(self) -> WorkerResult | None:
+    def step(self) -> ComponentResult | None:
         """Read one dataloader batch and enqueue it as rollout prompt groups."""
         if not self.can_load():
             return None
@@ -56,7 +57,7 @@ class PromptLoader:
             return None
         self.rollouter.enqueue_prompt_groups(self.context, prompt_groups)
         self.submitted_groups += len(prompt_groups)
-        return WorkerResult(component='prompt_loader', kind='prompt', count=len(prompt_groups))
+        return ComponentResult(component='prompt_loader', kind='prompt', count=len(prompt_groups))
 
     def is_idle(self) -> bool:
         return not self.can_load()
@@ -69,7 +70,7 @@ class PromptLoader:
                 return
 
     @staticmethod
-    def _normalize_batch(batch: Any) -> list[SampleRecord]:
+    def _normalize_batch(batch: Any) -> list[Trajectory]:
         if batch is None:
             return []
         if isinstance(batch, list):

@@ -2,28 +2,28 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable
 
-from .types import LoraContext, PartitionMetadata, RolloutContextState
+from .types import LoraContext, RolloutScheduleCandidate, TrainBatchCandidate
 
 
-def _oldest_partition(partitions: Iterable[PartitionMetadata]) -> PartitionMetadata:
-    return min(partitions, key=lambda p: (p.created_at, p.partition_id))
+def _oldest_train_candidate(candidates: Iterable[TrainBatchCandidate]) -> TrainBatchCandidate:
+    return min(candidates, key=lambda c: (c.created_at, c.partition_id))
 
 
 class WorkConservingRolloutPolicy:
     """Prefer contexts that are most likely to keep trainer fed."""
 
-    def pick_next_context(self, candidates: list[RolloutContextState]) -> LoraContext | None:
+    def pick_next_context(self, candidates: list[RolloutScheduleCandidate]) -> LoraContext | None:
         candidates = [c for c in candidates if c.pending_groups > 0 and c.rollout_capacity > 0]
         if not candidates:
             return None
         return min(
             candidates,
             key=lambda c: (
-                c.open_partitions > 0,
+                c.active_partitions > 0,
                 c.live_partitions,
-                c.in_flight_rollouts,
+                c.in_flight_groups,
                 c.last_submit_time,
                 c.context_key,
             ),
@@ -42,7 +42,7 @@ class WeightedFairRolloutPolicy:
         self.deficit: dict[str, float] = defaultdict(float)
         self._cursor = 0
 
-    def pick_next_context(self, candidates: list[RolloutContextState]) -> LoraContext | None:
+    def pick_next_context(self, candidates: list[RolloutScheduleCandidate]) -> LoraContext | None:
         candidates = [c for c in candidates if c.pending_groups > 0 and c.rollout_capacity > 0]
         if not candidates:
             return None
@@ -50,14 +50,14 @@ class WeightedFairRolloutPolicy:
         n = len(candidates)
         for i in range(n):
             idx = (self._cursor + i) % n
-            state = candidates[idx]
-            key = state.context_key
-            self.deficit[key] += state.weight * self.quantum
+            candidate = candidates[idx]
+            key = candidate.context_key
+            self.deficit[key] += candidate.weight * self.quantum
             cost = 1.0
             if self.deficit[key] >= cost:
                 self.deficit[key] -= cost
                 self._cursor = (idx + 1) % n
-                return state.context
+                return candidate.context
         self._cursor = (self._cursor + 1) % n
         return None
 
@@ -65,26 +65,27 @@ class WeightedFairRolloutPolicy:
 class PreferCurrentTrainPolicy:
     """Keep current adapter if it has work; otherwise switch immediately."""
 
-    def pick_next_partition(
+    def pick_next_batch(
         self,
-        candidates: list[PartitionMetadata],
+        candidates: list[TrainBatchCandidate],
         current_context: LoraContext | None = None,
-    ) -> PartitionMetadata | None:
+    ) -> TrainBatchCandidate | None:
         if not candidates:
             return None
         if current_context is not None:
-            same = [p for p in candidates if p.context.key == current_context.key]
+            same = [candidate for candidate in candidates if candidate.context.key == current_context.key]
             if same:
-                return _oldest_partition(same)
+                return _oldest_train_candidate(same)
 
-        grouped: dict[str, list[PartitionMetadata]] = defaultdict(list)
-        for partition in candidates:
-            grouped[partition.context.key].append(partition)
+        grouped: dict[str, list[TrainBatchCandidate]] = defaultdict(list)
+        for candidate in candidates:
+            grouped[candidate.context.key].append(candidate)
         selected_group = max(
             grouped.values(),
-            key=lambda group: (len(group), -_oldest_partition(group).created_at),
+            key=lambda group:
+            (sum(candidate.available_groups for candidate in group), -_oldest_train_candidate(group).created_at),
         )
-        return _oldest_partition(selected_group)
+        return _oldest_train_candidate(selected_group)
 
 
 class WeightedFairTrainPolicy:
@@ -100,18 +101,18 @@ class WeightedFairTrainPolicy:
         self.deficit: dict[str, float] = defaultdict(float)
         self._cursor = 0
 
-    def pick_next_partition(
+    def pick_next_batch(
         self,
-        candidates: list[PartitionMetadata],
+        candidates: list[TrainBatchCandidate],
         current_context: LoraContext | None = None,
-    ) -> PartitionMetadata | None:
+    ) -> TrainBatchCandidate | None:
         if not candidates:
             return None
-        grouped: dict[str, list[PartitionMetadata]] = defaultdict(list)
+        grouped: dict[str, list[TrainBatchCandidate]] = defaultdict(list)
         weights: dict[str, float] = {}
-        for partition in candidates:
-            grouped[partition.context.key].append(partition)
-            weights[partition.context.key] = 1.0
+        for candidate in candidates:
+            grouped[candidate.context.key].append(candidate)
+            weights[candidate.context.key] = 1.0
         keys = sorted(grouped)
         n = len(keys)
         for i in range(n):
@@ -122,6 +123,6 @@ class WeightedFairTrainPolicy:
             if self.deficit[key] >= cost:
                 self.deficit[key] -= cost
                 self._cursor = (idx + 1) % n
-                return _oldest_partition(grouped[key])
+                return _oldest_train_candidate(grouped[key])
         self._cursor = (self._cursor + 1) % n
         return None

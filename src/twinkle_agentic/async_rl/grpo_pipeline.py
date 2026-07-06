@@ -4,14 +4,15 @@ from __future__ import annotations
 import os
 import re
 from functools import partial
-from typing import Any, List
+from typing import Any
 
 from twinkle import get_logger
+from twinkle.data_format import Trajectory
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_loader import PromptLoader
-from .types import LoraContext
-from .workers import TrainerStepResult
+from .types import GRPOAdvantageBatch, LoraContext, RolloutOutput
+from .workers import TrainerStepResult, read_train_batch
 
 logger = get_logger()
 
@@ -51,6 +52,7 @@ def build_lora_contexts(cfg) -> list[LoraContext]:
                 reward_type=context_cfg.reward_type,
                 tool_profile=context_cfg.get('tool_profile', 'default'),
                 algorithm=context_cfg.get('algorithm', cfg.pipeline.get('algorithm', 'grpo')),
+                rollout_profile=context_cfg.get('rollout_profile', 'default'),
             ))
     base_models = {context.base_model_id for context in contexts}
     if len(base_models) != 1:
@@ -90,6 +92,40 @@ def lora_model_config_for_context(cfg, context: LoraContext):
     raise KeyError(f'cannot find lora context config for {context.key}')
 
 
+def lora_rollout_config(cfg, context_cfg):
+    from omegaconf import OmegaConf
+
+    rollout_defaults = OmegaConf.create({'batch_size': cfg.pipeline.default_rollout_batch_size})
+    return OmegaConf.merge(rollout_defaults, cfg.pipeline.rollout, context_cfg.get('rollout') or {})
+
+
+def rollout_batch_groups_for_context(cfg, context_cfg) -> int:
+    return int(lora_rollout_config(cfg, context_cfg).batch_size)
+
+
+def rollout_batch_groups_by_context(cfg, contexts: list[LoraContext]) -> dict[str, int]:
+    result = {}
+    for context_cfg, context in zip(lora_context_configs(cfg), contexts):
+        result[context.key] = rollout_batch_groups_for_context(cfg, context_cfg)
+    return result
+
+
+def mini_batch_size_for_context(cfg, context_cfg) -> int | None:
+    train_cfg = context_cfg.get('train') or {}
+    if train_cfg.get('mini_batch_size') is None:
+        return None
+    return int(train_cfg.mini_batch_size)
+
+
+def mini_batch_size_by_context(cfg, contexts: list[LoraContext]) -> dict[str, int]:
+    result = {}
+    for context_cfg, context in zip(lora_context_configs(cfg), contexts):
+        mini_batch_size = mini_batch_size_for_context(cfg, context_cfg)
+        if mini_batch_size is not None:
+            result[context.key] = mini_batch_size
+    return result
+
+
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     if isinstance(cfg, dict):
         return cfg.get(key, default)
@@ -124,6 +160,41 @@ def _build_lora_config(lora_cfg):
     if 'lora_dropout' in kwargs:
         kwargs['lora_dropout'] = float(kwargs['lora_dropout'])
     return LoraConfig(**kwargs)
+
+
+def _model_dp_size(cfg) -> int:
+    mesh_cfg = cfg.model.mesh
+    model_gpus = int(cfg.runtime.model_gpus)
+    tp_size = int(mesh_cfg.get('tp_size', 1))
+    ep_size = int(mesh_cfg.get('ep_size', 1))
+    pp_size = int(mesh_cfg.get('pp_size', 1))
+    parallel_size = tp_size * ep_size * pp_size
+    if model_gpus % parallel_size != 0:
+        raise ValueError(f'runtime.model_gpus={model_gpus} must be divisible by '
+                         f'model.mesh tp_size*ep_size*pp_size={parallel_size}')
+    return int(mesh_cfg.get('dp_size', model_gpus // parallel_size))
+
+
+def _validate_train_batch_config(cfg) -> None:
+    mini_batch_groups = int(cfg.pipeline.default_mini_batch_size)
+    num_generations = int(cfg.pipeline.rollout.get('num_generations', 1))
+    for context_cfg in lora_context_configs(cfg):
+        rollout_batch_groups = rollout_batch_groups_for_context(cfg, context_cfg)
+        if rollout_batch_groups % mini_batch_groups != 0:
+            raise ValueError('resolved rollout batch size must be divisible by pipeline.default_mini_batch_size. '
+                             'Both values are measured in prompt groups. '
+                             f'Got context={context_cfg.adapter_name}, rollout_batch_size={rollout_batch_groups}, '
+                             f'default_mini_batch_size={mini_batch_groups}.')
+    mini_batch_samples = mini_batch_groups * num_generations
+    dp_size = _model_dp_size(cfg)
+    if mini_batch_samples < dp_size:
+        raise ValueError('pipeline.default_mini_batch_size is measured in prompt groups, and '
+                         'default_mini_batch_size * pipeline.rollout.num_generations must be >= '
+                         'model data-parallel size. '
+                         f'Got default_mini_batch_size={mini_batch_groups}, num_generations={num_generations}, '
+                         f'mini_batch_samples={mini_batch_samples}, model_dp_size={dp_size}. '
+                         'Increase pipeline.default_mini_batch_size or pipeline.rollout.num_generations, '
+                         'or reduce model.mesh.dp_size.')
 
 
 def _metric_payload(metric: Any) -> dict[str, Any]:
@@ -173,40 +244,27 @@ def _prefixed_stats(prefix: str, values: list[float]) -> dict[str, float]:
     return {f'{prefix}_{key}': value for key, value in _stats(values).items()}
 
 
-def _training_batch_diagnostics(samples: list[dict[str, Any]], inputs: list[dict[str, Any]]) -> dict[str, Any]:
-    rewards = []
-    advantages = []
-    old_logps_lens = []
+def _training_batch_diagnostics(
+    *,
+    inputs: list[dict[str, Any]],
+    rewards: list[float],
+    advantages: list[float],
+    logprobs: list[list[float]],
+) -> dict[str, Any]:
+    logprobs_lens = []
     input_lens = []
-    group_ids = set()
-    generation_ids = set()
 
-    for sample, model_input in zip(samples, inputs):
-        reward = _as_float(sample.get('rewards', sample.get('reward')))
-        if reward is not None:
-            rewards.append(reward)
-        advantage = _as_float(sample.get('advantages', sample.get('advantage')))
-        if advantage is not None:
-            advantages.append(advantage)
-        old_logps = sample.get('old_logps') or []
-        old_logps_lens.append(float(len(old_logps)))
-        input_ids = model_input.get('input_ids') or []
-        input_lens.append(float(len(input_ids)))
-        group_id = sample.get('group_id')
-        if group_id is not None:
-            group_ids.add(group_id)
-        generation_idx = sample.get('generation_idx')
-        if generation_idx is not None:
-            generation_ids.add(generation_idx)
+    for model_input, sample_logprobs in zip(inputs, logprobs):
+        logprobs_lens.append(float(len(sample_logprobs or [])))
+        input_ids = model_input.get('input_ids')
+        input_lens.append(float(len(input_ids) if input_ids is not None else 0))
 
     diagnostics: dict[str, Any] = {
-        'sample_count': len(samples),
-        'group_count': len(group_ids),
-        'generation_count': len(generation_ids),
+        'sample_count': len(inputs),
     }
     diagnostics.update(_prefixed_stats('reward', rewards))
     diagnostics.update(_prefixed_stats('advantage', advantages))
-    diagnostics.update(_prefixed_stats('old_logps_len', old_logps_lens))
+    diagnostics.update(_prefixed_stats('logprobs_len', logprobs_lens))
     diagnostics.update(_prefixed_stats('input_len', input_lens))
     return diagnostics
 
@@ -252,10 +310,12 @@ def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: 
 
 
 def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
+    _validate_train_batch_config(cfg)
     contexts = build_lora_contexts(cfg)
     primary_context = contexts[0]
     rollout_cfg = cfg.pipeline.rollout
-    train_cfg = cfg.pipeline.get('train', {})
+    target_groups_by_context = rollout_batch_groups_by_context(cfg, contexts)
+    context_mini_batch_sizes = mini_batch_size_by_context(cfg, contexts)
     return BaseRLPipelineConfig(
         lora_contexts=contexts,
         tenant_id=primary_context.tenant_id,
@@ -266,12 +326,12 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         algorithm=primary_context.algorithm,
         tool_profile=primary_context.tool_profile,
         max_staleness=int(cfg.pipeline.max_staleness),
-        target_groups_per_partition=int(rollout_cfg.batch_size),
-        max_concurrent_groups=int(rollout_cfg.max_concurrent_groups),
-        reward_batch_size=int(cfg.pipeline.reward_batch_size),
-        advantage_batch_size=int(cfg.pipeline.advantage_batch_size),
-        train_batch_groups=int(train_cfg.get('batch_groups', 1)),
-        max_train_partitions=int(cfg.pipeline.max_steps),
+        default_rollout_batch_size=int(cfg.pipeline.default_rollout_batch_size),
+        target_groups_by_context=target_groups_by_context,
+        max_concurrency=int(rollout_cfg.get('max_concurrency', 16)),
+        default_mini_batch_size=int(cfg.pipeline.default_mini_batch_size),
+        mini_batch_size_by_context=context_mini_batch_sizes,
+        max_train_steps=int(cfg.pipeline.max_steps),
         save_name_prefix=cfg.pipeline.save_name_prefix,
         adapter_checkpoint_dir=cfg.model.adapter_checkpoint_dir,
         is_sampler_checkpoint=bool(cfg.pipeline.is_sampler_checkpoint),
@@ -279,37 +339,6 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         max_grad_norm=float(cfg.pipeline.max_grad_norm),
         norm_type=int(cfg.pipeline.norm_type),
     )
-
-
-_MODEL_INPUT_FIELDS = {
-    'messages',
-    'input_ids',
-    'labels',
-    'attention_mask',
-    'position_ids',
-    'cu_seqlens',
-    'pixel_values',
-    'image_grid_thw',
-    'video_pixel_values',
-    'video_grid_thw',
-    'input_features',
-    'feature_attention_mask',
-}
-
-
-def model_input_from_training_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Return only model-consumable fields from a TQ training row.
-
-    TQ rows contain both model input fields and training/runtime metadata
-    such as old_logps, advantages, rewards, policy_version and group_id.
-    Those fields are consumed by the loss or scheduler, not by InputProcessor.
-    """
-    trajectory = sample.get('trajectory')
-    source = trajectory if isinstance(trajectory, dict) else sample
-    model_input = {key: value for key, value in source.items() if key in _MODEL_INPUT_FIELDS}
-    if not model_input:
-        raise ValueError(f'training sample has no model input fields: keys={sorted(source.keys())}')
-    return model_input
 
 
 def validate_training_input_length(
@@ -375,7 +404,7 @@ class ServerSingleTurnRollout:
         self.sampling_params = sampling_params
         self.num_generations = num_generations
 
-    def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
+    def __call__(self, trajectories: list[Trajectory], **kwargs) -> list[RolloutOutput]:
         adapter_path = kwargs.get('adapter_path')
         adapter_name = kwargs.get('adapter_name', '')
         expanded = []
@@ -393,15 +422,16 @@ class ServerSingleTurnRollout:
             adapter_name=adapter_name,
             adapter_path=adapter_path,
         )
-        rows: list[dict[str, Any]] = []
+        rows: list[RolloutOutput] = []
         for source, response in zip(expanded, responses):
             for sequence in response.sequences:
-                row = dict(sequence.new_input_feature or source)
+                row = dict(source)
+                row.update(sequence.new_input_feature or {})
                 row.setdefault('group_id', source['group_id'])
                 row.setdefault('generation_idx', source['generation_idx'])
-                row['old_logps'] = self._extract_logps(sequence.logprobs)
+                row['logprobs'] = self._extract_logps(sequence.logprobs)
                 row['stop_reason'] = sequence.stop_reason
-                row['policy_version'] = kwargs.get('policy_version')
+                row['rollout_policy_version'] = kwargs.get('policy_version')
                 rows.append(row)
         return rows
 
@@ -545,8 +575,6 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             tq_config=TransferQueueRuntimeConfig(
                 init=bool(tq_cfg.get('init', True)),
                 total_storage_size=tq_cfg.get('total_storage_size'),
-                max_rows=tq_cfg.get('max_rows'),
-                max_rows_per_context=tq_cfg.get('max_rows_per_context'),
                 num_data_storage_units=int(tq_cfg.get('num_data_storage_units', 4)),
                 storage_backend=tq_cfg.get('storage_backend', 'SimpleStorage'),
             ))
@@ -557,10 +585,10 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         from twinkle.dataloader import DataLoader
 
         loaders = []
-        max_pending_groups = self.cfg.pipeline.rollout.get('max_pending_groups')
-        prompt_batch_size = int(self.cfg.pipeline.rollout.batch_size)
         for context_cfg, context in zip(lora_context_configs(self.cfg), self.contexts):
             context_model_cfg = lora_model_config(self.cfg, context_cfg)
+            prompt_batch_size = rollout_batch_groups_for_context(self.cfg, context_cfg)
+            max_pending_groups = prompt_batch_size * 2
             safe_context_key = re.sub(r'[^A-Za-z0-9_.-]+', '_', context.key)
             dataset_factory = partial(
                 build_prompt_dataset_from_config,
@@ -610,17 +638,18 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
     def build_save_adapter_fn(self):
         return self.save_adapter
 
-    def train_batch(self, context, partition_id: str, dataloader) -> TrainerStepResult:
-        batch = list(dataloader)
-        train_cfg = self.cfg.pipeline.train
-        mini_batch_size = int(train_cfg.mini_batch_size)
-        micro_batch_size = int(train_cfg.get('micro_batch_size', 1))
+    def train_batch(self, context, batch) -> TrainerStepResult:
+        partition_id = batch.partition_id
+        train_batch = read_train_batch(self.data_plane, batch)
+        mini_batch_groups = int(self.cfg.pipeline.default_mini_batch_size)
+        num_generations = int(self.cfg.pipeline.rollout.num_generations)
+        mini_batch_size = mini_batch_groups * num_generations
         context_model_cfg = lora_model_config_for_context(self.cfg, context)
         max_length = int(context_model_cfg.template.max_length)
         last_metrics: dict[str, Any] = {}
-        for mb_start in range(0, len(batch), mini_batch_size):
-            mini_batch = batch[mb_start:mb_start + mini_batch_size]
-            inputs = [model_input_from_training_sample(sample) for sample in mini_batch]
+        for mb_start in range(0, train_batch.sample_count, mini_batch_size):
+            mb_end = mb_start + mini_batch_size
+            inputs = train_batch.inputs[mb_start:mb_end]
             for model_input in inputs:
                 validate_training_input_length(
                     model_input,
@@ -628,15 +657,19 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                     partition_id=partition_id,
                     max_length=max_length,
                 )
-            old_logps = [sample.get('old_logps', []) for sample in mini_batch]
-            advantages = [sample.get('advantages', 0.0) for sample in mini_batch]
-            batch_diagnostics = _training_batch_diagnostics(mini_batch, inputs)
+            logprobs = train_batch.logprobs[mb_start:mb_end]
+            advantages = train_batch.advantages[mb_start:mb_end]
+            batch_diagnostics = _training_batch_diagnostics(
+                inputs=inputs,
+                rewards=train_batch.rewards[mb_start:mb_end],
+                advantages=advantages,
+                logprobs=logprobs,
+            )
             self.model.forward_backward(
                 inputs=inputs,
-                old_logps=old_logps,
+                old_logps=logprobs,
                 advantages=advantages,
                 adapter_name=context.adapter_name,
-                micro_batch_size=micro_batch_size,
             )
             self.model.clip_grad_and_step(
                 adapter_name=context.adapter_name,
@@ -654,15 +687,16 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 context.key,
                 partition_id,
                 mb_start // mini_batch_size + 1,
-                (len(batch) + mini_batch_size - 1) // mini_batch_size,
+                (train_batch.sample_count + mini_batch_size - 1) // mini_batch_size,
                 last_metrics,
             )
 
         return TrainerStepResult(metrics=last_metrics)
 
     def save_adapter(self, context, partition_id: str) -> TrainerStepResult:
+        runtime_state = self.lora_runtime_registry.get(context)
         save_name = (f'{self.cfg.pipeline.save_name_prefix}-{context.training_run_id}-'
-                     f'{context.adapter_name}-v{context.policy_version + 1}')
+                     f'{context.adapter_name}-v{runtime_state.policy_version + 1}')
         save_result = self.model.save(
             save_name,
             output_dir=self.cfg.model.adapter_checkpoint_dir,
@@ -674,12 +708,12 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         return TrainerStepResult(adapter_path=adapter_path)
 
 
-def grpo_advantage_fn(samples: list[dict[str, Any]], context) -> tuple[list[float], list[float]]:
+def grpo_advantage_fn(batch: GRPOAdvantageBatch, context) -> tuple[list[float], list[float]]:
     from twinkle.advantage import GRPOAdvantage
 
-    rewards = [float(sample.get('rewards', sample.get('reward', 0.0))) for sample in samples]
+    rewards = list(batch.rewards)
     if not rewards:
         return [], []
-    num_generations = max(1, max(int(sample.get('generation_idx', 0)) for sample in samples) + 1)
+    num_generations = max(1, max(batch.generation_indices) + 1)
     advantages = GRPOAdvantage()(rewards, num_generations=num_generations, scale='group').tolist()
     return advantages, rewards

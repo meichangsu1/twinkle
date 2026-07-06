@@ -39,6 +39,7 @@ from twinkle.reward.base import Reward
 from twinkle_agentic.async_rl import (
     BaseRLPipeline,
     BaseRLPipelineConfig,
+    GRPOAdvantageBatch,
     PromptLoader,
     LoraContext,
     TransferQueueDataPlane,
@@ -89,7 +90,7 @@ class SingleTurnClientRollout:
     """One-turn rollout adapter for twinkle_client vLLMSampler.
 
     It accepts one prompt group and returns `num_generations` train rows.
-    `adapter_path` from LoraAdapterRegistry is mapped to client sampler's
+    `adapter_path` from LoraRuntimeRegistry is mapped to client sampler's
     `adapter_uri` argument.
     """
 
@@ -116,9 +117,9 @@ class SingleTurnClientRollout:
                 row = dict(sequence.new_input_feature or source)
                 row.setdefault('group_id', group_id)
                 row['generation_idx'] = generation_idx
-                row['old_logps'] = self._extract_logps(sequence.logprobs)
+                row['logprobs'] = self._extract_logps(sequence.logprobs)
                 row['stop_reason'] = sequence.stop_reason
-                row['policy_version'] = kwargs.get('policy_version')
+                row['rollout_policy_version'] = kwargs.get('policy_version')
                 rows.append(row)
         return rows
 
@@ -164,6 +165,20 @@ def build_lora_contexts(cfg) -> list[LoraContext]:
     if len(base_models) != 1:
         raise ValueError(f'one async multi-LoRA job must use one base model, got {sorted(base_models)}')
     return contexts
+
+
+def mini_batch_size_by_context(cfg, contexts: list[LoraContext]) -> dict[str, int]:
+    result = {}
+    for context_cfg, context in zip(lora_context_configs(cfg), contexts):
+        train_cfg = context_cfg.get('train') or {}
+        if train_cfg.get('mini_batch_size') is not None:
+            result[context.key] = int(train_cfg.mini_batch_size)
+    return result
+
+
+def rollout_batch_size_for_context(cfg, context_cfg) -> int:
+    rollout_cfg = context_cfg.get('rollout') or {}
+    return int(rollout_cfg.get('batch_size', cfg.pipeline.default_rollout_batch_size))
 
 
 def maybe_init_ray(cfg) -> None:
@@ -254,23 +269,17 @@ def build_data_plane(cfg):
     return TransferQueueDataPlane(
         tq_config=TransferQueueRuntimeConfig(
             total_storage_size=tq_cfg.get('total_storage_size'),
-            max_rows=tq_cfg.get('max_rows'),
-            max_rows_per_context=tq_cfg.get('max_rows_per_context'),
             num_data_storage_units=int(tq_cfg.get('num_data_storage_units', 4)),
             storage_backend=tq_cfg.get('storage_backend', 'SimpleStorage'),
         )
     )
 
 
-def grpo_advantage_fn(samples: List[Dict[str, Any]], context) -> tuple[list[float], list[float]]:
-    rewards = [float(sample.get('rewards', sample.get('reward', 0.0))) for sample in samples]
+def grpo_advantage_fn(batch: GRPOAdvantageBatch, context) -> tuple[list[float], list[float]]:
+    rewards = [float(reward) for reward in batch.rewards]
     if not rewards:
         return [], []
-    num_generations = max(1, len(samples))
-    try:
-        num_generations = max(1, max(int(sample.get('generation_idx', 0)) for sample in samples) + 1)
-    except ValueError:
-        pass
+    num_generations = max(1, max(int(index) for index in batch.generation_indices) + 1)
     advantages = GRPOAdvantage()(rewards, num_generations=num_generations, scale='group').tolist()
     return advantages, rewards
 
@@ -291,9 +300,11 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 reward_type=primary_context.reward_type,
                 tool_profile=primary_context.tool_profile,
                 max_staleness=int(cfg.pipeline.max_staleness),
-                target_groups_per_partition=int(cfg.pipeline.rollout.batch_size),
-                max_concurrent_groups=int(cfg.pipeline.rollout.max_concurrent_groups),
-                max_train_partitions=int(cfg.pipeline.max_steps),
+                default_rollout_batch_size=int(cfg.pipeline.default_rollout_batch_size),
+                max_concurrency=int(cfg.pipeline.rollout.max_concurrency),
+                default_mini_batch_size=int(cfg.pipeline.get('default_mini_batch_size', 1)),
+                mini_batch_size_by_context=mini_batch_size_by_context(cfg, contexts),
+                max_train_steps=int(cfg.pipeline.max_steps),
                 save_name_prefix=cfg.pipeline.save_name_prefix,
                 is_sampler_checkpoint=bool(cfg.pipeline.is_sampler_checkpoint),
                 save_optimizer=bool(cfg.pipeline.save_optimizer),
@@ -305,9 +316,9 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
 
     def build_prompt_loaders(self):
         loaders = []
-        max_pending_groups = self.cfg.pipeline.rollout.get('max_pending_groups')
-        prompt_batch_size = int(self.cfg.pipeline.rollout.batch_size)
         for context_cfg, context in zip(lora_context_configs(self.cfg), self.contexts):
+            prompt_batch_size = rollout_batch_size_for_context(self.cfg, context_cfg)
+            max_pending_groups = prompt_batch_size * 2
             dataloader = DataLoader(
                 dataset=create_dataset(self.cfg, context_cfg),
                 batch_size=prompt_batch_size,

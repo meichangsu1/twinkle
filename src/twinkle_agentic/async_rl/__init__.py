@@ -5,39 +5,42 @@ from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .grpo_pipeline import AsyncMultiLoraGRPOPipeline
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_loader import PromptLoader
-from .registry import LoraAdapterRegistry
+from .registry import LoraRuntimeRegistry
 from .scheduling import (PreferCurrentTrainPolicy, WeightedFairRolloutPolicy, WeightedFairTrainPolicy,
                          WorkConservingRolloutPolicy)
 from .staleness import StalenessManager
-from .types import (AdapterRecord, GroupBatch, GroupMetadata, GroupStatus, LoraAdapterState, LoraContext,
-                    PartitionMetadata, PartitionStatus, RolloutCapacity, RolloutContextState, WorkerResult)
+from .types import (ComponentResult, GRPOAdvantageBatch, LoraAdapterState, LoraContext, LoraRuntimeState, PartitionMeta,
+                    PartitionStatus, PromptGroupMeta, PromptGroupRef, PromptGroupStatus, RolloutOutput,
+                    RolloutScheduleCandidate, TrainBatchCandidate, TransformersTrainBatch)
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
-                      RewardWorker, ToolManagerFactory, TrainerScheduler, TrainerWorker)
+                      ToolManagerFactory, TrainerScheduler, TrainerWorker)
 
 __all__ = [
-    'AdapterRecord',
-    'LoraAdapterRegistry',
+    'LoraRuntimeState',
+    'LoraRuntimeRegistry',
     'LoraAdapterState',
     'AdvantageWorker',
     'AsyncRollouter',
     'AsyncMultiLoraGRPOPipeline',
     'BaseRLPipeline',
     'BaseRLPipelineConfig',
-    'WorkerResult',
+    'ComponentResult',
     'WeightedFairRolloutPolicy',
     'WeightedFairTrainPolicy',
-    'GroupBatch',
-    'GroupMetadata',
-    'GroupStatus',
+    'PromptGroupMeta',
+    'PromptGroupStatus',
+    'GRPOAdvantageBatch',
+    'TransformersTrainBatch',
     'MultiLoraGRPOTrainConfig',
     'MultiLoraGRPOTrainerWorker',
-    'PartitionMetadata',
+    'PartitionMeta',
+    'RolloutOutput',
     'PartitionStatus',
     'PreferCurrentTrainPolicy',
     'PromptLoader',
-    'RewardWorker',
-    'RolloutCapacity',
-    'RolloutContextState',
+    'PromptGroupRef',
+    'RolloutScheduleCandidate',
+    'TrainBatchCandidate',
     'StalenessManager',
     'ToolManagerFactory',
     'TrainerScheduler',

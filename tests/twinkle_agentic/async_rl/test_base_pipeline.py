@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from twinkle_agentic.async_rl import (
     BaseRLPipeline,
     BaseRLPipelineConfig,
-    WorkerResult,
+    ComponentResult,
     PartitionStatus,
     PromptLoader,
     LoraContext,
@@ -17,9 +17,12 @@ def make_sample(i=0):
     return {
         'sample_id': f'sample_{i}',
         'messages': [{'role': 'user', 'content': f'q{i}'}],
+        'input_ids': [10 + i, 20 + i],
+        'labels': [-100, 20 + i],
+        'attention_mask': [1, 1],
         'group_id': f'g{i}',
         'generation_idx': 0,
-        'old_logps': [-0.1],
+        'logprobs': [-0.1],
     }
 
 
@@ -102,7 +105,7 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
             base_model_id='base',
             adapter_name='lora_a',
             reward_type='constant',
-            max_train_partitions=1,
+            max_train_steps=1,
         ),
         model=model,
         rollout=rollout,
@@ -135,7 +138,7 @@ def test_base_pipeline_uses_latest_adapter_path_for_next_rollout():
             base_model_id='base',
             adapter_name='lora_a',
             reward_type='constant',
-            max_train_partitions=1,
+            max_train_steps=1,
         ),
         model=model,
         rollout=rollout,
@@ -173,8 +176,8 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
         config=BaseRLPipelineConfig(
             lora_contexts=[context_a, context_b],
             reward_type='constant',
-            target_groups_per_partition=1,
-            max_train_partitions=2,
+            default_rollout_batch_size=1,
+            max_train_steps=2,
         ),
         model=model,
         rollout=rollout,
@@ -183,8 +186,8 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
         receive_weights_fn=lambda context: received.append(context),
     )
 
-    pipeline.submit_rollout_samples([make_sample(0)], context=context_a)
-    pipeline.submit_rollout_samples([make_sample(1)], context=context_b)
+    pipeline.submit_prompt_groups([make_sample(0)], context=context_a)
+    pipeline.submit_prompt_groups([make_sample(1)], context=context_b)
     history = pipeline.run_until_idle(max_steps=2)
 
     trained = [step['train'] for step in history if step['train'] is not None]
@@ -230,8 +233,8 @@ def test_base_pipeline_feeds_prompts_from_prompt_loaders():
         config=BaseRLPipelineConfig(
             lora_contexts=[context_a, context_b],
             reward_type='constant',
-            target_groups_per_partition=1,
-            max_train_partitions=2,
+            default_rollout_batch_size=1,
+            max_train_steps=2,
         ),
         model=model,
         rollout=rollout,
@@ -258,7 +261,7 @@ def test_algorithm_pipeline_can_define_roles_directly():
             if self.calls > 0:
                 return None
             self.calls += 1
-            return WorkerResult(component='dummy', kind='dummy', count=1)
+            return ComponentResult(component='dummy', kind='dummy', count=1)
 
         def is_idle(self):
             return self.calls > 0
@@ -291,7 +294,7 @@ def test_algorithm_pipeline_can_define_roles_directly():
             base_model_id='base',
             adapter_name='lora_a',
             algorithm='dummy',
-            max_train_partitions=1,
+            max_train_steps=1,
         ),
         data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
         component=component,

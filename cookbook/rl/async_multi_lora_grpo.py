@@ -3,7 +3,7 @@
 
 This entrypoint is the in-process/server MVP:
 
-  dataset prompts -> AsyncRollouter -> TransferQueue -> RewardWorker
+  dataset prompts -> AsyncRollouter(inline reward) -> TransferQueue
   -> AdvantageWorker -> TrainerWorker -> LoRA save -> vLLM adapter_path
 
 It does not use the Twinkle client/server submission path. The script owns

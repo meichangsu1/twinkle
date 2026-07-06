@@ -20,6 +20,10 @@ lora_contexts:
     adapter_name: tenant_a_gsm8k_lora
     reward_type: gsm8k
     tool_profile: default
+    rollout:
+      batch_size: 8
+    train:
+      mini_batch_size: 2
     model:
       optimizer:
         lr: 5.0e-5
@@ -40,6 +44,10 @@ lora_contexts:
     adapter_name: tenant_b_gsm8k_lora
     reward_type: gsm8k
     tool_profile: default
+    rollout:
+      batch_size: 4
+    train:
+      mini_batch_size: 1
     model:
       lora:
         r: 8
@@ -95,9 +103,9 @@ sampler:
   engine_args:
     gpu_memory_utilization: 0.8
     max_model_len: 8192
+    max_loras: 8
     max_lora_rank: 16
     enable_lora: true
-    enable_tower_connector_lora: true
   template:
     cls: Qwen3_5Template
     enable_thinking: false
@@ -111,15 +119,11 @@ sampler:
 pipeline:
   max_steps: 1000
   max_staleness: 1
+  default_rollout_batch_size: 8
+  default_mini_batch_size: 2
   rollout:
-    batch_size: 1
     num_generations: 8
-    max_concurrent_groups: 16
-  reward_batch_size: 1024
-  advantage_batch_size: 1024
-  train:
-    mini_batch_size: 1
-    micro_batch_size: 1
+    max_concurrency: 16
   save_name_prefix: async-grpo-lora-sync
   save_optimizer: false
   is_sampler_checkpoint: false
@@ -129,7 +133,5 @@ pipeline:
 transfer_queue:
   init: true
   total_storage_size: 200000
-  max_rows: 4096
-  max_rows_per_context: 2048
   num_data_storage_units: 4
   storage_backend: SimpleStorage
