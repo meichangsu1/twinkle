@@ -226,7 +226,39 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
-def _stats(values: list[float]) -> dict[str, float]:
+def _numeric_values(values: Any) -> list[float]:
+    if values is None:
+        return []
+    if hasattr(values, 'detach'):
+        values = values.detach()
+    if hasattr(values, 'cpu'):
+        values = values.cpu()
+    if hasattr(values, 'flatten'):
+        values = values.flatten()
+    if hasattr(values, 'tolist'):
+        values = values.tolist()
+    if isinstance(values, (list, tuple)):
+        result = []
+        for value in values:
+            converted = _as_float(value)
+            if converted is not None:
+                result.append(converted)
+        return result
+    converted = _as_float(values)
+    return [] if converted is None else [converted]
+
+
+def _sequence_len(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def _stats(values: Any) -> dict[str, float]:
+    values = _numeric_values(values)
     if not values:
         return {}
     count = len(values)
@@ -240,7 +272,7 @@ def _stats(values: list[float]) -> dict[str, float]:
     }
 
 
-def _prefixed_stats(prefix: str, values: list[float]) -> dict[str, float]:
+def _prefixed_stats(prefix: str, values: Any) -> dict[str, float]:
     return {f'{prefix}_{key}': value for key, value in _stats(values).items()}
 
 
@@ -255,9 +287,9 @@ def _training_batch_diagnostics(
     input_lens = []
 
     for model_input, sample_logprobs in zip(inputs, logprobs):
-        logprobs_lens.append(float(len(sample_logprobs or [])))
+        logprobs_lens.append(float(_sequence_len(sample_logprobs)))
         input_ids = model_input.get('input_ids')
-        input_lens.append(float(len(input_ids) if input_ids is not None else 0))
+        input_lens.append(float(_sequence_len(input_ids)))
 
     diagnostics: dict[str, Any] = {
         'sample_count': len(inputs),

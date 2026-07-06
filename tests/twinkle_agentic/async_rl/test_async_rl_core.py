@@ -24,7 +24,7 @@ from twinkle_agentic.async_rl import (
     TransformersTrainBatch,
     WorkConservingRolloutPolicy,
 )
-from twinkle_agentic.async_rl.grpo_pipeline import lora_model_config
+from twinkle_agentic.async_rl.grpo_pipeline import _training_batch_diagnostics, lora_model_config
 from twinkle_agentic.async_rl.workers import columns_to_tq_fields, rows_to_tq_fields
 
 from .fakes import FakeTransferQueueClient
@@ -443,6 +443,24 @@ def test_data_plane_train_batch_requires_encoded_input_feature_fields():
 
     with pytest.raises(ValueError, match='input_ids'):
         make_trainer_for_batch_view(data_plane).read_train_batch(train_batch_meta)
+
+
+def test_training_batch_diagnostics_accepts_tensor_values():
+    torch = pytest.importorskip('torch')
+
+    diagnostics = _training_batch_diagnostics(
+        inputs=[{
+            'input_ids': torch.tensor([1, 2, 3]),
+        }],
+        rewards=torch.tensor([1.0]),
+        advantages=torch.tensor([0.5]),
+        logprobs=[torch.tensor([-0.1, -0.2])],
+    )
+
+    assert diagnostics['reward_mean'] == 1.0
+    assert diagnostics['advantage_mean'] == 0.5
+    assert diagnostics['logprobs_len_mean'] == 2.0
+    assert diagnostics['input_len_mean'] == 3.0
 
 
 def test_rollout_sample_logprobs_must_match_trainable_labels():
