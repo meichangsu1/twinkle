@@ -411,6 +411,7 @@ class AsyncRollouter:
                 rollout_kwargs['adapter_path'] = group.rollout_adapter_path
             rollout_rows = list(await self.invoke_rollout([trajectory], rollout_kwargs))
             rewards = self.compute_rewards(context, rollout_rows)
+            reward_metrics = self.compute_reward_metrics(context, rollout_rows, rewards)
             current_policy_version = self.lora_runtime_registry.get(context).policy_version
             if self.staleness_manager.is_group_too_stale(
                     rollout_policy_version=group.rollout_policy_version,
@@ -456,6 +457,7 @@ class AsyncRollouter:
                     'rollout_latency_s': time.perf_counter() - start,
                     'rollout_policy_version': group.rollout_policy_version,
                     'policy_version_gap': current_policy_version - group.rollout_policy_version,
+                    **reward_metrics,
                 },
             )
             return meta
@@ -497,6 +499,18 @@ class AsyncRollouter:
         if reward_fn is None:
             return None
         return list(reward_fn(rollout_rows, context=context))
+
+    def compute_reward_metrics(
+        self,
+        context: LoraContext,
+        rollout_rows: list[RolloutOutput],
+        rewards: list[float] | None,
+    ) -> dict[str, Any]:
+        reward_fn = self.reward_registry.get(context.reward_type)
+        metric_payload = getattr(reward_fn, 'metric_payload', None)
+        if metric_payload is None:
+            return {}
+        return dict(metric_payload(rollout_rows, rewards=rewards, context=context))
 
     def write_rollout_samples(
         self,

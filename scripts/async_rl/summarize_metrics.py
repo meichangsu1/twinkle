@@ -37,24 +37,31 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     hours = wall_time_s / 3600.0 if wall_time_s > 0 else 0.0
 
     gap_values = _metric_values(events, 'policy_version_gap_mean')
-    reward_values = _metric_values(train_events, 'reward_mean')
-    accuracy_values = _metric_values(train_events, 'accuracy_reward_mean')
+    reward_values = _metric_values(train_events, 'train/total_reward') or _metric_values(train_events, 'reward_mean')
+    accuracy_values = (
+        _metric_values(train_events, 'train/accuracy_reward') or _metric_values(train_events, 'accuracy_reward_mean'))
+    brevity_values = _metric_values(train_events, 'train/brevity_reward')
+    loss_values = _metric_values(train_events, 'loss')
 
     by_context: dict[str, dict[str, Any]] = defaultdict(lambda: {
         'train_steps': 0,
         'rollout_groups': 0,
-        'reward_mean_last': None,
-        'accuracy_reward_mean_last': None,
+        'total_reward_last': None,
+        'accuracy_reward_last': None,
     })
     for event in train_events:
         key = str(event.get('context_key') or event.get('adapter_name') or 'unknown')
         by_context[key]['train_steps'] += 1
-        reward = _metric_optional_number(event, 'reward_mean')
-        accuracy = _metric_optional_number(event, 'accuracy_reward_mean')
+        reward = _metric_optional_number(event, 'train/total_reward')
+        if reward is None:
+            reward = _metric_optional_number(event, 'reward_mean')
+        accuracy = _metric_optional_number(event, 'train/accuracy_reward')
+        if accuracy is None:
+            accuracy = _metric_optional_number(event, 'accuracy_reward_mean')
         if reward is not None:
-            by_context[key]['reward_mean_last'] = reward
+            by_context[key]['total_reward_last'] = reward
         if accuracy is not None:
-            by_context[key]['accuracy_reward_mean_last'] = accuracy
+            by_context[key]['accuracy_reward_last'] = accuracy
     for event in rollout_done_events:
         key = str(event.get('context_key') or event.get('adapter_name') or 'unknown')
         by_context[key]['rollout_groups'] += int(_metric_number(event, 'groups') or 1)
@@ -71,8 +78,10 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         'policy_version_gap': _summary(gap_values),
         'stale_dropped_groups': len(stale_events),
         'stale_drop_ratio': len(stale_events) / max(len(stale_events) + len(rollout_done_events), 1),
-        'reward_mean': _summary(reward_values),
-        'accuracy_reward_mean': _summary(accuracy_values),
+        'total_reward': _summary(reward_values),
+        'accuracy_reward': _summary(accuracy_values),
+        'brevity_reward': _summary(brevity_values),
+        'loss': _summary(loss_values),
         'per_context': dict(sorted(by_context.items())),
         'event_counts': _event_counts(events),
     }

@@ -311,7 +311,7 @@ def _prefixed_stats(prefix: str, values: Any) -> dict[str, float]:
     return {f'{prefix}_{key}': value for key, value in _stats(values).items()}
 
 
-def _training_batch_diagnostics(
+def _async_train_batch_data_diagnostics(
     *,
     inputs: list[dict[str, Any]],
     rewards: list[float],
@@ -329,11 +329,49 @@ def _training_batch_diagnostics(
     diagnostics: dict[str, Any] = {
         'sample_count': len(inputs),
     }
-    diagnostics.update(_prefixed_stats('reward', rewards))
+    diagnostics.update(_prefixed_stats('tq_reward', rewards))
     diagnostics.update(_prefixed_stats('advantage', advantages))
     diagnostics.update(_prefixed_stats('logprobs_len', logprobs_lens))
     diagnostics.update(_prefixed_stats('input_len', input_lens))
     return diagnostics
+
+
+def _short_math_reward_metrics(
+    records: list[dict[str, Any]],
+    *,
+    total_rewards: list[float] | None = None,
+) -> dict[str, Any]:
+    """Return reward metrics using the same keys as cookbook/rl/short_math_grpo.py."""
+    from twinkle.metric import CompletionRewardMetric
+
+    metadata_items = [dict(record.get('metadata') or record) for record in records]
+    totals = list(total_rewards) if total_rewards is not None else _record_values(metadata_items, 'total_reward')
+    brevity = _record_values(metadata_items, 'brevity_reward')
+    accuracy = _record_values(metadata_items, 'accuracy_reward')
+    completion_lengths = _record_values(metadata_items, 'completion_length')
+    rewards = {}
+    if totals:
+        rewards['total'] = totals
+    if brevity:
+        rewards['brevity'] = brevity
+    if accuracy:
+        rewards['accuracy'] = accuracy
+    metric = CompletionRewardMetric()
+    metric.accumulate(rewards=rewards, completion_lengths=completion_lengths)
+    return metric.calculate()
+
+
+def _record_values(records: list[dict[str, Any]], key: str) -> list[float]:
+    values = []
+    for record in records:
+        value = record.get(key)
+        if value is None:
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return values
 
 
 def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: dict[str, Any]):
@@ -461,7 +499,28 @@ class GSM8KReward:
     def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[float]:
         accuracy = self.accuracy(trajectories)
         brevity = self.brevity(trajectories)
-        return [a + b for a, b in zip(accuracy, brevity)]
+        total = [a + b for a, b in zip(accuracy, brevity)]
+        for trajectory, total_reward, accuracy_reward, brevity_reward in zip(trajectories, total, accuracy, brevity):
+            metadata = dict(trajectory.get('metadata') or {})
+            metadata.update({
+                'total_reward': float(total_reward),
+                'accuracy_reward': float(accuracy_reward),
+                'brevity_reward': float(brevity_reward),
+            })
+            completion_length = _as_float(trajectory.get('completion_length'))
+            if completion_length is not None:
+                metadata['completion_length'] = completion_length
+            trajectory['metadata'] = metadata
+        return total
+
+    def metric_payload(
+        self,
+        trajectories: list[dict[str, Any]],
+        *,
+        rewards: list[float] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        return _short_math_reward_metrics(trajectories, total_rewards=rewards)
 
 
 class ServerSingleTurnRollout:
@@ -499,6 +558,7 @@ class ServerSingleTurnRollout:
                 row.setdefault('generation_idx', source['generation_idx'])
                 row['logprobs'] = self._extract_logps(sequence.logprobs)
                 row['stop_reason'] = sequence.stop_reason
+                row['completion_length'] = len(sequence.tokens)
                 row['rollout_policy_version'] = kwargs.get('policy_version')
                 rows.append(row)
         return rows
@@ -746,9 +806,11 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 )
             logprobs = train_batch.logprobs[mb_start:mb_end]
             advantages = train_batch.advantages[mb_start:mb_end]
-            batch_diagnostics = _training_batch_diagnostics(
+            rewards = train_batch.rewards[mb_start:mb_end]
+            sample_tags = list(getattr(batch, 'tags', []) or [])[mb_start:mb_end]
+            batch_diagnostics = _async_train_batch_data_diagnostics(
                 inputs=inputs,
-                rewards=train_batch.rewards[mb_start:mb_end],
+                rewards=rewards,
                 advantages=advantages,
                 logprobs=logprobs,
             )
@@ -768,6 +830,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                     is_training=True,
                     adapter_name=context.adapter_name,
                 ))
+            last_metrics.update(_short_math_reward_metrics(sample_tags, total_rewards=rewards))
             last_metrics.update(batch_diagnostics)
             logger.info(
                 'async_multi_lora_grpo train metrics: context=%s partition=%s mini_batch=%s/%s metrics=%s',

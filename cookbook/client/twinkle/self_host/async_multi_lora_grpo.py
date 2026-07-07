@@ -54,6 +54,7 @@ from twinkle_agentic.async_rl.scheduling import (
     WorkConservingRolloutPolicy,
 )
 from twinkle_client.sampler import vLLMSampler
+from twinkle_agentic.async_rl.grpo_pipeline import _short_math_reward_metrics
 
 logger = get_logger()
 
@@ -91,7 +92,28 @@ class GSM8KReward:
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
         accuracy = self.accuracy(trajectories)
         brevity = self.brevity(trajectories)
-        return [a + b for a, b in zip(accuracy, brevity)]
+        total = [a + b for a, b in zip(accuracy, brevity)]
+        for trajectory, total_reward, accuracy_reward, brevity_reward in zip(trajectories, total, accuracy, brevity):
+            metadata = dict(trajectory.get('metadata') or {})
+            metadata.update({
+                'total_reward': float(total_reward),
+                'accuracy_reward': float(accuracy_reward),
+                'brevity_reward': float(brevity_reward),
+            })
+            completion_length = trajectory.get('completion_length')
+            if completion_length is not None:
+                metadata['completion_length'] = float(completion_length)
+            trajectory['metadata'] = metadata
+        return total
+
+    def metric_payload(
+        self,
+        trajectories: List[Dict[str, Any]],
+        *,
+        rewards: List[float] | None = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        return _short_math_reward_metrics(trajectories, total_rewards=rewards)
 
 
 class SingleTurnClientRollout:
@@ -127,6 +149,7 @@ class SingleTurnClientRollout:
                 row['generation_idx'] = generation_idx
                 row['logprobs'] = self._extract_logps(sequence.logprobs)
                 row['stop_reason'] = sequence.stop_reason
+                row['completion_length'] = len(sequence.tokens)
                 row['rollout_policy_version'] = kwargs.get('policy_version')
                 rows.append(row)
         return rows

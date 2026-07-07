@@ -33,7 +33,8 @@ from twinkle_agentic.async_rl.grpo_pipeline import (
     _build_lora_config,
     _config_kwargs,
     _metric_payload,
-    _training_batch_diagnostics,
+    _short_math_reward_metrics,
+    _async_train_batch_data_diagnostics,
     async_rl_metrics_config,
     build_lora_contexts,
     build_prompt_dataset_from_config,
@@ -491,11 +492,16 @@ class SyncBarrierMultiLoraGRPORunner:
                     adapter_name=context.adapter_name,
                 ))
             metrics.update(
-                _training_batch_diagnostics(
+                _async_train_batch_data_diagnostics(
                     inputs=mb_inputs,
                     rewards=mb_rewards,
                     advantages=mb_advantages,
                     logprobs=mb_logprobs,
+                ))
+            metrics.update(
+                _short_math_reward_metrics(
+                    batch.rows[mb_start:mb_end],
+                    total_rewards=mb_rewards,
                 ))
             metrics.update({
                 'round_idx': round_idx,
