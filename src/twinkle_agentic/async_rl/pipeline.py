@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterable
 
 from twinkle.data_format import Trajectory
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
+from .metrics import AsyncRLMetricsConfig, AsyncRLMetricsRecorder, build_metrics_recorder
 from .prompt_loader import PromptLoader
 from .registry import LoraRuntimeRegistry
 from .staleness import StalenessManager
@@ -49,6 +50,7 @@ class BaseRLPipelineConfig:
     norm_type: int = 2
     train_kwargs: dict[str, Any] = field(default_factory=dict)
     tq_config: TransferQueueRuntimeConfig | None = None
+    metrics: AsyncRLMetricsConfig | None = None
 
 
 class BaseRLPipeline(ABC):
@@ -78,6 +80,7 @@ class BaseRLPipeline(ABC):
         self.train_batch_fn = None
         self.receive_weights_fn = None
         self._sync_step_loop = None
+        self.metrics_recorder: AsyncRLMetricsRecorder | None = None
 
         self.build_components()
         self.allocate_resources()
@@ -119,6 +122,9 @@ class BaseRLPipeline(ABC):
     def build_data_plane(self) -> TransferQueueDataPlane:
         """Build the TransferQueue data plane resource."""
         return TransferQueueDataPlane(tq_config=self.config.tq_config)
+
+    def build_metrics_recorder(self) -> AsyncRLMetricsRecorder:
+        return build_metrics_recorder(self.config.metrics)
 
     def build_reward_registry(self) -> dict[str, Callable[..., list[float]]]:
         return {}
@@ -188,8 +194,11 @@ class BaseRLPipeline(ABC):
             raise ValueError(f'duplicate LoraContext keys are not allowed: {context_keys}')
         self.context = self.contexts[0]
 
+        if self.metrics_recorder is None:
+            self.metrics_recorder = self.build_metrics_recorder()
         if self.data_plane is None:
             self.data_plane = self.build_data_plane()
+        self.data_plane.metrics_recorder = self.metrics_recorder
         if self.lora_runtime_registry is None:
             self.lora_runtime_registry = LoraRuntimeRegistry()
         if self.staleness_manager is None:
@@ -249,6 +258,7 @@ class BaseRLPipeline(ABC):
             max_concurrency=config.max_concurrency,
             target_groups_per_partition=config.default_rollout_batch_size,
             target_groups_by_context=config.target_groups_by_context,
+            metrics_recorder=self.metrics_recorder,
         )
 
     def build_advantage_worker(
@@ -262,6 +272,7 @@ class BaseRLPipeline(ABC):
             batch_size=self.config.default_mini_batch_size,
             batch_size_by_context=self.config.mini_batch_size_by_context,
             advantage_fn=advantage_fn,
+            metrics_recorder=self.metrics_recorder,
         )
 
     def build_trainer_scheduler(self, *, train_policy: Any | None) -> TrainerScheduler:
@@ -278,6 +289,7 @@ class BaseRLPipeline(ABC):
                 receive_weights_fn=self.receive_weights_fn,
                 train_batch_groups=self.config.default_mini_batch_size,
                 train_batch_groups_by_context=self.config.mini_batch_size_by_context,
+                metrics_recorder=self.metrics_recorder,
             )
 
         if self.__class__.train_batch is not BaseRLPipeline.train_batch:
@@ -290,6 +302,7 @@ class BaseRLPipeline(ABC):
                 receive_weights_fn=self.receive_weights_fn,
                 train_batch_groups=self.config.default_mini_batch_size,
                 train_batch_groups_by_context=self.config.mini_batch_size_by_context,
+                metrics_recorder=self.metrics_recorder,
             )
 
         return MultiLoraGRPOTrainerWorker(
@@ -309,6 +322,7 @@ class BaseRLPipeline(ABC):
             receive_weights_fn=self.receive_weights_fn,
             train_batch_groups=self.config.default_mini_batch_size,
             train_batch_groups_by_context=self.config.mini_batch_size_by_context,
+            metrics_recorder=self.metrics_recorder,
         )
 
     def build_pipeline_components(self) -> list[Any]:
@@ -382,6 +396,15 @@ class BaseRLPipeline(ABC):
             self._last_step_had_work = True
             if result.kind in step_result:
                 step_result[result.kind] = result.metadata
+        if self.metrics_recorder is not None:
+            self.metrics_recorder.log_event(
+                event='pipeline_step',
+                phase='pipeline',
+                metrics={
+                    **self._backlog_metrics(),
+                    'pipeline_had_work': self._last_step_had_work,
+                },
+            )
         return step_result
 
     def step(self) -> dict[str, PartitionMeta | None]:
@@ -447,11 +470,60 @@ class BaseRLPipeline(ABC):
     def should_stop(self, trained_steps: int) -> bool:
         return self.config.max_train_steps is not None and trained_steps >= self.config.max_train_steps
 
+    def _backlog_metrics(self) -> dict[str, Any]:
+        metrics: dict[str, Any] = {
+            'pending_prompt_groups': 0,
+            'inflight_rollout_groups': 0,
+            'active_partitions': 0,
+            'closed_partitions': 0,
+            'rollout_done_groups': 0,
+            'advantaging_groups': 0,
+            'advantage_done_groups': 0,
+            'training_groups': 0,
+            'untrained_groups': 0,
+        }
+        rollouter = getattr(self, 'rollouter', None)
+        for context in getattr(self, 'contexts', []):
+            if rollouter is not None:
+                metrics['pending_prompt_groups'] += rollouter.pending_prompt_group_count(context)
+            try:
+                runtime_state = self.lora_runtime_registry.get(context)
+                metrics['inflight_rollout_groups'] += runtime_state.in_flight_groups
+            except KeyError:
+                pass
+        for partition in self.data_plane.list_partitions():
+            if partition.status == PartitionStatus.ACTIVE:
+                metrics['active_partitions'] += 1
+            elif partition.status == PartitionStatus.CLOSED:
+                metrics['closed_partitions'] += 1
+        groups = self.data_plane.list_prompt_groups()
+        status_keys = {
+            PromptGroupStatus.ROLLOUT_DONE: 'rollout_done_groups',
+            PromptGroupStatus.ADVANTAGING: 'advantaging_groups',
+            PromptGroupStatus.ADVANTAGE_DONE: 'advantage_done_groups',
+            PromptGroupStatus.TRAINING: 'training_groups',
+        }
+        untrained_statuses = {
+            PromptGroupStatus.ROLLOUT_DONE,
+            PromptGroupStatus.ADVANTAGING,
+            PromptGroupStatus.ADVANTAGE_DONE,
+            PromptGroupStatus.TRAINING,
+        }
+        for group in groups:
+            key = status_keys.get(group.status)
+            if key is not None:
+                metrics[key] += 1
+            if group.status in untrained_statuses:
+                metrics['untrained_groups'] += 1
+        return metrics
+
     def shutdown(self) -> None:
         for component in getattr(self, 'components', []):
             shutdown = getattr(component, 'shutdown', None)
             if shutdown is not None:
                 shutdown()
+        if self.metrics_recorder is not None:
+            self.metrics_recorder.close()
         if self._sync_step_loop is not None and not self._sync_step_loop.is_closed():
             self._sync_step_loop.run_until_complete(asyncio.sleep(0))
             self._sync_step_loop.close()

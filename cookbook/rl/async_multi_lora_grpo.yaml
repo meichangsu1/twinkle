@@ -5,6 +5,16 @@ runtime:
   sampler_tp: 1
   lazy_collect: false
 
+experiment:
+  run_id: async_relaxed_seed0
+  mode: async_relaxed
+  seed: 0
+  metrics:
+    output_dir: outputs/async_rl_experiments
+    enable_jsonl: true
+    enable_swanlab: true
+    swanlab_project: twinkle
+
 lora_context:
   tenant_id: tenant_a
   training_run_id: gsm8k_grpo_server_run_001
@@ -21,9 +31,9 @@ lora_contexts:
     reward_type: gsm8k
     tool_profile: default
     rollout:
-      batch_size: 8
+      batch_size: 4
     train:
-      mini_batch_size: 2
+      mini_batch_size: 1
     model:
       optimizer:
         lr: 5.0e-5
@@ -119,8 +129,10 @@ sampler:
 pipeline:
   max_steps: 1000
   max_staleness: 1
-  default_rollout_batch_size: 8
-  default_mini_batch_size: 2
+  default_rollout_batch_size: 4
+  default_mini_batch_size: 1
+  rollout_policy: weighted_fair
+  train_policy: weighted_fair
   rollout:
     num_generations: 8
     max_concurrency: 16

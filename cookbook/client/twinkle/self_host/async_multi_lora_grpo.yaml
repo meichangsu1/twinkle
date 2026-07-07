@@ -2,6 +2,16 @@ client:
   base_url: http://127.0.0.1:8000
   api_key: EMPTY_TOKEN
 
+experiment:
+  run_id: client_async_relaxed_seed0
+  mode: async_relaxed
+  seed: 0
+  metrics:
+    output_dir: outputs/async_rl_experiments
+    enable_jsonl: true
+    enable_swanlab: true
+    swanlab_project: twinkle
+
 lora_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_grpo_run_001
@@ -62,6 +72,8 @@ pipeline:
   max_staleness: 1
   default_rollout_batch_size: 1
   default_mini_batch_size: 1
+  rollout_policy: weighted_fair
+  train_policy: weighted_fair
   rollout:
     num_generations: 4
     max_concurrency: 16

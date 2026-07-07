@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from twinkle.data_format import Trajectory
+from .metrics import AsyncRLMetricsRecorder, NoopMetricsRecorder
 from .types import ComponentResult, LoraContext
 from .workers import AsyncRollouter
 
@@ -23,11 +24,13 @@ class PromptLoader:
         dataloader: Iterable[Any],
         rollouter: AsyncRollouter,
         max_pending_groups: int | None = None,
+        metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
         self.context = context
         self.dataloader = dataloader
         self.rollouter = rollouter
         self.max_pending_groups = max_pending_groups
+        self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
         self._iterator = None
         self.exhausted = False
         self.submitted_groups = 0
@@ -57,6 +60,17 @@ class PromptLoader:
             return None
         self.rollouter.enqueue_prompt_groups(self.context, prompt_groups)
         self.submitted_groups += len(prompt_groups)
+        self.metrics_recorder.log_event(
+            event='prompt_loaded',
+            phase='prompt',
+            context=self.context,
+            metrics={
+                'prompt_groups': len(prompt_groups),
+                'pending_prompt_groups': self.rollouter.pending_prompt_group_count(self.context),
+                'max_pending_groups': self.max_pending_groups,
+                'submitted_groups': self.submitted_groups,
+            },
+        )
         return ComponentResult(component='prompt_loader', kind='prompt', count=len(prompt_groups))
 
     def is_idle(self) -> bool:

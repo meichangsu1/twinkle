@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from omegaconf import OmegaConf
@@ -25,6 +26,7 @@ from twinkle_agentic.async_rl import (
     WorkConservingRolloutPolicy,
 )
 from twinkle_agentic.async_rl.grpo_pipeline import _training_batch_diagnostics, lora_model_config
+from twinkle_agentic.async_rl.metrics import AsyncRLMetricsConfig, JSONLMetricsRecorder, flatten_for_swanlab
 from twinkle_agentic.async_rl.workers import columns_to_tq_fields, rows_to_tq_fields
 
 from .fakes import FakeTransferQueueClient
@@ -118,6 +120,63 @@ def test_lora_context_namespace_and_metadata_validation():
     assert context.partition_id(3) == 'tenant/run/lora/train_3'
     metadata = context.metadata()
     context.validate_metadata(metadata)
+
+
+def test_jsonl_metrics_recorder_writes_event_sidecar(tmp_path):
+    config = AsyncRLMetricsConfig(
+        run_id='run/seed:42',
+        mode='async_strict',
+        seed=42,
+        output_dir=str(tmp_path),
+        metadata={'num_loras': 2},
+    )
+    recorder = JSONLMetricsRecorder(config)
+    context = make_context('lora')
+
+    recorder.log_event(
+        event='train_done',
+        phase='train',
+        context=context,
+        partition_id=context.partition_id(0),
+        policy_version=1,
+        metrics={'reward_mean': 0.5},
+    )
+    recorder.close()
+
+    path = tmp_path / 'run_seed_42' / 'metrics.jsonl'
+    events = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+    assert events[0]['event'] == 'run_metadata'
+    assert events[0]['metrics']['num_loras'] == 2
+    assert events[1]['event'] == 'train_done'
+    assert events[1]['context_key'] == context.key
+    assert events[1]['adapter_name'] == 'lora'
+    assert events[1]['partition_id'] == context.partition_id(0)
+    assert events[1]['policy_version'] == 1
+    assert events[1]['metrics']['reward_mean'] == 0.5
+
+
+def test_swanlab_flatten_uses_stable_metric_namespaces():
+    payload = {
+        'elapsed_s': 3.0,
+        'phase': 'train',
+        'event': 'train_batch_done',
+        'adapter_name': 'lora',
+        'policy_version': 2,
+        'metrics': {
+            'reward_mean': 0.7,
+            'policy_version_gap_mean': 0.0,
+            'untrained_groups': 4,
+            'error': 'ignored',
+        },
+    }
+
+    flat = flatten_for_swanlab(payload)
+    assert flat['global/wall_time_s'] == 3.0
+    assert flat['context/lora/policy_version'] == 2
+    assert flat['context/lora/reward_mean'] == 0.7
+    assert flat['staleness/policy_version_gap_mean'] == 0.0
+    assert flat['backlog/untrained_groups'] == 4
+    assert 'context/lora/error' not in flat
     metadata['adapter_name'] = 'other'
     with pytest.raises(ValueError, match='adapter_name'):
         context.validate_metadata(metadata)

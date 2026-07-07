@@ -12,6 +12,7 @@ from typing import Any, Callable, Deque, Iterable
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .data_plane import TransferQueueDataPlane
+from .metrics import AsyncRLMetricsRecorder, NoopMetricsRecorder, prefixed_summary
 from .registry import LoraRuntimeRegistry
 from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
 from .staleness import StalenessManager
@@ -236,6 +237,23 @@ def _batch_group_ids(batch: Any) -> list[str]:
     return group_ids
 
 
+def _metrics_from_result(result: Any) -> dict[str, Any]:
+    if isinstance(result, TrainerStepResult):
+        return dict(result.metrics or {})
+    if isinstance(result, dict):
+        return dict(result.get('metrics') or {})
+    return {}
+
+
+def _batch_policy_gap_metrics(batch: Any, *, current_policy_version: int) -> dict[str, float]:
+    gaps = []
+    for tag in getattr(batch, 'tags', None) or []:
+        rollout_policy_version = tag.get('rollout_policy_version')
+        if rollout_policy_version is not None:
+            gaps.append(float(current_policy_version - int(rollout_policy_version)))
+    return prefixed_summary('policy_version_gap', gaps)
+
+
 class AsyncRollouter:
     """Schedule prompt groups, run rollout, and append results to train partitions."""
 
@@ -252,6 +270,7 @@ class AsyncRollouter:
         max_concurrency: int = 16,
         target_groups_per_partition: int = 1,
         target_groups_by_context: dict[str, int] | None = None,
+        metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
         self.data_plane = data_plane
         self.lora_runtime_registry = lora_runtime_registry
@@ -263,6 +282,7 @@ class AsyncRollouter:
         self.max_concurrency = max_concurrency
         self.target_groups_per_partition = target_groups_per_partition
         self.target_groups_by_context = dict(target_groups_by_context or {})
+        self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
         self.pending_prompt_groups_by_context: dict[str, Deque[tuple[LoraContext, Trajectory]]] = defaultdict(deque)
         self.active_tasks: set[asyncio.Task] = set()
         self._last_rollout_submit_time: dict[str, float] = defaultdict(float)
@@ -369,6 +389,18 @@ class AsyncRollouter:
         trajectory = prompt_group
         self.data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.RUNNING)
         self.lora_runtime_registry.on_rollout_started(context)
+        start = time.perf_counter()
+        self.metrics_recorder.log_event(
+            event='rollout_started',
+            phase='rollout',
+            context=context,
+            partition_id=group_ref.partition_id,
+            policy_version=group.rollout_policy_version,
+            metrics={
+                'group_id': group_ref.group_id,
+                'inflight_rollout_groups': self.lora_runtime_registry.get(context).in_flight_groups,
+            },
+        )
         try:
             rollout_kwargs = {
                 'tool_manager': tool_manager,
@@ -389,6 +421,19 @@ class AsyncRollouter:
                     PromptGroupStatus.DROPPED,
                     extra_tag={'drop_reason': 'stale_after_rollout'},
                 )
+                self.metrics_recorder.log_event(
+                    event='stale_dropped',
+                    phase='rollout',
+                    context=context,
+                    partition_id=group_ref.partition_id,
+                    policy_version=current_policy_version,
+                    metrics={
+                        'group_id': group_ref.group_id,
+                        'rollout_policy_version': group.rollout_policy_version,
+                        'policy_version_gap': current_policy_version - group.rollout_policy_version,
+                        'rollout_latency_s': time.perf_counter() - start,
+                    },
+                )
                 return self.data_plane.list_partitions(
                     context, statuses=[PartitionStatus.ACTIVE, PartitionStatus.CLOSED])[0]
             meta, sample_keys = self.write_rollout_samples(group_ref, rollout_rows, rewards=rewards)
@@ -399,12 +444,38 @@ class AsyncRollouter:
             )
             self._last_rollout_submit_time[context.key] = time.time()
             self._submitted_prompt_groups[context.key] += 1
+            self.metrics_recorder.log_event(
+                event='rollout_done',
+                phase='rollout',
+                context=context,
+                partition_id=group_ref.partition_id,
+                policy_version=current_policy_version,
+                metrics={
+                    'group_id': group_ref.group_id,
+                    'sample_count': len(sample_keys),
+                    'rollout_latency_s': time.perf_counter() - start,
+                    'rollout_policy_version': group.rollout_policy_version,
+                    'policy_version_gap': current_policy_version - group.rollout_policy_version,
+                },
+            )
             return meta
         except Exception as exc:
             self.data_plane.update_prompt_group_status(
                 group_ref,
                 PromptGroupStatus.FAILED,
                 extra_tag={'error': str(exc)},
+            )
+            self.metrics_recorder.log_event(
+                event='rollout_failed',
+                phase='rollout',
+                context=context,
+                partition_id=group_ref.partition_id,
+                policy_version=group.rollout_policy_version,
+                metrics={
+                    'group_id': group_ref.group_id,
+                    'rollout_latency_s': time.perf_counter() - start,
+                    'error': str(exc),
+                },
             )
             raise
         finally:
@@ -500,6 +571,20 @@ class AsyncRollouter:
             self.active_tasks.add(task)
             self.close_partition_if_full(partition)
             submitted_groups += 1
+            self.metrics_recorder.log_event(
+                event='rollout_submitted',
+                phase='rollout',
+                context=context,
+                partition_id=partition.partition_id,
+                policy_version=runtime_state.policy_version,
+                metrics={
+                    'submitted_groups': submitted_groups,
+                    'active_tasks': len(self.active_tasks),
+                    'pending_prompt_groups': self.pending_prompt_group_count(context),
+                    'rollout_capacity': self.free_group_slots(partition),
+                    'max_concurrency': self.max_concurrency,
+                },
+            )
         return submitted_groups
 
     async def collect_finished_tasks(self) -> int:
@@ -565,12 +650,14 @@ class AdvantageWorker:
         batch_size: int = 1024,
         batch_size_by_context: dict[str, int] | None = None,
         advantage_fn: Callable[[GRPOAdvantageBatch, LoraContext], tuple[list[float], list[float]]] | None = None,
+        metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
         self.data_plane = data_plane
         self.contexts = list(contexts or [])
         self.batch_size = batch_size
         self.batch_size_by_context = dict(batch_size_by_context or {})
         self.advantage_fn = advantage_fn or self._default_advantage_fn
+        self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
 
     @staticmethod
     def _default_advantage_fn(batch: GRPOAdvantageBatch, context: LoraContext) -> tuple[list[float], list[float]]:
@@ -585,6 +672,7 @@ class AdvantageWorker:
         batch_size = self.batch_size_for_context(context) if batch_size is None else batch_size
         groups = self._select_ready_groups(context, max_groups=batch_size)
         partition_id = groups[0].partition_id
+        start = time.perf_counter()
         batch = self.data_plane.claim_prompt_group_samples(
             context=context,
             partition_id=partition_id,
@@ -592,6 +680,16 @@ class AdvantageWorker:
             claim_status=PromptGroupStatus.ADVANTAGING,
             max_groups=len(groups),
             fields=['rewards'],
+        )
+        self.metrics_recorder.log_event(
+            event='advantage_started',
+            phase='advantage',
+            context=context,
+            partition_id=partition_id,
+            metrics={
+                'group_count': len(groups),
+                'sample_count': len(batch.keys),
+            },
         )
         try:
             columns = self.data_plane.read_batch_fields(batch, fields=['rewards'])
@@ -616,8 +714,31 @@ class AdvantageWorker:
                 ),
             )
             self.data_plane.mark_batch_groups(batch, PromptGroupStatus.ADVANTAGE_DONE)
+            self.metrics_recorder.log_event(
+                event='advantage_done',
+                phase='advantage',
+                context=context,
+                partition_id=partition_id,
+                metrics={
+                    'group_count': len(groups),
+                    'sample_count': sample_count,
+                    'advantage_latency_s': time.perf_counter() - start,
+                },
+            )
         except Exception as exc:
             self.data_plane.mark_batch_groups(batch, PromptGroupStatus.FAILED, extra_tag={'error': str(exc)})
+            self.metrics_recorder.log_event(
+                event='advantage_failed',
+                phase='advantage',
+                context=context,
+                partition_id=partition_id,
+                metrics={
+                    'group_count': len(groups),
+                    'sample_count': len(batch.keys),
+                    'advantage_latency_s': time.perf_counter() - start,
+                    'error': str(exc),
+                },
+            )
             raise
         return self.data_plane.list_partitions(context, statuses=[PartitionStatus.CLOSED, PartitionStatus.ACTIVE])[0]
 
@@ -699,6 +820,7 @@ class TrainerWorker:
         receive_weights_fn: Callable[[Any], None] | None = None,
         train_batch_groups: int = 1,
         train_batch_groups_by_context: dict[str, int] | None = None,
+        metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
         self.data_plane = data_plane
         self.lora_runtime_registry = lora_runtime_registry
@@ -708,6 +830,7 @@ class TrainerWorker:
         self.receive_weights_fn = receive_weights_fn
         self.train_batch_groups = train_batch_groups
         self.train_batch_groups_by_context = dict(train_batch_groups_by_context or {})
+        self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
         self.current_context: LoraContext | None = None
 
     def step(self) -> ComponentResult | None:
@@ -723,6 +846,7 @@ class TrainerWorker:
         self.lora_runtime_registry.on_train_started(context, partition.partition_id)
         batch = None
         try:
+            start = time.perf_counter()
             groups = self.select_train_groups(
                 context,
                 partition.partition_id,
@@ -736,9 +860,38 @@ class TrainerWorker:
                 max_groups=len(groups),
                 fields=['input_ids', 'labels', 'logprobs', 'advantages'],
             )
+            current_policy_version = self.lora_runtime_registry.get(context).policy_version
+            gap_metrics = _batch_policy_gap_metrics(batch, current_policy_version=current_policy_version)
+            self.metrics_recorder.log_event(
+                event='train_claimed',
+                phase='train',
+                context=context,
+                partition_id=partition.partition_id,
+                policy_version=current_policy_version,
+                metrics={
+                    'group_count': len(groups),
+                    'sample_count': len(batch.keys),
+                    **gap_metrics,
+                },
+            )
             result = self.train_batch_fn(context, batch)
             self.data_plane.mark_batch_groups(batch, PromptGroupStatus.TRAIN_DONE)
             group_count = len(_batch_group_ids(batch))
+            train_metrics = _metrics_from_result(result)
+            self.metrics_recorder.log_event(
+                event='train_batch_done',
+                phase='train',
+                context=context,
+                partition_id=partition.partition_id,
+                policy_version=current_policy_version,
+                metrics={
+                    'group_count': group_count,
+                    'sample_count': len(batch.keys),
+                    'train_batch_latency_s': time.perf_counter() - start,
+                    **gap_metrics,
+                    **train_metrics,
+                },
+            )
             batch = None
             if not self.partition_training_complete(context, partition.partition_id):
                 self.lora_runtime_registry.on_train_finished(context, partition.partition_id)
@@ -757,8 +910,30 @@ class TrainerWorker:
             runtime_state = self.lora_runtime_registry.on_weight_sync_finished(context, adapter_path=adapter_path)
             if self.receive_weights_fn is not None:
                 self.receive_weights_fn(runtime_state)
+            self.metrics_recorder.log_event(
+                event='weight_sync_done',
+                phase='train',
+                context=context,
+                partition_id=partition.partition_id,
+                policy_version=runtime_state.policy_version,
+                metrics={
+                    'group_count': group_count,
+                    'adapter_path': adapter_path,
+                },
+            )
             self.data_plane.clear_partition(context, partition.partition_id)
             self.lora_runtime_registry.on_partition_cleared(context, partition.partition_id)
+            self.metrics_recorder.log_event(
+                event='partition_train_done',
+                phase='train',
+                context=context,
+                partition_id=partition.partition_id,
+                policy_version=runtime_state.policy_version,
+                metrics={
+                    'group_count': group_count,
+                    'partition_train_latency_s': time.perf_counter() - start,
+                },
+            )
             return ComponentResult(
                 component='trainer_worker',
                 kind='train',
@@ -768,6 +943,16 @@ class TrainerWorker:
         except Exception as exc:
             if batch is not None:
                 self.data_plane.mark_batch_groups(batch, PromptGroupStatus.FAILED, extra_tag={'error': str(exc)})
+                self.metrics_recorder.log_event(
+                    event='train_failed',
+                    phase='train',
+                    context=context,
+                    partition_id=partition.partition_id,
+                    metrics={
+                        'sample_count': len(batch.keys),
+                        'error': str(exc),
+                    },
+                )
             self.lora_runtime_registry.on_train_finished(context, partition.partition_id)
             self.lora_runtime_registry.mark_failed(context, str(exc))
             raise
@@ -863,6 +1048,7 @@ class MultiLoraGRPOTrainerWorker(TrainerWorker):
         receive_weights_fn: Callable[[Any], None] | None = None,
         train_batch_groups: int = 1,
         train_batch_groups_by_context: dict[str, int] | None = None,
+        metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
         self.model = model
         self.train_config = train_config or MultiLoraGRPOTrainConfig()
@@ -875,6 +1061,7 @@ class MultiLoraGRPOTrainerWorker(TrainerWorker):
             receive_weights_fn=receive_weights_fn,
             train_batch_groups=train_batch_groups,
             train_batch_groups_by_context=train_batch_groups_by_context,
+            metrics_recorder=metrics_recorder,
         )
 
     def train_batch(self, context: LoraContext, tq_batch: Any) -> TrainerStepResult:

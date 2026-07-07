@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from functools import partial
 from typing import Any
 
 from twinkle import get_logger
 from twinkle.data_format import Trajectory
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
+from .metrics import AsyncRLMetricsConfig
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_loader import PromptLoader
+from .scheduling import (PreferCurrentTrainPolicy, WeightedFairRolloutPolicy, WeightedFairTrainPolicy,
+                         WorkConservingRolloutPolicy)
 from .types import GRPOAdvantageBatch, LoraContext, RolloutOutput
 from .workers import TrainerStepResult, read_train_batch
 
@@ -84,12 +88,16 @@ def lora_model_config(cfg, context_cfg):
     return OmegaConf.merge(cfg.model, context_model_cfg)
 
 
-def lora_model_config_for_context(cfg, context: LoraContext):
+def lora_context_config_for_context(cfg, context: LoraContext):
     for context_cfg in lora_context_configs(cfg):
         if (context_cfg.tenant_id == context.tenant_id and context_cfg.training_run_id == context.training_run_id
                 and context_cfg.adapter_name == context.adapter_name):
-            return lora_model_config(cfg, context_cfg)
+            return context_cfg
     raise KeyError(f'cannot find lora context config for {context.key}')
+
+
+def lora_model_config_for_context(cfg, context: LoraContext):
+    return lora_model_config(cfg, lora_context_config_for_context(cfg, context))
 
 
 def lora_rollout_config(cfg, context_cfg):
@@ -124,6 +132,33 @@ def mini_batch_size_by_context(cfg, contexts: list[LoraContext]) -> dict[str, in
         if mini_batch_size is not None:
             result[context.key] = mini_batch_size
     return result
+
+
+def async_rl_metrics_config(cfg) -> AsyncRLMetricsConfig | None:
+    experiment_cfg = cfg.get('experiment') or {}
+    metrics_cfg = experiment_cfg.get('metrics') or {}
+    if metrics_cfg.get('enabled') is False:
+        return None
+    metadata = {
+        'model_id': cfg.model.get('model_id', None),
+        'max_steps': int(cfg.pipeline.max_steps),
+        'max_staleness': int(cfg.pipeline.max_staleness),
+        'default_rollout_batch_size': int(cfg.pipeline.default_rollout_batch_size),
+        'default_mini_batch_size': int(cfg.pipeline.default_mini_batch_size),
+        'rollout_policy': str(cfg.pipeline.get('rollout_policy', 'work_conserving')),
+        'train_policy': str(cfg.pipeline.get('train_policy', 'prefer_current')),
+        'num_loras': len(lora_context_configs(cfg)),
+    }
+    return AsyncRLMetricsConfig(
+        run_id=str(experiment_cfg.get('run_id') or f'async_rl_{int(time.time())}'),
+        mode=str(experiment_cfg.get('mode') or 'async'),
+        seed=experiment_cfg.get('seed'),
+        output_dir=str(metrics_cfg.get('output_dir', 'outputs/async_rl_experiments')),
+        enable_jsonl=bool(metrics_cfg.get('enable_jsonl', True)),
+        enable_swanlab=bool(metrics_cfg.get('enable_swanlab', False)),
+        swanlab_project=str(metrics_cfg.get('swanlab_project', 'twinkle')),
+        metadata=metadata,
+    )
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -370,6 +405,7 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         save_optimizer=bool(cfg.pipeline.save_optimizer),
         max_grad_norm=float(cfg.pipeline.max_grad_norm),
         norm_type=int(cfg.pipeline.norm_type),
+        metrics=async_rl_metrics_config(cfg),
     )
 
 
@@ -641,6 +677,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                     dataloader=dataloader,
                     rollouter=self.rollouter,
                     max_pending_groups=max_pending_groups,
+                    metrics_recorder=self.metrics_recorder,
                 ))
         return loaders
 
@@ -664,6 +701,22 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
     def build_advantage_fn(self):
         return grpo_advantage_fn
 
+    def build_rollout_policy(self):
+        policy = str(self.cfg.pipeline.get('rollout_policy', 'work_conserving'))
+        if policy == 'work_conserving':
+            return WorkConservingRolloutPolicy()
+        if policy == 'weighted_fair':
+            return WeightedFairRolloutPolicy()
+        raise ValueError(f'unsupported rollout_policy: {policy!r}')
+
+    def build_train_policy(self):
+        policy = str(self.cfg.pipeline.get('train_policy', 'prefer_current'))
+        if policy == 'prefer_current':
+            return PreferCurrentTrainPolicy()
+        if policy == 'weighted_fair':
+            return WeightedFairTrainPolicy()
+        raise ValueError(f'unsupported train_policy: {policy!r}')
+
     def build_train_batch_fn(self):
         return self.train_batch
 
@@ -673,7 +726,9 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
     def train_batch(self, context, batch) -> TrainerStepResult:
         partition_id = batch.partition_id
         train_batch = read_train_batch(self.data_plane, batch)
-        mini_batch_groups = int(self.cfg.pipeline.default_mini_batch_size)
+        context_cfg = lora_context_config_for_context(self.cfg, context)
+        mini_batch_groups = mini_batch_size_for_context(self.cfg, context_cfg) or int(
+            self.cfg.pipeline.default_mini_batch_size)
         num_generations = int(self.cfg.pipeline.rollout.num_generations)
         mini_batch_size = mini_batch_groups * num_generations
         context_model_cfg = lora_model_config_for_context(self.cfg, context)

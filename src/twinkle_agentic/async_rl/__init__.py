@@ -3,6 +3,8 @@
 
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .grpo_pipeline import AsyncMultiLoraGRPOPipeline
+from .metrics import (AsyncRLMetricsConfig, AsyncRLMetricsRecorder, CompositeMetricsRecorder, JSONLMetricsRecorder,
+                      NoopMetricsRecorder, SwanLabMetricsRecorder)
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_loader import PromptLoader
 from .registry import LoraRuntimeRegistry
@@ -22,6 +24,8 @@ __all__ = [
     'AdvantageWorker',
     'AsyncRollouter',
     'AsyncMultiLoraGRPOPipeline',
+    'AsyncRLMetricsConfig',
+    'AsyncRLMetricsRecorder',
     'BaseRLPipeline',
     'BaseRLPipelineConfig',
     'ComponentResult',
@@ -30,6 +34,10 @@ __all__ = [
     'PromptGroupMeta',
     'PromptGroupStatus',
     'GRPOAdvantageBatch',
+    'CompositeMetricsRecorder',
+    'JSONLMetricsRecorder',
+    'NoopMetricsRecorder',
+    'SwanLabMetricsRecorder',
     'TransformersTrainBatch',
     'MultiLoraGRPOTrainConfig',
     'MultiLoraGRPOTrainerWorker',

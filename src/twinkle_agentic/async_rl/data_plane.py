@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from transfer_queue import KVBatchMeta
 from typing import Any, Iterable
 
+from transfer_queue import KVBatchMeta
+
+from .metrics import AsyncRLMetricsRecorder, NoopMetricsRecorder
 from .types import (LoraContext, LoraRuntimeState, PartitionMeta, PartitionStatus, PromptGroupMeta, PromptGroupRef,
                     PromptGroupStatus)
 
@@ -28,9 +31,15 @@ class TransferQueueRuntimeConfig:
 class TransferQueueDataPlane:
     """The only data-plane boundary for async RL TransferQueue access."""
 
-    def __init__(self, tq_client: Any | None = None, tq_config: TransferQueueRuntimeConfig | None = None):
+    def __init__(
+        self,
+        tq_client: Any | None = None,
+        tq_config: TransferQueueRuntimeConfig | None = None,
+        metrics_recorder: AsyncRLMetricsRecorder | None = None,
+    ):
         self.tq_config = tq_config or TransferQueueRuntimeConfig()
         self.tq = tq_client or self._init_transfer_queue(self.tq_config)
+        self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
         self._partitions: dict[str, PartitionMeta] = {}
         self._prompt_groups: dict[str, dict[str, PromptGroupMeta]] = defaultdict(dict)
         self._next_train_id: dict[str, int] = defaultdict(int)
@@ -180,11 +189,18 @@ class TransferQueueDataPlane:
     ) -> None:
         if not keys:
             return
+        start = time.perf_counter()
         self.tq.kv_batch_put(
             keys=keys,
             partition_id=partition_id,
             fields=fields,
             tags=tags,
+        )
+        self._record_tq_event(
+            'kv_batch_put',
+            start,
+            partition_id=partition_id,
+            metrics={'write_samples': len(keys)},
         )
 
     def list_partitions(
@@ -204,10 +220,25 @@ class TransferQueueDataPlane:
             return sorted(partitions, key=lambda p: (p.created_at, p.partition_id))
 
     def read_batch_fields(self, batch: Any, fields: list[str] | str | None = None) -> Any:
-        return self.tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        start = time.perf_counter()
+        result = self.tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        self._record_tq_event(
+            'kv_batch_get',
+            start,
+            partition_id=batch.partition_id,
+            metrics={'read_samples': len(batch.keys)},
+        )
+        return result
 
     def write_batch_fields(self, batch: Any, fields: Any) -> None:
+        start = time.perf_counter()
         self.tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=fields)
+        self._record_tq_event(
+            'kv_batch_put',
+            start,
+            partition_id=batch.partition_id,
+            metrics={'write_samples': len(batch.keys)},
+        )
 
     def claim_prompt_group_samples(
         self,
@@ -223,7 +254,15 @@ class TransferQueueDataPlane:
             raise ValueError(f'max_groups must be positive, got {max_groups}')
         with self._lock:
             self._load_metadata()
+            start = time.perf_counter()
             tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
+            self._record_tq_event(
+                'kv_list',
+                start,
+                context=context,
+                partition_id=partition_id,
+                metrics={'keys': len(tags_by_key)},
+            )
             groups = [
                 group for group in self._prompt_groups.get(partition_id, {}).values()
                 if group.context.key == context.key and group.status == ready_status
@@ -302,9 +341,25 @@ class TransferQueueDataPlane:
             partition = self._partitions.get(partition_id)
             if partition is not None and partition.context.key != context.key:
                 raise ValueError(f'partition {partition_id} belongs to {partition.context.key}, not {context.key}')
+            start = time.perf_counter()
             keys = list(self.tq.kv_list(partition_id=partition_id).get(partition_id, {}))
+            self._record_tq_event(
+                'kv_list',
+                start,
+                context=context,
+                partition_id=partition_id,
+                metrics={'keys': len(keys)},
+            )
             if keys:
+                start = time.perf_counter()
                 self.tq.kv_clear(keys=keys, partition_id=partition_id)
+                self._record_tq_event(
+                    'kv_clear',
+                    start,
+                    context=context,
+                    partition_id=partition_id,
+                    metrics={'cleared_keys': len(keys)},
+                )
             if partition is not None:
                 partition.status = PartitionStatus.CLEARED
                 partition.touch()
@@ -333,15 +388,27 @@ class TransferQueueDataPlane:
     def _put_partition_tag(self, partition: PartitionMeta) -> None:
         tag = dict(partition.tag())
         tag['record_type'] = 'partition'
+        start = time.perf_counter()
         self.tq.kv_put(key=PARTITION_KEY, partition_id=partition.partition_id, tag=tag)
+        self._record_tq_event('kv_put', start, context=partition.context, partition_id=partition.partition_id)
 
     def _put_group_tag(self, group: PromptGroupMeta, *, extra_tag: dict[str, Any] | None = None) -> None:
+        start = time.perf_counter()
         tag = dict(self.tq.kv_list(partition_id=group.partition_id).get(group.partition_id, {}).get(group.key) or {})
+        self._record_tq_event(
+            'kv_list',
+            start,
+            context=group.context,
+            partition_id=group.partition_id,
+            metrics={'keys': 1 if tag else 0},
+        )
         tag.update(group.tag())
         if extra_tag:
             tag.update(extra_tag)
         self._prompt_groups[group.partition_id][group.group_id] = group
+        start = time.perf_counter()
         self.tq.kv_put(key=group.key, partition_id=group.partition_id, tag=tag)
+        self._record_tq_event('kv_put', start, context=group.context, partition_id=group.partition_id)
 
     def _next_group_id(self, partition: PartitionMeta) -> str:
         with self._lock:
@@ -353,7 +420,10 @@ class TransferQueueDataPlane:
             return f'group_{index}'
 
     def _load_metadata(self) -> None:
-        for partition_id, tags_by_key in self.tq.kv_list().items():
+        start = time.perf_counter()
+        all_tags = self.tq.kv_list()
+        self._record_tq_event('kv_list', start, metrics={'partitions': len(all_tags)})
+        for partition_id, tags_by_key in all_tags.items():
             partition_tag = tags_by_key.get(PARTITION_KEY)
             partition = self._partition_from_tag(partition_id, partition_tag or {})
             if partition is not None:
@@ -414,3 +484,23 @@ class TransferQueueDataPlane:
             )
         except (KeyError, ValueError):
             return None
+
+    def _record_tq_event(
+        self,
+        op: str,
+        start: float,
+        *,
+        context: LoraContext | None = None,
+        partition_id: str | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {f'{op}_latency_ms': (time.perf_counter() - start) * 1000.0}
+        if metrics:
+            payload.update(metrics)
+        self.metrics_recorder.log_event(
+            event=op,
+            phase='tq',
+            context=context,
+            partition_id=partition_id,
+            metrics=payload,
+        )
