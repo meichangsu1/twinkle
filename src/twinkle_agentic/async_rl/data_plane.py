@@ -84,6 +84,14 @@ class TransferQueueDataPlane:
             self._next_train_id[context.key] = train_id + 1
             return context.partition_id(train_id)
 
+    def peek_next_train_id(self, context: LoraContext) -> int:
+        with self._lock:
+            self._load_metadata()
+            train_id = self._next_train_id[context.key]
+            while context.partition_id(train_id) in self._partitions:
+                train_id += 1
+            return train_id
+
     def create_rollout_partition(
         self,
         context: LoraContext,

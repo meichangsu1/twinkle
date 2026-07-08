@@ -60,6 +60,16 @@ TRAIN_LOSS_FIELDS = ('logprobs', 'advantages', 'rewards')
 REQUIRED_TRAIN_LOSS_FIELDS = ('logprobs', 'advantages')
 REWARD_FIELD = 'rewards'
 ROLLOUT_TRAIN_FIELDS = (*TRANSFORMERS_INPUT_FIELDS, 'logprobs', 'rewards', 'advantages', 'returns')
+TERMINAL_PROMPT_GROUP_STATUSES = {
+    PromptGroupStatus.TRAIN_DONE,
+    PromptGroupStatus.FAILED,
+    PromptGroupStatus.DROPPED,
+}
+TERMINAL_PARTITION_STATUSES = {
+    PartitionStatus.TRAIN_DONE,
+    PartitionStatus.CLEARED,
+    PartitionStatus.FAILED,
+}
 
 
 def rows_to_tq_fields(rows: list[dict[str, Any]]):
@@ -253,6 +263,16 @@ def _batch_policy_gap_metrics(batch: Any, *, current_policy_version: int) -> dic
     return prefixed_summary('policy_version_gap', gaps)
 
 
+def _partition_train_id(partition_id: str) -> int:
+    suffix = partition_id.rsplit('/', 1)[-1]
+    if not suffix.startswith('train_'):
+        raise ValueError(f'partition id must end with train_<id>, got {partition_id!r}')
+    try:
+        return int(suffix[len('train_'):])
+    except ValueError as exc:
+        raise ValueError(f'partition id must end with numeric train id, got {partition_id!r}') from exc
+
+
 class AsyncRollouter:
     """Schedule prompt groups, run rollout, and append results to train partitions."""
 
@@ -362,6 +382,15 @@ class AsyncRollouter:
 
     def can_create_next_rollout_partition(self, context: LoraContext, current_policy_version: int) -> bool:
         groups = self.data_plane.list_prompt_groups(context)
+        partitions = self.data_plane.list_partitions(context)
+        live_partitions = [partition for partition in partitions if partition.status not in TERMINAL_PARTITION_STATUSES]
+        if live_partitions:
+            oldest_train_id = min(_partition_train_id(partition.partition_id) for partition in live_partitions)
+            next_train_id = self.data_plane.peek_next_train_id(context)
+            if next_train_id - oldest_train_id > self.staleness_manager.max_staleness:
+                return False
+        if self.staleness_manager.max_staleness == 0:
+            return not any(group.status not in TERMINAL_PROMPT_GROUP_STATUSES for group in groups)
         running_statuses = {PromptGroupStatus.PENDING, PromptGroupStatus.RUNNING}
         if any(group.status in running_statuses for group in groups):
             return False

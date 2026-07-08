@@ -733,12 +733,12 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             dataloader_kwargs = {}
             if self.cfg.runtime.mode == 'ray':
                 dataloader_kwargs['remote_group'] = 'model'
+                dataloader_kwargs['instance_id'] = f'{os.getpid()}-{safe_context_key}-'
             dataloader = DataLoader(
                 dataset=dataset_factory,
                 batch_size=prompt_batch_size,
                 min_batch_size=prompt_batch_size,
                 device_mesh=self.model_mesh,
-                instance_id=f'{os.getpid()}-{safe_context_key}-',
                 **dataloader_kwargs,
             )
             loaders.append(

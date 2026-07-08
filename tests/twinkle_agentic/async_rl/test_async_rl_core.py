@@ -390,6 +390,80 @@ def test_staleness_blocks_next_partition_by_live_group_version():
     )
 
 
+def test_strict_rollouter_blocks_new_partition_until_live_groups_finish():
+    context = make_context('a')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=0),
+        rollout=lambda trajectories, **_: trajectories,
+    )
+    partition = data_plane.create_rollout_partition(context, target_groups=1)
+    group_ref = data_plane.create_prompt_group(context, partition, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.ADVANTAGE_DONE)
+
+    assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
+
+    data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.TRAIN_DONE)
+    data_plane.update_partition_status(partition.partition_id, PartitionStatus.TRAIN_DONE)
+
+    assert rollouter.can_create_next_rollout_partition(context, current_policy_version=1)
+
+
+def test_relaxed_rollouter_limits_created_partitions_by_staleness_window():
+    context = make_context('a')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=1),
+        rollout=lambda trajectories, **_: trajectories,
+    )
+    p0 = data_plane.create_rollout_partition(context, target_groups=1)
+    g0 = data_plane.create_prompt_group(context, p0, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(g0, PromptGroupStatus.ADVANTAGE_DONE)
+    p1 = data_plane.create_rollout_partition(context, target_groups=1)
+    g1 = data_plane.create_prompt_group(context, p1, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(g1, PromptGroupStatus.ADVANTAGE_DONE)
+
+    assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
+
+    data_plane.update_prompt_group_status(g0, PromptGroupStatus.TRAIN_DONE)
+    data_plane.update_partition_status(p0.partition_id, PartitionStatus.TRAIN_DONE)
+
+    assert rollouter.can_create_next_rollout_partition(context, current_policy_version=1)
+
+
+def test_relaxed_rollouter_uses_partition_step_span_not_live_count():
+    context = make_context('a')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=2),
+        rollout=lambda trajectories, **_: trajectories,
+    )
+    p0 = data_plane.create_rollout_partition(context, target_groups=1)
+    g0 = data_plane.create_prompt_group(context, p0, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(g0, PromptGroupStatus.ADVANTAGE_DONE)
+    p1 = data_plane.create_rollout_partition(context, target_groups=1)
+    g1 = data_plane.create_prompt_group(context, p1, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(g1, PromptGroupStatus.TRAIN_DONE)
+    data_plane.update_partition_status(p1.partition_id, PartitionStatus.TRAIN_DONE)
+    p2 = data_plane.create_rollout_partition(context, target_groups=1)
+    g2 = data_plane.create_prompt_group(context, p2, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(g2, PromptGroupStatus.ADVANTAGE_DONE)
+
+    assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
+
+
 def test_data_plane_prompt_group_records_are_partition_scoped():
     context = make_context('a')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
