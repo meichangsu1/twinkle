@@ -131,7 +131,9 @@ def _train_points(run: dict[str, Any], metric_key: str) -> tuple[list[float], li
         if value is None:
             continue
         step += 1
-        logged_step = _metric(event, 'step')
+        logged_step = _metric(event, 'optimizer_step')
+        if logged_step is None:
+            logged_step = _metric(event, 'step')
         if logged_step is None:
             logged_step = _metric(event, 'train_step')
         wall_time.append(float(event.get('elapsed_s') or 0.0))

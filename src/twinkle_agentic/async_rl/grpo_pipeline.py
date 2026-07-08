@@ -842,6 +842,15 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 ))
             last_metrics.update(_short_math_reward_metrics(sample_tags, total_rewards=rewards))
             last_metrics.update(batch_diagnostics)
+            optimizer_step = last_metrics.get('iters')
+            if optimizer_step is not None:
+                last_metrics['optimizer_step'] = optimizer_step
+                last_metrics['step'] = optimizer_step
+            last_metrics.update({
+                'sample_count': len(inputs),
+                'prompt_count': len(inputs) / num_generations,
+                'num_generations': num_generations,
+            })
             logger.info(
                 'async_multi_lora_grpo train metrics: context=%s partition=%s mini_batch=%s/%s metrics=%s',
                 context.key,

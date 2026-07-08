@@ -104,15 +104,16 @@ class JSONLMetricsWriter:
             },
         )
 
-    def write_train_metrics(self, *, step: int, metrics: dict[str, Any]) -> None:
+    def write_train_metrics(self, *, optimizer_step: int, metrics: dict[str, Any]) -> None:
         event_metrics = dict(metrics)
-        event_metrics['step'] = step
+        event_metrics['optimizer_step'] = optimizer_step
+        event_metrics['step'] = optimizer_step
         event_metrics['max_steps'] = MAX_STEPS
         self.write_event(
             event='train_batch_done',
             phase='train',
             elapsed_s=_elapsed_s(event_metrics, fallback=time.time() - self.start_time),
-            policy_version=step,
+            policy_version=optimizer_step,
             metrics=event_metrics,
         )
 
@@ -265,6 +266,25 @@ def compute_rewards(
     return total_rewards, brevity_rewards, accuracy_rewards
 
 
+def reward_metrics_for_slice(
+    *,
+    completion_lengths: List[int],
+    total_rewards: List[float],
+    brevity_rewards: List[float],
+    accuracy_rewards: List[float],
+) -> dict[str, Any]:
+    metric = CompletionRewardMetric()
+    metric.accumulate(
+        completion_lengths=completion_lengths,
+        rewards={
+            'total': total_rewards,
+            'brevity': brevity_rewards,
+            'accuracy': accuracy_rewards,
+        },
+    )
+    return metric.calculate()
+
+
 # ========== Main ==========
 def main():
     metrics_writer = JSONLMetricsWriter(METRICS_JSONL, run_id=RUN_ID, mode=MODE)
@@ -351,7 +371,6 @@ def _main(metrics_writer: JSONLMetricsWriter):
     )
 
     advantage_fn = GRPOAdvantage()
-    metrics = CompletionRewardMetric()
     sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1, temperature=1.0, top_p=0.95)
 
     optim_step = 0
@@ -362,7 +381,6 @@ def _main(metrics_writer: JSONLMetricsWriter):
         if optim_step >= MAX_STEPS:
             break
 
-        metrics.reset()
         expand_prompts = []
         for prompt in batch:
             expand_prompts.extend([prompt] * NUM_GENERATIONS)
@@ -387,15 +405,6 @@ def _main(metrics_writer: JSONLMetricsWriter):
 
         total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(all_input_data)
 
-        metrics.accumulate(
-            completion_lengths=all_completion_lengths,
-            rewards={
-                'total': total_rewards,
-                'brevity': brevity_rewards,
-                'accuracy': accuracy_rewards,
-            },
-        )
-
         advantages = advantage_fn(total_rewards, num_generations=NUM_GENERATIONS, scale='group').tolist()
 
         total_completions = len(all_input_data)
@@ -404,6 +413,10 @@ def _main(metrics_writer: JSONLMetricsWriter):
             mb_inputs = all_input_data[mb_start:mb_end]
             mb_old_logps = all_old_logps[mb_start:mb_end]
             mb_advantages = advantages[mb_start:mb_end]
+            mb_completion_lengths = all_completion_lengths[mb_start:mb_end]
+            mb_total_rewards = total_rewards[mb_start:mb_end]
+            mb_brevity_rewards = brevity_rewards[mb_start:mb_end]
+            mb_accuracy_rewards = accuracy_rewards[mb_start:mb_end]
 
             model.forward_backward(
                 inputs=mb_inputs,
@@ -414,21 +427,28 @@ def _main(metrics_writer: JSONLMetricsWriter):
             model.clip_grad_and_step()
             optim_step += 1
 
+            log_dict = reward_metrics_for_slice(
+                completion_lengths=mb_completion_lengths,
+                total_rewards=mb_total_rewards,
+                brevity_rewards=mb_brevity_rewards,
+                accuracy_rewards=mb_accuracy_rewards,
+            )
+            log_dict.update(model.calculate_metric(is_training=True))
+            log_dict.update({
+                'optimizer_step': optim_step,
+                'sample_count': len(mb_inputs),
+                'prompt_count': len(mb_inputs) / NUM_GENERATIONS,
+                'outer_prompt_count': len(batch),
+                'outer_sample_count': total_completions,
+                'num_generations': NUM_GENERATIONS,
+            })
+            logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
+            metrics_writer.write_train_metrics(optimizer_step=optim_step, metrics=log_dict)
+
             if optim_step >= MAX_STEPS:
                 break
             if optim_step % SAVE_STEPS == 0:
                 model.save(f'math-grpo-checkpoint-{optim_step}')
-
-        log_dict = metrics.calculate()
-        log_dict.update(model.calculate_metric(is_training=True))
-        log_dict.update({
-            'sample_count': total_completions,
-            'prompt_count': len(batch),
-            'num_generations': NUM_GENERATIONS,
-        })
-        metrics.reset()
-        logger.info(f'[Step {optim_step}/{MAX_STEPS}] {log_dict}')
-        metrics_writer.write_train_metrics(step=optim_step, metrics=log_dict)
 
     logger.info(f'Training completed. optim_steps={optim_step}')
     metrics_writer.write_completed(optim_step=optim_step)
