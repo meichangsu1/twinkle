@@ -345,7 +345,10 @@ def _short_math_reward_metrics(
     from twinkle.metric import CompletionRewardMetric
 
     metadata_items = [dict(record.get('metadata') or record) for record in records]
-    totals = list(total_rewards) if total_rewards is not None else _record_values(metadata_items, 'total_reward')
+    totals = _numeric_values(total_rewards) if total_rewards is not None else _record_values(
+        metadata_items,
+        'total_reward',
+    )
     brevity = _record_values(metadata_items, 'brevity_reward')
     accuracy = _record_values(metadata_items, 'accuracy_reward')
     completion_lengths = _record_values(metadata_items, 'completion_length')
@@ -367,11 +370,31 @@ def _record_values(records: list[dict[str, Any]], key: str) -> list[float]:
         value = record.get(key)
         if value is None:
             continue
-        try:
-            values.append(float(value))
-        except (TypeError, ValueError):
-            continue
+        number = _to_float(value)
+        if number is not None:
+            values.append(number)
     return values
+
+
+def _numeric_values(values: Any) -> list[float]:
+    result = []
+    for value in values or []:
+        number = _to_float(value)
+        if number is not None:
+            result.append(number)
+    return result
+
+
+def _to_float(value: Any) -> float | None:
+    if hasattr(value, 'item'):
+        try:
+            value = value.item()
+        except Exception:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: dict[str, Any]):

@@ -25,7 +25,11 @@ from twinkle_agentic.async_rl import (
     TransformersTrainBatch,
     WorkConservingRolloutPolicy,
 )
-from twinkle_agentic.async_rl.grpo_pipeline import _async_train_batch_data_diagnostics, lora_model_config
+from twinkle_agentic.async_rl.grpo_pipeline import (
+    _async_train_batch_data_diagnostics,
+    _short_math_reward_metrics,
+    lora_model_config,
+)
 from twinkle_agentic.async_rl.metrics import AsyncRLMetricsConfig, JSONLMetricsRecorder, flatten_for_swanlab
 from twinkle_agentic.async_rl.workers import columns_to_tq_fields, rows_to_tq_fields
 
@@ -472,6 +476,39 @@ def test_data_plane_builds_transformers_train_batch_without_sample_rows():
     assert 'advantages' not in train_batch.inputs[0]
 
 
+def test_data_plane_does_not_feed_scalar_length_to_trainer_inputs():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    partition = data_plane.create_rollout_partition(context, target_groups=1)
+    sample = make_sample(0)
+    sample['length'] = len(sample['input_ids'])
+    complete_prompt_group(data_plane, context, partition, sample)
+
+    adv_batch = data_plane.claim_prompt_group_samples(
+        context=context,
+        partition_id=partition.partition_id,
+        ready_status=PromptGroupStatus.ROLLOUT_DONE,
+        claim_status=PromptGroupStatus.ADVANTAGING,
+        max_groups=1,
+    )
+    data_plane.write_batch_fields(
+        adv_batch,
+        {'advantages': [0.25], 'returns': [1.0]},
+    )
+    data_plane.mark_batch_groups(adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
+    train_batch_meta = data_plane.claim_prompt_group_samples(
+        context=context,
+        partition_id=partition.partition_id,
+        ready_status=PromptGroupStatus.ADVANTAGE_DONE,
+        claim_status=PromptGroupStatus.TRAINING,
+        max_groups=1,
+    )
+
+    train_batch = make_trainer_for_batch_view(data_plane).read_train_batch(train_batch_meta)
+
+    assert 'length' not in train_batch.inputs[0]
+
+
 def test_data_plane_train_batch_requires_encoded_input_feature_fields():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
@@ -520,6 +557,19 @@ def test_async_train_batch_data_diagnostics_accepts_tensor_values():
     assert diagnostics['advantage_mean'] == 0.5
     assert diagnostics['logprobs_len_mean'] == 2.0
     assert diagnostics['input_len_mean'] == 3.0
+
+
+def test_short_math_reward_metrics_accepts_tensor_rewards():
+    torch = pytest.importorskip('torch')
+
+    metrics = _short_math_reward_metrics(
+        [{'completion_length': 3}, {'completion_length': 5}],
+        total_rewards=[torch.tensor(1.0), torch.tensor(2.0)],
+    )
+
+    assert metrics['train/total_reward'] == 1.5
+    assert metrics['train/total_reward_std'] > 0.0
+    assert metrics['train/completion_length'] == 4.0
 
 
 def test_rollout_sample_logprobs_must_match_trainable_labels():

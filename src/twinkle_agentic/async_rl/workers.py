@@ -48,7 +48,6 @@ TRANSFORMERS_INPUT_FIELDS = (
     'position_ids',
     'cu_seqlens',
     'completion_mask',
-    'length',
     'pixel_values',
     'image_grid_thw',
     'video_pixel_values',
