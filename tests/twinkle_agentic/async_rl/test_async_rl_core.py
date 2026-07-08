@@ -436,6 +436,37 @@ def test_data_plane_allows_mixed_policy_versions_inside_active_partition():
     )
 
 
+def test_mark_batch_groups_writes_group_tags_in_one_batch():
+    context = make_context('lora')
+    tq_client = FakeTransferQueueClient()
+    data_plane = TransferQueueDataPlane(tq_client=tq_client)
+    partition = data_plane.create_rollout_partition(context, target_groups=2)
+    complete_prompt_group(data_plane, context, partition, make_sample(0))
+    complete_prompt_group(data_plane, context, partition, make_sample(1))
+
+    batch = data_plane.claim_prompt_group_samples(
+        context=context,
+        partition_id=partition.partition_id,
+        ready_status=PromptGroupStatus.ROLLOUT_DONE,
+        claim_status=PromptGroupStatus.ADVANTAGING,
+        max_groups=2,
+    )
+    tq_client.kv_batch_put_calls.clear()
+
+    data_plane.mark_batch_groups(batch, PromptGroupStatus.ADVANTAGE_DONE)
+
+    assert len(tq_client.kv_batch_put_calls) == 1
+    call = tq_client.kv_batch_put_calls[0]
+    assert call['partition_id'] == partition.partition_id
+    assert call['keys'] == ['groups/group_0', 'groups/group_1']
+    assert call['has_tags'] is True
+    assert call['has_fields'] is False
+    assert [group.status for group in data_plane.list_prompt_groups(context)] == [
+        PromptGroupStatus.ADVANTAGE_DONE,
+        PromptGroupStatus.ADVANTAGE_DONE,
+    ]
+
+
 def test_data_plane_builds_transformers_train_batch_without_sample_rows():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
@@ -557,6 +588,26 @@ def test_async_train_batch_data_diagnostics_accepts_tensor_values():
     assert diagnostics['advantage_mean'] == 0.5
     assert diagnostics['logprobs_len_mean'] == 2.0
     assert diagnostics['input_len_mean'] == 3.0
+
+
+def test_async_train_batch_data_diagnostics_accepts_tensor_vectors():
+    torch = pytest.importorskip('torch')
+
+    diagnostics = _async_train_batch_data_diagnostics(
+        inputs=[{
+            'input_ids': torch.tensor([1, 2, 3]),
+        }, {
+            'input_ids': torch.tensor([1, 2, 3, 4]),
+        }],
+        rewards=torch.tensor([1.0, 2.0]),
+        advantages=torch.tensor([0.5, -0.5]),
+        logprobs=[torch.tensor([-0.1, -0.2]), torch.tensor([-0.3])],
+    )
+
+    assert diagnostics['tq_reward_mean'] == 1.5
+    assert diagnostics['advantage_mean'] == 0.0
+    assert diagnostics['logprobs_len_mean'] == 1.5
+    assert diagnostics['input_len_mean'] == 3.5
 
 
 def test_short_math_reward_metrics_accepts_tensor_rewards():

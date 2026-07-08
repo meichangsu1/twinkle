@@ -177,7 +177,7 @@ class TransferQueueDataPlane:
                 group.num_samples = len(sample_keys)
             group.status = status
             group.touch()
-            self._put_group_tag(group, extra_tag=extra_tag)
+            self._put_group_tags([group], extra_tag=extra_tag)
 
     def write_sample_batch(
         self,
@@ -303,7 +303,7 @@ class TransferQueueDataPlane:
             for group in selected_groups:
                 group.status = claim_status
                 group.touch()
-                self._put_group_tag(group)
+            self._put_group_tags(selected_groups)
             return batch
 
     def mark_batch_groups(self, batch: Any, status: PromptGroupStatus, *, extra_tag: dict[str, Any] | None = None):
@@ -314,12 +314,16 @@ class TransferQueueDataPlane:
         if not partition_id:
             raise ValueError('prompt-group batch missing partition_id')
         with self._lock:
+            self._load_metadata()
+            groups = []
             for group_id in group_ids:
-                self.update_prompt_group_status(
-                    PromptGroupRef(partition_id=partition_id, group_id=str(group_id)),
-                    status,
-                    extra_tag=extra_tag,
-                )
+                group = self._prompt_groups.get(partition_id, {}).get(str(group_id))
+                if group is None:
+                    raise KeyError(f'unknown prompt group: {partition_id}/{group_id}')
+                group.status = status
+                group.touch()
+                groups.append(group)
+            self._put_group_tags(groups, extra_tag=extra_tag)
 
     @staticmethod
     def _group_ids_from_sample_tags(tags: Iterable[dict[str, Any]]) -> list[str]:
@@ -393,22 +397,39 @@ class TransferQueueDataPlane:
         self._record_tq_event('kv_put', start, context=partition.context, partition_id=partition.partition_id)
 
     def _put_group_tag(self, group: PromptGroupMeta, *, extra_tag: dict[str, Any] | None = None) -> None:
+        self._put_group_tags([group], extra_tag=extra_tag)
+
+    def _put_group_tags(
+        self,
+        groups: Iterable[PromptGroupMeta],
+        *,
+        extra_tag: dict[str, Any] | None = None,
+    ) -> None:
+        groups = list(groups)
+        if not groups:
+            return
+        partition_ids = {group.partition_id for group in groups}
+        if len(partition_ids) != 1:
+            raise ValueError(f'group batch must belong to one partition, got {sorted(partition_ids)}')
+        partition_id = groups[0].partition_id
+        keys = []
+        tags = []
+        for group in groups:
+            tag = dict(group.tag())
+            if extra_tag:
+                tag.update(extra_tag)
+            self._prompt_groups[group.partition_id][group.group_id] = group
+            keys.append(group.key)
+            tags.append(tag)
         start = time.perf_counter()
-        tag = dict(self.tq.kv_list(partition_id=group.partition_id).get(group.partition_id, {}).get(group.key) or {})
+        self.tq.kv_batch_put(keys=keys, partition_id=partition_id, tags=tags)
         self._record_tq_event(
-            'kv_list',
+            'kv_batch_put',
             start,
-            context=group.context,
-            partition_id=group.partition_id,
-            metrics={'keys': 1 if tag else 0},
+            context=groups[0].context,
+            partition_id=partition_id,
+            metrics={'write_group_tags': len(keys)},
         )
-        tag.update(group.tag())
-        if extra_tag:
-            tag.update(extra_tag)
-        self._prompt_groups[group.partition_id][group.group_id] = group
-        start = time.perf_counter()
-        self.tq.kv_put(key=group.key, partition_id=group.partition_id, tag=tag)
-        self._record_tq_event('kv_put', start, context=group.context, partition_id=group.partition_id)
 
     def _next_group_id(self, partition: PartitionMeta) -> str:
         with self._lock:

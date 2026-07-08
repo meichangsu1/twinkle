@@ -249,6 +249,11 @@ def _metric_payload(metric: Any) -> dict[str, Any]:
 def _as_float(value: Any) -> float | None:
     if value is None:
         return None
+    if hasattr(value, 'item'):
+        try:
+            value = value.item()
+        except Exception:
+            return None
     if isinstance(value, (list, tuple)):
         if not value:
             return None
@@ -370,31 +375,10 @@ def _record_values(records: list[dict[str, Any]], key: str) -> list[float]:
         value = record.get(key)
         if value is None:
             continue
-        number = _to_float(value)
+        number = _as_float(value)
         if number is not None:
             values.append(number)
     return values
-
-
-def _numeric_values(values: Any) -> list[float]:
-    result = []
-    for value in values or []:
-        number = _to_float(value)
-        if number is not None:
-            result.append(number)
-    return result
-
-
-def _to_float(value: Any) -> float | None:
-    if hasattr(value, 'item'):
-        try:
-            value = value.item()
-        except Exception:
-            return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: dict[str, Any]):
@@ -746,13 +730,16 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 OmegaConf.to_container(context_cfg, resolve=True),
                 OmegaConf.to_container(context_model_cfg.template, resolve=True),
             )
+            dataloader_kwargs = {}
+            if self.cfg.runtime.mode == 'ray':
+                dataloader_kwargs['remote_group'] = 'model'
             dataloader = DataLoader(
                 dataset=dataset_factory,
                 batch_size=prompt_batch_size,
                 min_batch_size=prompt_batch_size,
                 device_mesh=self.model_mesh,
-                remote_group='model',
                 instance_id=f'{os.getpid()}-{safe_context_key}-',
+                **dataloader_kwargs,
             )
             loaders.append(
                 PromptLoader(

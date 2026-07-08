@@ -8,6 +8,7 @@ class FakeTransferQueueClient:
     def __init__(self):
         self.fields: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
         self.tags: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        self.kv_batch_put_calls: list[dict[str, Any]] = []
 
     def kv_put(self, key: str, partition_id: str, fields=None, tag=None):
         if fields:
@@ -22,6 +23,12 @@ class FakeTransferQueueClient:
             self.tags[partition_id][key] = current_tag
 
     def kv_batch_put(self, keys, partition_id: str, fields=None, tags=None):
+        self.kv_batch_put_calls.append({
+            'keys': list(keys),
+            'partition_id': partition_id,
+            'has_fields': fields is not None,
+            'has_tags': tags is not None,
+        })
         fields = self._rows_from_fields(fields, len(keys))
         tags = tags or [{} for _ in keys]
         for key, row_fields, tag in zip(keys, fields, tags):
