@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -12,7 +14,8 @@ from .metrics import AsyncRLMetricsConfig, AsyncRLMetricsRecorder, build_metrics
 from .prompt_loader import PromptLoader
 from .registry import LoraRuntimeRegistry
 from .staleness import StalenessManager
-from .types import GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus, PromptGroupStatus, RolloutCallable
+from .types import (ComponentResult, GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus,
+                    PromptGroupStatus, RolloutCallable)
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
                       ToolManagerFactory, TrainerScheduler, TrainerStepResult, TrainerWorker)
 
@@ -80,6 +83,10 @@ class BaseRLPipeline(ABC):
         self.train_batch_fn = None
         self.receive_weights_fn = None
         self._sync_step_loop = None
+        self._concurrent_stop_event: asyncio.Event | None = None
+        self._concurrent_history: list[dict[str, PartitionMeta | None]] = []
+        self._concurrent_trained = 0
+        self._concurrent_lock: asyncio.Lock | None = None
         self.metrics_recorder: AsyncRLMetricsRecorder | None = None
 
         self.build_components()
@@ -441,6 +448,93 @@ class BaseRLPipeline(ABC):
                 await asyncio.sleep(0)
         return history
 
+    async def run_concurrent_async(
+        self,
+        prompt_groups: Iterable[Trajectory] | None = None,
+        *,
+        max_steps: int | None = None,
+        idle_sleep_s: float = 0.01,
+        metrics_interval_s: float = 1.0,
+    ) -> list[dict[str, PartitionMeta | None]]:
+        if prompt_groups is not None:
+            self.submit_prompt_groups(prompt_groups)
+        limit = max_steps if max_steps is not None else self.config.max_train_steps
+        self._concurrent_stop_event = asyncio.Event()
+        self._concurrent_history = []
+        self._concurrent_trained = 0
+        self._concurrent_lock = asyncio.Lock()
+        tasks = [
+            asyncio.create_task(
+                self._run_component_loop(
+                    component,
+                    idle_sleep_s=idle_sleep_s,
+                ),
+                name=f'async-rl-{component.__class__.__name__}',
+            )
+            for component in self.components
+        ]
+        try:
+            last_metrics = 0.0
+            while True:
+                for task in tasks:
+                    if task.done() and not task.cancelled():
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
+                if limit is not None and self._concurrent_trained >= limit:
+                    break
+                if self._is_drained():
+                    break
+                now = asyncio.get_running_loop().time()
+                if now - last_metrics >= metrics_interval_s:
+                    self._record_pipeline_step_metrics()
+                    last_metrics = now
+                await asyncio.sleep(idle_sleep_s)
+        finally:
+            if self._concurrent_stop_event is not None:
+                self._concurrent_stop_event.set()
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            self._record_pipeline_step_metrics()
+            self._concurrent_stop_event = None
+            self._concurrent_lock = None
+        return list(self._concurrent_history)
+
+    async def _run_component_loop(self, component: Any, *, idle_sleep_s: float) -> None:
+        idle_steps = 0
+        while self._concurrent_stop_event is not None and not self._concurrent_stop_event.is_set():
+            result = await self._component_step(component)
+            if result is None:
+                idle_steps += 1
+                await asyncio.sleep(min(idle_sleep_s * max(1, idle_steps), 0.25))
+                continue
+            idle_steps = 0
+            await self._record_component_result(result)
+
+    async def _component_step(self, component: Any) -> ComponentResult | None:
+        if getattr(component, 'blocking_step', False):
+            return await asyncio.to_thread(component.step)
+        result = component.step()
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def _record_component_result(self, result: ComponentResult) -> None:
+        if self._concurrent_lock is None:
+            return
+        async with self._concurrent_lock:
+            step_result: dict[str, PartitionMeta | None] = {'rollout': None, 'advantage': None, 'train': None}
+            if result.kind in step_result:
+                step_result[result.kind] = result.metadata
+            self._concurrent_history.append(step_result)
+            if result.kind == 'train':
+                self._concurrent_trained += 1
+                if self.should_stop(self._concurrent_trained) and self._concurrent_stop_event is not None:
+                    self._concurrent_stop_event.set()
+
     def run(
         self,
         prompt_groups: Iterable[Trajectory] | None = None,
@@ -454,8 +548,18 @@ class BaseRLPipeline(ABC):
         """
         return asyncio.run(self.run_async(prompt_groups, max_steps=max_steps))
 
-    def run_until_idle(self, *, max_steps: int | None = None) -> list[dict[str, PartitionMeta | None]]:
+    def run_concurrent(
+        self,
+        prompt_groups: Iterable[Trajectory] | None = None,
+        *,
+        max_steps: int | None = None,
+    ) -> list[dict[str, PartitionMeta | None]]:
+        return asyncio.run(self.run_concurrent_async(prompt_groups, max_steps=max_steps))
+
+    def run_until_idle(self, *, max_steps: int | None = None, concurrent: bool = False) -> list[dict[str, PartitionMeta | None]]:
         """Advance workers without adding new rollout prompts."""
+        if concurrent:
+            return self.run_concurrent(max_steps=max_steps)
         return self.run(max_steps=max_steps)
 
     def sync_and_clear_completed_partitions(self, metadata: PartitionMeta) -> None:
@@ -516,6 +620,17 @@ class BaseRLPipeline(ABC):
             if group.status in untrained_statuses:
                 metrics['untrained_groups'] += 1
         return metrics
+
+    def _record_pipeline_step_metrics(self) -> None:
+        if self.metrics_recorder is not None:
+            self.metrics_recorder.log_event(
+                event='pipeline_step',
+                phase='pipeline',
+                metrics={
+                    **self._backlog_metrics(),
+                    'pipeline_had_work': True,
+                },
+            )
 
     def shutdown(self) -> None:
         for component in getattr(self, 'components', []):

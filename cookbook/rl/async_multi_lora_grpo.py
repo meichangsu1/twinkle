@@ -98,7 +98,8 @@ def main() -> None:
 
     logger.info('Starting server-side async multi-LoRA GRPO')
     logger.info(get_device_placement())
-    history = pipeline.run_until_idle(max_steps=int(cfg.pipeline.max_steps))
+    concurrent = str(cfg.pipeline.get('scheduler', 'serial')) == 'concurrent'
+    history = pipeline.run_until_idle(max_steps=int(cfg.pipeline.max_steps), concurrent=concurrent)
     trained = sum(1 for item in history if item.get('train') is not None)
     logger.info('async_multi_lora_grpo progress: trained_partitions=%s', trained)
 

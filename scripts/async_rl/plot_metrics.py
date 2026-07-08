@@ -387,6 +387,9 @@ def _save(fig, output: Path) -> None:
     fig.tight_layout()
     fig.savefig(output, dpi=160)
     fig.clf()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
 
 
 if __name__ == '__main__':

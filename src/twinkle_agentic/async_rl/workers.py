@@ -850,6 +850,7 @@ class MultiLoraGRPOTrainConfig:
 
 
 class TrainerWorker:
+    blocking_step = True
 
     def __init__(
         self,
