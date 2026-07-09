@@ -34,10 +34,7 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     rollout_samples = sum(_metric_number(event, 'sample_count') for event in rollout_done_events)
     train_partitions = len(partition_done_events)
     train_steps = len(train_events)
-    optimizer_steps = [
-        _metric_optional_number(event, 'optimizer_step')
-        for event in train_events
-    ]
+    optimizer_steps = [_metric_optional_number(event, 'optimizer_step') for event in train_events]
     optimizer_steps = [step for step in optimizer_steps if step is not None]
     hours = wall_time_s / 3600.0 if wall_time_s > 0 else 0.0
 

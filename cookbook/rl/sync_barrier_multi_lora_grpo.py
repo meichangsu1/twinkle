@@ -48,7 +48,7 @@ from twinkle_agentic.async_rl.grpo_pipeline import (
     validate_training_input_length,
 )
 from twinkle_agentic.async_rl.types import LoraContext
-from twinkle_agentic.async_rl.workers import TRANSFORMERS_INPUT_FIELDS
+from twinkle_agentic.async_rl.tq_utils import TRANSFORMERS_INPUT_FIELDS
 
 logger = get_logger()
 

@@ -9,6 +9,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+_SAVE_DPI = 300
+_SAVE_SVG = False
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate async RL experiment plots from metrics.jsonl files.')
@@ -26,7 +29,13 @@ def main() -> None:
         default=[],
         help='Optional gpu_util.csv file. May be passed multiple times.',
     )
+    parser.add_argument('--dpi', type=int, default=300, help='PNG output DPI.')
+    parser.add_argument('--svg', action='store_true', help='Also write SVG copies of each plot.')
     args = parser.parse_args()
+
+    global _SAVE_DPI, _SAVE_SVG
+    _SAVE_DPI = args.dpi
+    _SAVE_SVG = args.svg
 
     plt = _import_matplotlib()
     run_metrics = [_load_run(path) for path in args.runs]
@@ -385,7 +394,9 @@ def _write_no_data(ax) -> None:
 def _save(fig, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(output, dpi=160)
+    fig.savefig(output, dpi=_SAVE_DPI)
+    if _SAVE_SVG:
+        fig.savefig(output.with_suffix('.svg'))
     fig.clf()
     import matplotlib.pyplot as plt
 

@@ -32,7 +32,7 @@ from twinkle_agentic.async_rl.grpo_pipeline import (
     lora_model_config,
 )
 from twinkle_agentic.async_rl.metrics import AsyncRLMetricsConfig, JSONLMetricsRecorder, flatten_for_swanlab
-from twinkle_agentic.async_rl.workers import columns_to_tq_fields, rows_to_tq_fields
+from twinkle_agentic.async_rl.tq_utils import columns_to_tq_fields, rows_to_tq_fields
 
 from .fakes import FakeTransferQueueClient
 
@@ -83,7 +83,7 @@ def make_rollout_sample_writer(data_plane):
 
 
 def write_rollout_samples(data_plane, group_ref, samples, *, rewards=None):
-    return make_rollout_sample_writer(data_plane).write_rollout_samples(group_ref, samples, rewards=rewards)
+    return make_rollout_sample_writer(data_plane)._write_rollout_samples(group_ref, samples, rewards=rewards)
 
 
 def batch_group_ids(batch):
@@ -102,6 +102,15 @@ def mark_batch_group_ids(data_plane, batch, status):
         partition_id=batch.partition_id,
         group_ids=batch_group_ids(batch),
         status=status,
+    )
+
+
+def claim_groups_by_status(data_plane, context, partition_id, ready_status, claim_status, *, max_groups):
+    groups = data_plane.list_prompt_groups(context, partition_id=partition_id, statuses=[ready_status])
+    return data_plane.claim_prompt_groups(
+        groups[:max_groups],
+        ready_status=ready_status,
+        claim_status=claim_status,
     )
 
 
@@ -266,7 +275,7 @@ def test_data_plane_rollout_reward_advantage_and_clear():
 
     meta = complete_prompt_group(data_plane, context, partition, make_sample(0))
     assert meta.status == PartitionStatus.CLOSED
-    group = data_plane.list_prompt_groups(context)[0]
+    group = data_plane.list_prompt_groups(context, partition_id=partition.partition_id)[0]
     assert group.status == PromptGroupStatus.ROLLOUT_DONE
     assert_uuid(group.group_id)
     assert group.sample_keys == [f'samples/{group.group_id}/0']
@@ -282,10 +291,19 @@ def test_data_plane_rollout_reward_advantage_and_clear():
     assert 'group_status' not in sample_tag
     assert 'partition_status' not in sample_tag
 
-    adv_worker = AdvantageWorker(data_plane=data_plane)
-    meta = adv_worker.process_advantage_batch(context)
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+    registry.on_partition_created(context, partition.partition_id)
+    adv_worker = AdvantageWorker(data_plane=data_plane, lora_runtime_registry=registry)
+    groups = data_plane.list_prompt_groups(
+        context,
+        partition_id=partition.partition_id,
+        statuses=[PromptGroupStatus.ROLLOUT_DONE],
+    )
+    meta = adv_worker.process_advantage_batch(context, partition_id=partition.partition_id, groups=groups)
     assert meta.status == PartitionStatus.CLOSED
-    assert data_plane.list_prompt_groups(context)[0].status == PromptGroupStatus.ADVANTAGE_DONE
+    assert data_plane.list_prompt_groups(context, partition_id=partition.partition_id)[0].status == (
+        PromptGroupStatus.ADVANTAGE_DONE)
 
     data_plane.clear_partition(context, partition.partition_id)
     assert data_plane.list_partitions(context) == []
@@ -298,31 +316,33 @@ def test_data_plane_group_claim_consumption_is_exclusive():
     complete_prompt_group(data_plane, context, partition, make_sample(0))
     complete_prompt_group(data_plane, context, partition, make_sample(1))
 
-    first = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    first = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
-    second = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    second = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
 
     assert len(first.keys) == 1
     assert len(second.keys) == 1
     assert first.keys != second.keys
-    assert [group.status for group in data_plane.list_prompt_groups(context)] == [
+    assert [group.status for group in data_plane.list_prompt_groups(context, partition_id=partition.partition_id)] == [
         PromptGroupStatus.ADVANTAGING,
         PromptGroupStatus.ADVANTAGING,
     ]
 
 
-def test_claim_prompt_group_samples_does_not_cross_partitions():
+def test_claim_prompt_groups_does_not_cross_partitions():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     first_partition = data_plane.create_rollout_partition(context, target_groups=1)
@@ -330,11 +350,12 @@ def test_claim_prompt_group_samples_does_not_cross_partitions():
     complete_prompt_group(data_plane, context, first_partition, make_sample(0))
     complete_prompt_group(data_plane, context, second_partition, make_sample(1))
 
-    batch = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=first_partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    batch = claim_groups_by_status(
+        data_plane,
+        context,
+        first_partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
 
@@ -393,14 +414,14 @@ def test_staleness_blocks_next_partition_by_live_group_version():
     assert manager.can_create_next_rollout_partition(
         context,
         current_policy_version=1,
-        groups=data_plane.list_prompt_groups(context),
+        groups=data_plane.list_all_prompt_groups(context),
     )
     p1 = data_plane.create_rollout_partition(context, target_groups=1)
     complete_prompt_group(data_plane, context, p1, make_sample(1), policy_version=1)
     assert not manager.can_create_next_rollout_partition(
         context,
         current_policy_version=2,
-        groups=data_plane.list_prompt_groups(context),
+        groups=data_plane.list_all_prompt_groups(context),
     )
 
 
@@ -419,11 +440,11 @@ def test_strict_rollouter_blocks_new_partition_until_live_partition_finishes():
     group_ref = data_plane.create_prompt_group(context, partition, runtime_state=registry.get(context))
     data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.ADVANTAGE_DONE)
 
-    assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
+    assert not rollouter._can_create_next_rollout_partition(context)
 
     data_plane.update_partition_status(partition.partition_id, PartitionStatus.TRAIN_DONE)
 
-    assert rollouter.can_create_next_rollout_partition(context, current_policy_version=1)
+    assert rollouter._can_create_next_rollout_partition(context)
 
 
 def test_relaxed_rollouter_limits_created_partitions_by_staleness_window():
@@ -444,12 +465,12 @@ def test_relaxed_rollouter_limits_created_partitions_by_staleness_window():
     g1 = data_plane.create_prompt_group(context, p1, runtime_state=registry.get(context))
     data_plane.update_prompt_group_status(g1, PromptGroupStatus.ADVANTAGE_DONE)
 
-    assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
+    assert not rollouter._can_create_next_rollout_partition(context)
 
     data_plane.update_prompt_group_status(g0, PromptGroupStatus.TRAIN_DONE)
     data_plane.update_partition_status(p0.partition_id, PartitionStatus.TRAIN_DONE)
 
-    assert rollouter.can_create_next_rollout_partition(context, current_policy_version=1)
+    assert rollouter._can_create_next_rollout_partition(context)
 
 
 def test_relaxed_rollouter_uses_partition_step_span_not_live_count():
@@ -474,7 +495,7 @@ def test_relaxed_rollouter_uses_partition_step_span_not_live_count():
     g2 = data_plane.create_prompt_group(context, p2, runtime_state=registry.get(context))
     data_plane.update_prompt_group_status(g2, PromptGroupStatus.ADVANTAGE_DONE)
 
-    assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
+    assert not rollouter._can_create_next_rollout_partition(context)
 
 
 def test_data_plane_prompt_group_records_are_partition_scoped():
@@ -510,11 +531,12 @@ def test_data_plane_allows_mixed_policy_versions_inside_active_partition():
     meta = data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
 
     assert meta.status == PartitionStatus.CLOSED
-    batch = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    batch = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=2,
     )
     assert batch_group_ids(batch) == [g0.group_id, g1.group_id]
@@ -534,11 +556,12 @@ def test_mark_groups_writes_group_tags_in_one_batch():
     complete_prompt_group(data_plane, context, partition, make_sample(0))
     complete_prompt_group(data_plane, context, partition, make_sample(1))
 
-    batch = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    batch = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=2,
     )
     tq_client.kv_batch_put_calls.clear()
@@ -551,7 +574,7 @@ def test_mark_groups_writes_group_tags_in_one_batch():
     assert call['keys'] == [f'groups/{group_id}' for group_id in batch_group_ids(batch)]
     assert call['has_tags'] is True
     assert call['has_fields'] is False
-    assert [group.status for group in data_plane.list_prompt_groups(context)] == [
+    assert [group.status for group in data_plane.list_prompt_groups(context, partition_id=partition.partition_id)] == [
         PromptGroupStatus.ADVANTAGE_DONE,
         PromptGroupStatus.ADVANTAGE_DONE,
     ]
@@ -563,11 +586,12 @@ def test_data_plane_builds_transformers_train_batch_without_sample_rows():
     partition = data_plane.create_rollout_partition(context, target_groups=1)
     complete_prompt_group(data_plane, context, partition, make_sample(0))
 
-    adv_batch = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    adv_batch = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
     data_plane.write_batch_fields(
@@ -575,11 +599,12 @@ def test_data_plane_builds_transformers_train_batch_without_sample_rows():
         {'advantages': [0.25], 'returns': [1.0]},
     )
     mark_batch_group_ids(data_plane, adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
-    train_batch_meta = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ADVANTAGE_DONE,
-        claim_status=PromptGroupStatus.TRAINING,
+    train_batch_meta = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ADVANTAGE_DONE,
+        PromptGroupStatus.TRAINING,
         max_groups=1,
     )
 
@@ -605,11 +630,12 @@ def test_data_plane_does_not_feed_scalar_length_to_trainer_inputs():
     sample['length'] = len(sample['input_ids'])
     complete_prompt_group(data_plane, context, partition, sample)
 
-    adv_batch = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    adv_batch = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
     data_plane.write_batch_fields(
@@ -617,11 +643,12 @@ def test_data_plane_does_not_feed_scalar_length_to_trainer_inputs():
         {'advantages': [0.25], 'returns': [1.0]},
     )
     mark_batch_group_ids(data_plane, adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
-    train_batch_meta = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ADVANTAGE_DONE,
-        claim_status=PromptGroupStatus.TRAINING,
+    train_batch_meta = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ADVANTAGE_DONE,
+        PromptGroupStatus.TRAINING,
         max_groups=1,
     )
 
@@ -638,11 +665,12 @@ def test_data_plane_train_batch_requires_encoded_input_feature_fields():
     sample.pop('input_ids')
     complete_prompt_group(data_plane, context, partition, sample)
 
-    adv_batch = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    adv_batch = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
     data_plane.write_batch_fields(
@@ -650,11 +678,12 @@ def test_data_plane_train_batch_requires_encoded_input_feature_fields():
         {'advantages': [0.0], 'returns': [0.0]},
     )
     mark_batch_group_ids(data_plane, adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
-    train_batch_meta = data_plane.claim_prompt_group_samples(
-        context=context,
-        partition_id=partition.partition_id,
-        ready_status=PromptGroupStatus.ADVANTAGE_DONE,
-        claim_status=PromptGroupStatus.TRAINING,
+    train_batch_meta = claim_groups_by_status(
+        data_plane,
+        context,
+        partition.partition_id,
+        PromptGroupStatus.ADVANTAGE_DONE,
+        PromptGroupStatus.TRAINING,
         max_groups=1,
     )
 
@@ -824,7 +853,7 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
         assert submit_result.kind == 'rollout'
         for _ in range(10):
             result = await rollouter.step()
-            if data_plane.list_prompt_groups(context, statuses=[PromptGroupStatus.ROLLOUT_DONE]):
+            if data_plane.list_all_prompt_groups(context, statuses=[PromptGroupStatus.ROLLOUT_DONE]):
                 return result
             await asyncio.sleep(0)
         raise AssertionError('rollout task did not complete')
@@ -835,7 +864,7 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     assert meta.status == PartitionStatus.CLOSED
     assert meta.partition_id == context.partition_id(0)
 
-    advantage_result = AdvantageWorker(data_plane=data_plane, contexts=[context]).step()
+    advantage_result = AdvantageWorker(data_plane=data_plane, contexts=[context], lora_runtime_registry=registry).step()
     assert advantage_result.kind == 'advantage'
 
     received = []
@@ -872,11 +901,12 @@ def test_trainer_trains_group_batches_and_syncs_only_when_partition_done():
     registry = LoraRuntimeRegistry()
     registry.register(context)
     partition = data_plane.create_rollout_partition(context, target_groups=4)
+    registry.on_partition_created(context, partition.partition_id)
     complete_prompt_group(data_plane, context, partition, make_sample(0))
     complete_prompt_group(data_plane, context, partition, make_sample(1))
     complete_prompt_group(data_plane, context, partition, make_sample(2))
     complete_prompt_group(data_plane, context, partition, make_sample(3))
-    AdvantageWorker(data_plane=data_plane, contexts=[context], batch_size=4).step()
+    AdvantageWorker(data_plane=data_plane, contexts=[context], lora_runtime_registry=registry, batch_size=4).step()
     expected_group_ids = [
         group.group_id
         for group in data_plane.list_prompt_groups(
@@ -925,16 +955,18 @@ def test_trainer_mini_batch_size_is_context_level():
     registry.register(context_b)
 
     partition_a = data_plane.create_rollout_partition(context_a, target_groups=1)
+    registry.on_partition_created(context_a, partition_a.partition_id)
     complete_prompt_group(data_plane, context_a, partition_a, make_sample(0))
-    AdvantageWorker(data_plane=data_plane, contexts=[context_a], batch_size=1).step()
+    AdvantageWorker(data_plane=data_plane, contexts=[context_a], lora_runtime_registry=registry, batch_size=1).step()
 
     partition_b = data_plane.create_rollout_partition(context_b, target_groups=2)
     complete_prompt_group(data_plane, context_b, partition_b, make_sample(1))
-    adv_batch_b = data_plane.claim_prompt_group_samples(
-        context=context_b,
-        partition_id=partition_b.partition_id,
-        ready_status=PromptGroupStatus.ROLLOUT_DONE,
-        claim_status=PromptGroupStatus.ADVANTAGING,
+    adv_batch_b = claim_groups_by_status(
+        data_plane,
+        context_b,
+        partition_b.partition_id,
+        PromptGroupStatus.ROLLOUT_DONE,
+        PromptGroupStatus.ADVANTAGING,
         max_groups=1,
     )
     data_plane.write_batch_fields(adv_batch_b, {'advantages': [0.0], 'returns': [0.0]})
@@ -999,7 +1031,7 @@ def test_async_rollouter_accumulates_prompt_groups_into_one_rollout_partition():
         results = []
         for _ in range(10):
             result = await rollouter.step()
-            if len(data_plane.list_prompt_groups(context, statuses=[PromptGroupStatus.ROLLOUT_DONE])) == 2:
+            if len(data_plane.list_all_prompt_groups(context, statuses=[PromptGroupStatus.ROLLOUT_DONE])) == 2:
                 return [result]
             await asyncio.sleep(0)
         raise AssertionError('rollout task did not complete')

@@ -6,16 +6,16 @@ import inspect
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from numbers import Number
 from typing import Any, Callable, Deque, Iterable
 
-from twinkle.data_format import InputFeature, Trajectory
+from twinkle.data_format import Trajectory
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .data_plane import TransferQueueDataPlane
 from .metrics import AsyncRLMetricsRecorder, NoopMetricsRecorder, prefixed_summary
 from .registry import LoraRuntimeRegistry
 from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
 from .staleness import StalenessManager
+from .tq_utils import ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields, read_train_batch, rows_to_tq_fields
 from .types import (ComponentResult, GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus, PromptGroupRef,
                     PromptGroupStatus, RolloutCallable, RolloutOutput, RolloutScheduleCandidate, TrainBatchCandidate,
                     TransformersTrainBatch)
@@ -41,111 +41,11 @@ class ToolManagerFactory:
         return factory(context, prompt_group)
 
 
-TRANSFORMERS_INPUT_FIELDS = (
-    'input_ids',
-    'labels',
-    'attention_mask',
-    'position_ids',
-    'cu_seqlens',
-    'completion_mask',
-    'pixel_values',
-    'image_grid_thw',
-    'video_pixel_values',
-    'video_grid_thw',
-    'input_features',
-    'feature_attention_mask',
-)
-REQUIRED_MODEL_INPUT_FIELDS = ('input_ids', 'labels')
-TRAIN_LOSS_FIELDS = ('logprobs', 'advantages', 'rewards')
-REQUIRED_TRAIN_LOSS_FIELDS = ('logprobs', 'advantages')
-REWARD_FIELD = 'rewards'
-ROLLOUT_TRAIN_FIELDS = (*TRANSFORMERS_INPUT_FIELDS, 'logprobs', 'rewards', 'advantages', 'returns')
 TERMINAL_PARTITION_STATUSES = {
     PartitionStatus.TRAIN_DONE,
     PartitionStatus.CLEARED,
     PartitionStatus.FAILED,
 }
-
-
-def rows_to_tq_fields(rows: list[dict[str, Any]]):
-    from tensordict import TensorDict
-
-    if not rows:
-        return TensorDict({}, batch_size=[0])
-    field_names = tuple(rows[0].keys())
-    expected = set(field_names)
-    for row_index, row in enumerate(rows):
-        actual = set(row)
-        if actual != expected:
-            missing = sorted(expected - actual)
-            extra = sorted(actual - expected)
-            raise ValueError(f'TQ row {row_index} fields mismatch: missing={missing}, extra={extra}')
-    columns = {field_name: [row[field_name] for row in rows] for field_name in field_names}
-    return columns_to_tq_fields(columns, len(rows))
-
-
-def columns_to_tq_fields(columns: dict[str, list[Any]], size: int):
-    import torch
-    from tensordict import TensorDict
-    from tensordict.tensorclass import NonTensorStack
-
-    if size < 0:
-        raise ValueError(f'TQ field size must be non-negative, got {size}')
-    packed = {}
-    for field_name, values in columns.items():
-        if not isinstance(values, list):
-            raise TypeError(f'TQ field {field_name!r} must be a list, got {type(values)!r}')
-        if len(values) != size:
-            raise ValueError(f'TQ field {field_name!r} must contain {size} values, got {len(values)}')
-        if all(isinstance(item, Number) and not isinstance(item, bool) for item in values):
-            packed[field_name] = torch.tensor(values)
-        else:
-            packed[field_name] = NonTensorStack(*values)
-    return TensorDict(packed, batch_size=[size])
-
-
-def read_train_batch(
-    data_plane: TransferQueueDataPlane,
-    batch: Any,
-    data_fields: list[str] | None = None,
-) -> TransformersTrainBatch:
-    selected = _selected_train_fields(data_fields)
-    columns = data_plane.read_batch_fields(batch, fields=selected)
-    size = len(batch.keys)
-    input_columns = {
-        field_name: columns[field_name]
-        for field_name in TRANSFORMERS_INPUT_FIELDS if field_name in columns
-    }
-    for field_name in REQUIRED_MODEL_INPUT_FIELDS:
-        values = input_columns.get(field_name)
-        if values is None or any(value is None for value in values):
-            raise ValueError(f'TQ batch missing required model input field {field_name!r}')
-
-    inputs: list[InputFeature] = []
-    for index in range(size):
-        inputs.append(
-            InputFeature(**{
-                field_name: values[index]
-                for field_name, values in input_columns.items() if values[index] is not None
-            }))
-
-    return TransformersTrainBatch(
-        inputs=inputs,
-        logprobs=columns['logprobs'],
-        advantages=columns['advantages'],
-        rewards=columns[REWARD_FIELD],
-        sample_keys=list(batch.keys),
-    )
-
-
-def _selected_train_fields(data_fields: list[str] | None) -> list[str]:
-    if data_fields is None:
-        return sorted(set(TRANSFORMERS_INPUT_FIELDS) | set(TRAIN_LOSS_FIELDS))
-    return sorted(
-        set(data_fields)
-        | set(REQUIRED_MODEL_INPUT_FIELDS)
-        | set(REQUIRED_TRAIN_LOSS_FIELDS)
-        | {REWARD_FIELD})
 
 
 def _require_rollout_logprobs(sample: dict[str, Any], *, sample_key: str) -> list[float]:
@@ -228,10 +128,6 @@ def _safe_len(value: Any) -> int | None:
         return None
 
 
-def _group_ids(groups: Iterable[Any]) -> list[str]:
-    return [str(group.group_id) for group in groups]
-
-
 def _metrics_from_result(result: Any) -> dict[str, Any]:
     if isinstance(result, TrainerStepResult):
         return dict(result.metrics or {})
@@ -308,7 +204,7 @@ class AsyncRollouter:
     def pending_prompt_group_count(self, context: LoraContext) -> int:
         return len(self.pending_prompt_groups_by_context.get(context.key, ()))
 
-    def list_live_partitions(self, context: LoraContext) -> list[PartitionMeta]:
+    def _list_live_partitions(self, context: LoraContext) -> list[PartitionMeta]:
         runtime_state = self.lora_runtime_registry.get(context)
         partitions = []
         stale_partition_ids = []
@@ -323,20 +219,20 @@ class AsyncRollouter:
             return sorted(partitions, key=lambda partition: (partition.created_at, partition.partition_id))
         return self.data_plane.list_partitions(context)
 
-    def build_rollout_candidate(self, context: LoraContext) -> RolloutScheduleCandidate | None:
+    def _build_rollout_candidate(self, context: LoraContext) -> RolloutScheduleCandidate | None:
         """Collect current queue, staleness, partition, and adapter state for scheduling."""
         pending_groups = len(self.pending_prompt_groups_by_context.get(context.key, ()))
         if pending_groups <= 0:
             return None
         runtime_state = self.lora_runtime_registry.get(context)
-        partitions = self.list_live_partitions(context)
+        partitions = self._list_live_partitions(context)
         active_partitions = [p for p in partitions if p.status == PartitionStatus.ACTIVE]
         active_partition = active_partitions[0] if active_partitions else None
         free_slots = 0
         if active_partition is not None:
-            free_slots = self.free_group_slots(active_partition)
-        elif self.can_create_next_rollout_partition(context, runtime_state.policy_version):
-            free_slots = self.target_groups_for_context(context)
+            free_slots = self._free_group_slots(active_partition)
+        elif self._can_create_next_rollout_partition(context):
+            free_slots = self._target_groups_for_context(context)
         return RolloutScheduleCandidate(
             context=context,
             pending_groups=pending_groups,
@@ -350,10 +246,10 @@ class AsyncRollouter:
             weight=runtime_state.weight,
         )
 
-    def pick_next_rollout_candidate(self) -> LoraContext | None:
+    def _pick_next_rollout_candidate(self) -> LoraContext | None:
         """Choose the next context that is allowed to submit one prompt group."""
         candidates: list[RolloutScheduleCandidate] = []
-        if self.remaining_task_capacity() <= 0:
+        if self._remaining_task_capacity() <= 0:
             return None
         seen: dict[str, LoraContext] = {}
         for queue in self.pending_prompt_groups_by_context.values():
@@ -364,50 +260,49 @@ class AsyncRollouter:
         for context in seen.values():
             if not self.lora_runtime_registry.can_accept_rollout(context):
                 continue
-            candidate = self.build_rollout_candidate(context)
+            candidate = self._build_rollout_candidate(context)
             if candidate is None or candidate.rollout_capacity <= 0:
                 continue
             candidates.append(candidate)
         return self.rollout_policy.pick_next_context(candidates)
 
-    def remaining_task_capacity(self) -> int:
+    def _remaining_task_capacity(self) -> int:
         return max(0, self.max_concurrency - len(self.active_tasks))
 
-    def target_groups_for_context(self, context: LoraContext) -> int:
+    def _target_groups_for_context(self, context: LoraContext) -> int:
         return int(self.target_groups_by_context.get(context.key, self.target_groups_per_partition))
 
-    def peek_next_train_id(self, context: LoraContext) -> int:
+    def _peek_next_train_id(self, context: LoraContext) -> int:
         if context.key not in self._next_train_id_by_context:
             self._next_train_id_by_context[context.key] = self.data_plane.peek_next_train_id(context)
         return self._next_train_id_by_context[context.key]
 
-    def allocate_next_partition_id(self, context: LoraContext) -> str:
-        train_id = self.peek_next_train_id(context)
+    def _allocate_next_partition_id(self, context: LoraContext) -> str:
+        train_id = self._peek_next_train_id(context)
         self._next_train_id_by_context[context.key] = train_id + 1
         return context.partition_id(train_id)
 
-    def free_group_slots(self, partition: PartitionMeta) -> int:
+    def _free_group_slots(self, partition: PartitionMeta) -> int:
         if partition.status != PartitionStatus.ACTIVE:
             return 0
         group_count = len(self.data_plane.list_prompt_groups(partition.context, partition_id=partition.partition_id))
         return max(0, partition.target_groups - group_count)
 
-    def can_create_next_rollout_partition(self, context: LoraContext, current_policy_version: int) -> bool:
-        _ = current_policy_version
-        partitions = self.list_live_partitions(context)
+    def _can_create_next_rollout_partition(self, context: LoraContext) -> bool:
+        partitions = self._list_live_partitions(context)
         live_partitions = [partition for partition in partitions if partition.status not in TERMINAL_PARTITION_STATUSES]
         if not live_partitions:
             return True
         oldest_train_id = min(_partition_train_id(partition.partition_id) for partition in live_partitions)
-        next_train_id = self.peek_next_train_id(context)
+        next_train_id = self._peek_next_train_id(context)
         return next_train_id - oldest_train_id <= self.staleness_manager.max_staleness
 
-    def pop_prompt_group(self, context: LoraContext) -> Trajectory:
+    def _pop_prompt_group(self, context: LoraContext) -> Trajectory:
         queue = self.pending_prompt_groups_by_context[context.key]
         _, prompt_group = queue.popleft()
         return prompt_group
 
-    async def run_prompt_group_rollout(
+    async def _run_prompt_group_rollout(
         self,
         group_ref: PromptGroupRef,
         prompt_group: Trajectory,
@@ -439,9 +334,9 @@ class AsyncRollouter:
             }
             if group.rollout_adapter_path is not None:
                 rollout_kwargs['adapter_path'] = group.rollout_adapter_path
-            rollout_rows = list(await self.invoke_rollout([trajectory], rollout_kwargs))
-            rewards = self.compute_rewards(context, rollout_rows)
-            reward_metrics = self.compute_reward_metrics(context, rollout_rows, rewards)
+            rollout_rows = list(await self._invoke_rollout([trajectory], rollout_kwargs))
+            rewards = self._compute_rewards(context, rollout_rows)
+            reward_metrics = self._compute_reward_metrics(context, rollout_rows, rewards)
             current_policy_version = self.lora_runtime_registry.get(context).policy_version
             if self.staleness_manager.is_group_too_stale(
                     rollout_policy_version=group.rollout_policy_version,
@@ -466,7 +361,7 @@ class AsyncRollouter:
                     },
                 )
                 return self.data_plane.get_rollout_partition(group_ref.partition_id)
-            meta, sample_keys = self.write_rollout_samples(group_ref, rollout_rows, rewards=rewards)
+            meta, sample_keys = self._write_rollout_samples(group_ref, rollout_rows, rewards=rewards)
             self.data_plane.update_prompt_group_status(
                 group_ref,
                 PromptGroupStatus.ROLLOUT_DONE,
@@ -512,7 +407,7 @@ class AsyncRollouter:
         finally:
             self.lora_runtime_registry.on_rollout_finished(context)
 
-    async def invoke_rollout(
+    async def _invoke_rollout(
         self,
         trajectories: list[Trajectory],
         rollout_kwargs: dict[str, Any],
@@ -523,13 +418,13 @@ class AsyncRollouter:
             return await self.rollout(trajectories, **rollout_kwargs)
         return await asyncio.to_thread(self.rollout, trajectories, **rollout_kwargs)
 
-    def compute_rewards(self, context: LoraContext, rollout_rows: list[RolloutOutput]) -> list[float] | None:
+    def _compute_rewards(self, context: LoraContext, rollout_rows: list[RolloutOutput]) -> list[float] | None:
         reward_fn = self.reward_registry.get(context.reward_type)
         if reward_fn is None:
             return None
         return list(reward_fn(rollout_rows, context=context))
 
-    def compute_reward_metrics(
+    def _compute_reward_metrics(
         self,
         context: LoraContext,
         rollout_rows: list[RolloutOutput],
@@ -541,7 +436,7 @@ class AsyncRollouter:
             return {}
         return dict(metric_payload(rollout_rows, rewards=rewards, context=context))
 
-    def write_rollout_samples(
+    def _write_rollout_samples(
         self,
         group_ref: PromptGroupRef,
         samples: Iterable[RolloutOutput],
@@ -591,13 +486,13 @@ class AsyncRollouter:
         )
         return partition, sample_keys
 
-    def submit_prompt_group_tasks(self) -> int:
+    def _submit_prompt_group_tasks(self) -> int:
         submitted_groups = 0
-        while self.remaining_task_capacity() > 0:
-            context = self.pick_next_rollout_candidate()
+        while self._remaining_task_capacity() > 0:
+            context = self._pick_next_rollout_candidate()
             if context is None:
                 break
-            partition = self.get_active_or_create_rollout_partition(context)
+            partition = self._get_active_or_create_rollout_partition(context)
             if partition is None:
                 continue
             runtime_state = self.lora_runtime_registry.get(context)
@@ -609,10 +504,10 @@ class AsyncRollouter:
                 )
             except LookupError:
                 continue
-            prompt_group = self.pop_prompt_group(context)
-            task = asyncio.create_task(self.run_prompt_group_rollout(group_ref, prompt_group))
+            prompt_group = self._pop_prompt_group(context)
+            task = asyncio.create_task(self._run_prompt_group_rollout(group_ref, prompt_group))
             self.active_tasks.add(task)
-            self.close_partition_if_full(partition)
+            self._close_partition_if_full(partition)
             submitted_groups += 1
             self.metrics_recorder.log_event(
                 event='rollout_submitted',
@@ -624,13 +519,13 @@ class AsyncRollouter:
                     'submitted_groups': submitted_groups,
                     'active_tasks': len(self.active_tasks),
                     'pending_prompt_groups': self.pending_prompt_group_count(context),
-                    'rollout_capacity': self.free_group_slots(partition),
+                    'rollout_capacity': self._free_group_slots(partition),
                     'max_concurrency': self.max_concurrency,
                 },
             )
         return submitted_groups
 
-    async def collect_finished_tasks(self) -> int:
+    async def _collect_finished_tasks(self) -> int:
         done = [task for task in self.active_tasks if task.done()]
         for task in done:
             self.active_tasks.remove(task)
@@ -639,41 +534,41 @@ class AsyncRollouter:
             try:
                 await task
             except Exception as exc:
-                # Group-level failure is already persisted by run_prompt_group_rollout.
+                # Group-level failure is already persisted by _run_prompt_group_rollout.
                 # The exception is consumed here so asyncio does not leak it.
                 _ = exc
         return len(done)
 
-    def get_active_or_create_rollout_partition(self, context: LoraContext) -> PartitionMeta | None:
+    def _get_active_or_create_rollout_partition(self, context: LoraContext) -> PartitionMeta | None:
         """Return the context's active rollout partition, or create the next train_k."""
         active_partitions = [
-            partition for partition in self.list_live_partitions(context) if partition.status == PartitionStatus.ACTIVE
+            partition for partition in self._list_live_partitions(context) if partition.status == PartitionStatus.ACTIVE
         ]
         active_partition = active_partitions[0] if active_partitions else None
         if active_partition is not None:
-            if self.free_group_slots(active_partition) > 0:
+            if self._free_group_slots(active_partition) > 0:
                 return active_partition
             self.data_plane.update_partition_status(active_partition.partition_id, PartitionStatus.CLOSED)
         runtime_state = self.lora_runtime_registry.get(context)
-        if not self.can_create_next_rollout_partition(context, runtime_state.policy_version):
+        if not self._can_create_next_rollout_partition(context):
             return None
         meta = self.data_plane.create_rollout_partition(
             context,
-            target_groups=self.target_groups_for_context(context),
-            partition_id=self.allocate_next_partition_id(context),
+            target_groups=self._target_groups_for_context(context),
+            partition_id=self._allocate_next_partition_id(context),
         )
         self.lora_runtime_registry.on_partition_created(context, meta.partition_id)
         return meta
 
-    def close_partition_if_full(self, partition: PartitionMeta) -> None:
+    def _close_partition_if_full(self, partition: PartitionMeta) -> None:
         if partition.status != PartitionStatus.ACTIVE:
             return
-        if self.free_group_slots(partition) == 0:
+        if self._free_group_slots(partition) == 0:
             self.data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
 
     async def step(self) -> ComponentResult | None:
-        completed = await self.collect_finished_tasks()
-        submitted_groups = self.submit_prompt_group_tasks()
+        completed = await self._collect_finished_tasks()
+        submitted_groups = self._submit_prompt_group_tasks()
         if completed or submitted_groups:
             return ComponentResult(component='rollouter', kind='rollout', count=completed + submitted_groups)
         return None
@@ -716,19 +611,23 @@ class AdvantageWorker:
         advantages = [reward - mean_reward for reward in rewards]
         return advantages, rewards
 
-    def process_advantage_batch(self, context: LoraContext, *, batch_size: int | None = None) -> PartitionMeta:
-        batch_size = self.batch_size_for_context(context) if batch_size is None else batch_size
-        groups = self._select_ready_groups(context, max_groups=batch_size)
-        partition_id = groups[0].partition_id
+    def process_advantage_batch(
+        self,
+        context: LoraContext,
+        *,
+        partition_id: str,
+        groups: list[Any],
+    ) -> PartitionMeta:
+        if not groups:
+            raise ValueError('groups must not be empty')
         start = time.perf_counter()
-        batch = self.data_plane.claim_prompt_group_samples(
-            context=context,
-            partition_id=partition_id,
+        batch = self.data_plane.claim_prompt_groups(
+            groups,
             ready_status=PromptGroupStatus.ROLLOUT_DONE,
             claim_status=PromptGroupStatus.ADVANTAGING,
-            max_groups=len(groups),
             fields=['rewards'],
         )
+        sample_count = len(batch.keys)
         self.metrics_recorder.log_event(
             event='advantage_started',
             phase='advantage',
@@ -736,36 +635,12 @@ class AdvantageWorker:
             partition_id=partition_id,
             metrics={
                 'group_count': len(groups),
-                'sample_count': len(batch.keys),
+                'sample_count': sample_count,
             },
         )
         try:
-            columns = self.data_plane.read_batch_fields(batch, fields=['rewards'])
-            advantage_batch = GRPOAdvantageBatch(
-                rewards=columns['rewards'],
-                sample_keys=list(batch.keys),
-                generation_indices=[int(tag['generation_idx']) for tag in batch.tags],
-            )
-            advantages, returns = self.advantage_fn(advantage_batch, context)
-            sample_count = len(batch.keys)
-            if len(advantages) != sample_count or len(returns) != sample_count:
-                raise ValueError(f'advantage_fn returned {len(advantages)} advantages and {len(returns)} returns '
-                                 f'for {sample_count} samples')
-            self.data_plane.write_batch_fields(
-                batch,
-                fields=columns_to_tq_fields(
-                    {
-                        'advantages': advantages,
-                        'returns': returns,
-                    },
-                    sample_count,
-                ),
-            )
-            self.data_plane.mark_groups(
-                partition_id=partition_id,
-                group_ids=_group_ids(groups),
-                status=PromptGroupStatus.ADVANTAGE_DONE,
-            )
+            self._compute_advantages(context, batch)
+            self.data_plane.mark_prompt_groups(groups, PromptGroupStatus.ADVANTAGE_DONE)
             self.metrics_recorder.log_event(
                 event='advantage_done',
                 phase='advantage',
@@ -778,12 +653,7 @@ class AdvantageWorker:
                 },
             )
         except Exception as exc:
-            self.data_plane.mark_groups(
-                partition_id=partition_id,
-                group_ids=_group_ids(groups),
-                status=PromptGroupStatus.FAILED,
-                extra_tag={'error': str(exc)},
-            )
+            self.data_plane.mark_prompt_groups(groups, PromptGroupStatus.FAILED, extra_tag={'error': str(exc)})
             self.metrics_recorder.log_event(
                 event='advantage_failed',
                 phase='advantage',
@@ -799,64 +669,79 @@ class AdvantageWorker:
             raise
         return self.data_plane.get_rollout_partition(partition_id)
 
+    def _compute_advantages(self, context: LoraContext, batch: Any) -> Any:
+        columns = self.data_plane.read_batch_fields(batch, fields=['rewards'])
+        advantage_batch = GRPOAdvantageBatch(
+            rewards=columns['rewards'],
+            sample_keys=list(batch.keys),
+            generation_indices=[int(tag['generation_idx']) for tag in batch.tags],
+        )
+        advantages, returns = self.advantage_fn(advantage_batch, context)
+        sample_count = len(batch.keys)
+        if len(advantages) != sample_count or len(returns) != sample_count:
+            raise ValueError(f'advantage_fn returned {len(advantages)} advantages and {len(returns)} returns '
+                             f'for {sample_count} samples')
+        self.data_plane.write_batch_fields(
+            batch,
+            fields=columns_to_tq_fields(
+                {
+                    'advantages': advantages,
+                    'returns': returns,
+                },
+                sample_count,
+            ),
+        )
+        return batch
+
     def step(self) -> ComponentResult | None:
+        if self.lora_runtime_registry is None:
+            return None
+        count = 0
+        last_meta = None
         for context in self.contexts:
-            try:
-                meta = self.process_advantage_batch(context)
-                return ComponentResult(component='advantage_worker', kind='advantage', metadata=meta)
-            except LookupError:
-                continue
-        return None
+            max_groups = self.batch_size_for_context(context)
+            partition_ids = sorted(self.lora_runtime_registry.get(context).live_partitions)
+            for partition_id in partition_ids:
+                groups = self._select_advantage_groups(context, partition_id=partition_id, max_groups=max_groups)
+                if not groups:
+                    continue
+                last_meta = self.process_advantage_batch(context, partition_id=partition_id, groups=groups)
+                count += len(groups)
+        if last_meta is None:
+            return None
+        return ComponentResult(component='advantage_worker', kind='advantage', metadata=last_meta, count=count)
 
     def batch_size_for_context(self, context: LoraContext) -> int:
         return int(self.batch_size_by_context.get(context.key, self.batch_size))
 
     def is_idle(self) -> bool:
-        return not any(
-            self._select_ready_groups(context, max_groups=1, raise_on_empty=False)
-            for context in self.contexts)
+        if self.lora_runtime_registry is None:
+            return True
+        for context in self.contexts:
+            partition_ids = sorted(self.lora_runtime_registry.get(context).live_partitions)
+            max_groups = self.batch_size_for_context(context)
+            for partition_id in partition_ids:
+                if self._select_advantage_groups(context, partition_id=partition_id, max_groups=max_groups):
+                    return False
+        return True
 
     def shutdown(self) -> None:
         return None
 
-    def _select_ready_groups(
+    def _select_advantage_groups(
         self,
         context: LoraContext,
         *,
+        partition_id: str,
         max_groups: int,
-        raise_on_empty: bool = True,
     ) -> list[Any]:
-        groups = self._ready_groups_for_context(context)
-        if not groups:
-            if raise_on_empty:
-                raise LookupError(f'no advantage-ready group for {context.key}')
-            return []
-        partition_id = groups[0].partition_id
-        partition_groups = [group for group in groups if group.partition_id == partition_id]
-        return partition_groups[:max_groups]
-
-    def _ready_groups_for_context(self, context: LoraContext) -> list[Any]:
-        partition_ids = self._live_partition_ids(context)
-        if not partition_ids:
-            return self.data_plane.list_prompt_groups(context, statuses=[PromptGroupStatus.ROLLOUT_DONE])
-        groups = []
-        for partition_id in partition_ids:
-            groups.extend(
-                self.data_plane.list_prompt_groups(
-                    context,
-                    partition_id=partition_id,
-                    statuses=[PromptGroupStatus.ROLLOUT_DONE],
-                ))
-        return sorted(groups, key=lambda group: (group.created_at, group.partition_id, group.group_id))
-
-    def _live_partition_ids(self, context: LoraContext) -> list[str]:
-        if self.lora_runtime_registry is None:
-            return []
-        try:
-            runtime_state = self.lora_runtime_registry.get(context)
-        except KeyError:
-            return []
-        return sorted(runtime_state.live_partitions)
+        groups = self.data_plane.list_prompt_groups(
+            context,
+            partition_id=partition_id,
+            statuses=[PromptGroupStatus.ROLLOUT_DONE],
+        )
+        groups = sorted(groups, key=lambda group: (group.created_at, group.partition_id, group.group_id))
+        return groups[:max_groups]
 
 
 class TrainerScheduler:
@@ -940,12 +825,10 @@ class TrainerWorker:
                 partition.partition_id,
                 max_groups=self.train_batch_groups_for_context(context),
             )
-            batch = self.data_plane.claim_prompt_group_samples(
-                context=context,
-                partition_id=partition.partition_id,
+            batch = self.data_plane.claim_prompt_groups(
+                groups,
                 ready_status=PromptGroupStatus.ADVANTAGE_DONE,
                 claim_status=PromptGroupStatus.TRAINING,
-                max_groups=len(groups),
                 fields=['input_ids', 'labels', 'logprobs', 'advantages'],
             )
             current_policy_version = self.lora_runtime_registry.get(context).policy_version
@@ -963,13 +846,8 @@ class TrainerWorker:
                 },
             )
             result = self.train_batch_fn(context, batch)
-            claimed_group_ids = _group_ids(groups)
-            self.data_plane.mark_groups(
-                partition_id=partition.partition_id,
-                group_ids=claimed_group_ids,
-                status=PromptGroupStatus.TRAIN_DONE,
-            )
-            group_count = len(claimed_group_ids)
+            self.data_plane.mark_prompt_groups(groups, PromptGroupStatus.TRAIN_DONE)
+            group_count = len(groups)
             train_metrics = _metrics_from_result(result)
             self.metrics_recorder.log_event(
                 event='train_batch_done',
@@ -1035,12 +913,7 @@ class TrainerWorker:
             )
         except Exception as exc:
             if batch is not None:
-                self.data_plane.mark_groups(
-                    partition_id=partition.partition_id,
-                    group_ids=_group_ids(groups),
-                    status=PromptGroupStatus.FAILED,
-                    extra_tag={'error': str(exc)},
-                )
+                self.data_plane.mark_prompt_groups(groups, PromptGroupStatus.FAILED, extra_tag={'error': str(exc)})
                 self.metrics_recorder.log_event(
                     event='train_failed',
                     phase='train',

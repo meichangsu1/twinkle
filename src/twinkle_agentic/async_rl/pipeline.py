@@ -507,7 +507,7 @@ class BaseRLPipeline(ABC):
                         partition_id=partition.partition_id,
                     ))
         else:
-            groups = self.data_plane.list_prompt_groups()
+            groups = self.data_plane.list_all_prompt_groups()
         status_keys = {
             PromptGroupStatus.ROLLOUT_DONE: 'rollout_done_groups',
             PromptGroupStatus.ADVANTAGING: 'advantaging_groups',

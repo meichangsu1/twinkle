@@ -43,21 +43,19 @@ def parse_short_math_log(
     mode: str,
     adapter_name: str,
 ) -> list[dict[str, Any]]:
-    events = [
-        {
-            'ts': time.time(),
-            'elapsed_s': 0.0,
-            'run_id': run_id,
-            'mode': mode,
-            'seed': None,
-            'event': 'run_metadata',
-            'phase': 'run',
-            'adapter_name': adapter_name,
-            'metrics': {
-                'source': str(path),
-            },
-        }
-    ]
+    events = [{
+        'ts': time.time(),
+        'elapsed_s': 0.0,
+        'run_id': run_id,
+        'mode': mode,
+        'seed': None,
+        'event': 'run_metadata',
+        'phase': 'run',
+        'adapter_name': adapter_name,
+        'metrics': {
+            'source': str(path),
+        },
+    }]
     for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
         match = STEP_PATTERN.search(line)
         if match is None:

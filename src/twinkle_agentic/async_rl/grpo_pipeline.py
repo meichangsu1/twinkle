@@ -15,8 +15,9 @@ from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_loader import PromptLoader
 from .scheduling import (PreferCurrentTrainPolicy, WeightedFairRolloutPolicy, WeightedFairTrainPolicy,
                          WorkConservingRolloutPolicy)
+from .tq_utils import read_train_batch
 from .types import GRPOAdvantageBatch, LoraContext, RolloutOutput
-from .workers import TrainerStepResult, read_train_batch
+from .workers import TrainerStepResult
 
 logger = get_logger()
 
@@ -157,6 +158,9 @@ def async_rl_metrics_config(cfg) -> AsyncRLMetricsConfig | None:
         enable_jsonl=bool(metrics_cfg.get('enable_jsonl', True)),
         enable_swanlab=bool(metrics_cfg.get('enable_swanlab', False)),
         swanlab_project=str(metrics_cfg.get('swanlab_project', 'twinkle')),
+        swanlab_experiment_name=metrics_cfg.get('swanlab_experiment_name'),
+        swanlab_mode=str(metrics_cfg.get('swanlab_mode', 'local')),
+        swanlab_logdir=metrics_cfg.get('swanlab_logdir'),
         metadata=metadata,
     )
 

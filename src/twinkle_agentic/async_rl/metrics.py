@@ -22,6 +22,9 @@ class AsyncRLMetricsConfig:
     enable_jsonl: bool = True
     enable_swanlab: bool = False
     swanlab_project: str = 'twinkle'
+    swanlab_experiment_name: str | None = None
+    swanlab_mode: str = 'local'
+    swanlab_logdir: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -99,7 +102,15 @@ class SwanLabMetricsRecorder(AsyncRLMetricsRecorder):
             self._swanlab = None
             return
         self._swanlab = swanlab
-        self._swanlab.init(project=config.swanlab_project, config=_jsonable(config.metadata))
+        init_kwargs = {
+            'project': config.swanlab_project,
+            'experiment_name': config.swanlab_experiment_name or config.run_id,
+            'mode': config.swanlab_mode,
+            'config': _jsonable(config.metadata),
+        }
+        if config.swanlab_logdir:
+            init_kwargs['logdir'] = config.swanlab_logdir
+        self._swanlab.init(**init_kwargs)
 
     def log_event(
         self,
@@ -125,6 +136,10 @@ class SwanLabMetricsRecorder(AsyncRLMetricsRecorder):
         )
         self.step += 1
         self._swanlab.log(flatten_for_swanlab(payload), step=self.step)
+
+    def close(self) -> None:
+        if self._swanlab is not None and hasattr(self._swanlab, 'finish'):
+            self._swanlab.finish()
 
 
 class CompositeMetricsRecorder(AsyncRLMetricsRecorder):
@@ -286,6 +301,12 @@ def _swanlab_scalar(value: Any) -> int | float | None:
         return int(value)
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return value
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        return number if math.isfinite(number) else None
     return None
 
 
