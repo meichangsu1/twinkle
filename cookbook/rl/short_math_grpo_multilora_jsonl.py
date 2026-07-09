@@ -725,7 +725,9 @@ def build_eval_batches(contexts: List[LoraRunContext]) -> dict[str, list[list[An
             remote_group='model',
             instance_id=f'{SCRIPT_INSTANCE_ID}-{_safe_name(context.adapter_name)}-eval-',
         )
-        batches = [batch for batch in dataloader]
+        batches = []
+        for batch in dataloader:
+            batches.append(batch)
         batches_by_adapter[context.adapter_name] = batches
         logger.info(
             'Loaded validation batches for adapter=%s eval_dataset=%s batches=%s',
