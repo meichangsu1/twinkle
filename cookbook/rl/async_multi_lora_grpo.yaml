@@ -127,7 +127,6 @@ sampler:
     top_p: 0.95
 
 pipeline:
-  scheduler: concurrent
   max_steps: 1000
   max_staleness: 1
   default_rollout_batch_size: 4

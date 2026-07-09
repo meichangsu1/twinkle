@@ -116,7 +116,6 @@ pipeline:
   # One async partition contains 4 prompt groups * 8 generations = 32 samples.
   # With default_mini_batch_size=1, each partition produces 4 train_batch_done
   # events, matching short_math MAX_STEPS=100 when max_steps=25.
-  scheduler: concurrent
   max_steps: 25
   max_staleness: 0
   default_rollout_batch_size: 4

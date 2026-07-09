@@ -92,9 +92,12 @@ class PartitionMeta:
     def tag(self) -> dict[str, Any]:
         tag = self.context.metadata()
         tag.update({
+            'record_type': 'partition',
             'partition_id': self.partition_id,
             'target_groups': self.target_groups,
             'partition_status': self.status.value,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at,
         })
         return tag
 

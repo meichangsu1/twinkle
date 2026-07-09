@@ -1,5 +1,6 @@
 import asyncio
 import json
+from uuid import UUID
 
 import pytest
 from omegaconf import OmegaConf
@@ -94,6 +95,18 @@ def batch_group_ids(batch):
             seen.add(group_id)
             group_ids.append(group_id)
     return group_ids
+
+
+def mark_batch_group_ids(data_plane, batch, status):
+    data_plane.mark_groups(
+        partition_id=batch.partition_id,
+        group_ids=batch_group_ids(batch),
+        status=status,
+    )
+
+
+def assert_uuid(value):
+    UUID(str(value))
 
 
 def complete_prompt_group(data_plane, context, partition, sample, *, policy_version=0, adapter_path=None):
@@ -255,15 +268,16 @@ def test_data_plane_rollout_reward_advantage_and_clear():
     assert meta.status == PartitionStatus.CLOSED
     group = data_plane.list_prompt_groups(context)[0]
     assert group.status == PromptGroupStatus.ROLLOUT_DONE
-    assert group.sample_keys == ['samples/group_0/0']
+    assert_uuid(group.group_id)
+    assert group.sample_keys == [f'samples/{group.group_id}/0']
     tags = data_plane.tq.kv_list(partition_id=partition.partition_id)[partition.partition_id]
-    assert set(tags) == {'__partition__', 'groups/group_0', 'samples/group_0/0'}
+    assert set(tags) == {'__partition__', f'groups/{group.group_id}', f'samples/{group.group_id}/0'}
     assert tags['__partition__']['partition_status'] == PartitionStatus.CLOSED.value
     group_tag = tags[group.key]
     assert group_tag['sample_keys'] == group.sample_keys
-    sample_tag = tags['samples/group_0/0']
+    sample_tag = tags[f'samples/{group.group_id}/0']
     assert sample_tag['sample_status'] == 'success'
-    assert sample_tag['group_id'] == 'group_0'
+    assert sample_tag['group_id'] == group.group_id
     assert sample_tag['generation_idx'] == 0
     assert 'group_status' not in sample_tag
     assert 'partition_status' not in sample_tag
@@ -274,7 +288,7 @@ def test_data_plane_rollout_reward_advantage_and_clear():
     assert data_plane.list_prompt_groups(context)[0].status == PromptGroupStatus.ADVANTAGE_DONE
 
     data_plane.clear_partition(context, partition.partition_id)
-    assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
+    assert data_plane.list_partitions(context) == []
 
 
 def test_data_plane_group_claim_consumption_is_exclusive():
@@ -390,7 +404,7 @@ def test_staleness_blocks_next_partition_by_live_group_version():
     )
 
 
-def test_strict_rollouter_blocks_new_partition_until_live_groups_finish():
+def test_strict_rollouter_blocks_new_partition_until_live_partition_finishes():
     context = make_context('a')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     registry = LoraRuntimeRegistry()
@@ -407,7 +421,6 @@ def test_strict_rollouter_blocks_new_partition_until_live_groups_finish():
 
     assert not rollouter.can_create_next_rollout_partition(context, current_policy_version=0)
 
-    data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.TRAIN_DONE)
     data_plane.update_partition_status(partition.partition_id, PartitionStatus.TRAIN_DONE)
 
     assert rollouter.can_create_next_rollout_partition(context, current_policy_version=1)
@@ -473,7 +486,10 @@ def test_data_plane_prompt_group_records_are_partition_scoped():
     data_plane.create_prompt_group(context, partition, runtime_state=make_runtime_state(context))
 
     groups = data_plane.list_prompt_groups(context, partition_id=partition.partition_id)
-    assert [group.group_id for group in groups] == ['group_0', 'group_1']
+    assert len(groups) == 2
+    assert len({group.group_id for group in groups}) == 2
+    for group in groups:
+        assert_uuid(group.group_id)
 
 
 def test_data_plane_allows_mixed_policy_versions_inside_active_partition():
@@ -501,7 +517,7 @@ def test_data_plane_allows_mixed_policy_versions_inside_active_partition():
         claim_status=PromptGroupStatus.ADVANTAGING,
         max_groups=2,
     )
-    assert batch_group_ids(batch) == ['group_0', 'group_1']
+    assert batch_group_ids(batch) == [g0.group_id, g1.group_id]
     assert [tag['rollout_policy_version'] for tag in batch.tags] == [0, 1]
     assert len(batch.keys) == 2
     data_plane.write_batch_fields(
@@ -510,7 +526,7 @@ def test_data_plane_allows_mixed_policy_versions_inside_active_partition():
     )
 
 
-def test_mark_batch_groups_writes_group_tags_in_one_batch():
+def test_mark_groups_writes_group_tags_in_one_batch():
     context = make_context('lora')
     tq_client = FakeTransferQueueClient()
     data_plane = TransferQueueDataPlane(tq_client=tq_client)
@@ -527,12 +543,12 @@ def test_mark_batch_groups_writes_group_tags_in_one_batch():
     )
     tq_client.kv_batch_put_calls.clear()
 
-    data_plane.mark_batch_groups(batch, PromptGroupStatus.ADVANTAGE_DONE)
+    mark_batch_group_ids(data_plane, batch, PromptGroupStatus.ADVANTAGE_DONE)
 
     assert len(tq_client.kv_batch_put_calls) == 1
     call = tq_client.kv_batch_put_calls[0]
     assert call['partition_id'] == partition.partition_id
-    assert call['keys'] == ['groups/group_0', 'groups/group_1']
+    assert call['keys'] == [f'groups/{group_id}' for group_id in batch_group_ids(batch)]
     assert call['has_tags'] is True
     assert call['has_fields'] is False
     assert [group.status for group in data_plane.list_prompt_groups(context)] == [
@@ -558,7 +574,7 @@ def test_data_plane_builds_transformers_train_batch_without_sample_rows():
         adv_batch,
         {'advantages': [0.25], 'returns': [1.0]},
     )
-    data_plane.mark_batch_groups(adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
+    mark_batch_group_ids(data_plane, adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
     train_batch_meta = data_plane.claim_prompt_group_samples(
         context=context,
         partition_id=partition.partition_id,
@@ -600,7 +616,7 @@ def test_data_plane_does_not_feed_scalar_length_to_trainer_inputs():
         adv_batch,
         {'advantages': [0.25], 'returns': [1.0]},
     )
-    data_plane.mark_batch_groups(adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
+    mark_batch_group_ids(data_plane, adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
     train_batch_meta = data_plane.claim_prompt_group_samples(
         context=context,
         partition_id=partition.partition_id,
@@ -633,7 +649,7 @@ def test_data_plane_train_batch_requires_encoded_input_feature_fields():
         adv_batch,
         {'advantages': [0.0], 'returns': [0.0]},
     )
-    data_plane.mark_batch_groups(adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
+    mark_batch_group_ids(data_plane, adv_batch, PromptGroupStatus.ADVANTAGE_DONE)
     train_batch_meta = data_plane.claim_prompt_group_samples(
         context=context,
         partition_id=partition.partition_id,
@@ -827,7 +843,9 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     def train_fn(ctx, batch):
         assert ctx == context
         assert len(batch.keys) == 1
-        assert batch_group_ids(batch) == ['group_0']
+        group_ids = batch_group_ids(batch)
+        assert len(group_ids) == 1
+        assert_uuid(group_ids[0])
         assert trainer.read_train_batch(batch).sample_count == 1
         return {'adapter_path': '/tmp/adapter-lora-v1'}
 
@@ -844,7 +862,7 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     assert trainer.train_next_batch() is None
     assert received[0].policy_version == 1
     assert received[0].adapter_path == '/tmp/adapter-lora-v1'
-    assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
+    assert data_plane.list_partitions(context) == []
     assert registry.get(context).live_partitions == set()
 
 
@@ -859,6 +877,14 @@ def test_trainer_trains_group_batches_and_syncs_only_when_partition_done():
     complete_prompt_group(data_plane, context, partition, make_sample(2))
     complete_prompt_group(data_plane, context, partition, make_sample(3))
     AdvantageWorker(data_plane=data_plane, contexts=[context], batch_size=4).step()
+    expected_group_ids = [
+        group.group_id
+        for group in data_plane.list_prompt_groups(
+            context,
+            partition_id=partition.partition_id,
+            statuses=[PromptGroupStatus.ADVANTAGE_DONE],
+        )
+    ]
 
     train_batches = []
     received = []
@@ -886,8 +912,8 @@ def test_trainer_trains_group_batches_and_syncs_only_when_partition_done():
     assert second.kind == 'train'
     assert received[0].policy_version == 1
     assert received[0].adapter_path == '/tmp/lora-v1'
-    assert train_batches == [['group_0', 'group_1'], ['group_2', 'group_3']]
-    assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
+    assert train_batches == [expected_group_ids[:2], expected_group_ids[2:]]
+    assert data_plane.list_partitions(context) == []
 
 
 def test_trainer_mini_batch_size_is_context_level():
@@ -912,13 +938,15 @@ def test_trainer_mini_batch_size_is_context_level():
         max_groups=1,
     )
     data_plane.write_batch_fields(adv_batch_b, {'advantages': [0.0], 'returns': [0.0]})
-    data_plane.mark_batch_groups(adv_batch_b, PromptGroupStatus.ADVANTAGE_DONE)
+    mark_batch_group_ids(data_plane, adv_batch_b, PromptGroupStatus.ADVANTAGE_DONE)
 
     trained_contexts = []
 
     def train_fn(ctx, batch):
         trained_contexts.append(ctx.key)
-        assert batch_group_ids(batch) == ['group_0']
+        group_ids = batch_group_ids(batch)
+        assert len(group_ids) == 1
+        assert_uuid(group_ids[0])
         return {'adapter_path': f'/tmp/{ctx.adapter_name}-v1'}
 
     trainer = TrainerWorker(
@@ -1055,8 +1083,14 @@ def test_prompt_loader_is_pipeline_source_component():
     )
     loader = PromptLoader(context=context, dataloader=[[make_sample(0)]], rollouter=rollouter)
 
-    result = loader.step()
+    assert loader.step() is None
+    result = None
+    for _ in range(20):
+        result = loader.step()
+        if result is not None:
+            break
 
+    assert result is not None
     assert result.component == 'prompt_loader'
     assert result.kind == 'prompt'
     assert result.count == 1

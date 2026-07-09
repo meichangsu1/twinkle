@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -40,9 +40,6 @@ class TransferQueueDataPlane:
         self.tq_config = tq_config or TransferQueueRuntimeConfig()
         self.tq = tq_client or self._init_transfer_queue(self.tq_config)
         self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
-        self._partitions: dict[str, PartitionMeta] = {}
-        self._prompt_groups: dict[str, dict[str, PromptGroupMeta]] = defaultdict(dict)
-        self._next_train_id: dict[str, int] = defaultdict(int)
         self._lock = threading.RLock()
 
     def _init_transfer_queue(self, config: TransferQueueRuntimeConfig):
@@ -77,20 +74,19 @@ class TransferQueueDataPlane:
         )
 
     def _next_partition_id(self, context: LoraContext) -> str:
-        with self._lock:
-            train_id = self._next_train_id[context.key]
-            while context.partition_id(train_id) in self._partitions:
-                train_id += 1
-            self._next_train_id[context.key] = train_id + 1
-            return context.partition_id(train_id)
+        return context.partition_id(self.peek_next_train_id(context))
 
     def peek_next_train_id(self, context: LoraContext) -> int:
-        with self._lock:
-            self._load_metadata()
-            train_id = self._next_train_id[context.key]
-            while context.partition_id(train_id) in self._partitions:
-                train_id += 1
-            return train_id
+        next_train_id = 0
+        for partition in self.list_partitions(context):
+            suffix = partition.partition_id.rsplit('/', 1)[-1]
+            if not suffix.startswith('train_'):
+                continue
+            try:
+                next_train_id = max(next_train_id, int(suffix[len('train_'):]) + 1)
+            except ValueError:
+                continue
+        return next_train_id
 
     def create_rollout_partition(
         self,
@@ -100,9 +96,9 @@ class TransferQueueDataPlane:
         partition_id: str | None = None,
     ) -> PartitionMeta:
         with self._lock:
-            self._load_metadata()
             partition_id = partition_id or self._next_partition_id(context)
-            existing = self._partitions.get(partition_id)
+            partition_tag = self._list_partition_tags(partition_id).get(PARTITION_KEY, {})
+            existing = self._partition_from_tag(partition_id, partition_tag)
             if existing is not None:
                 raise ValueError(f'partition already exists: {partition_id}')
             partition = PartitionMeta(
@@ -110,16 +106,12 @@ class TransferQueueDataPlane:
                 partition_id=partition_id,
                 target_groups=target_groups,
             )
-            self._partitions[partition_id] = partition
             self._put_partition_tag(partition)
         return partition
 
     def update_partition_status(self, partition_id: str, status: PartitionStatus) -> PartitionMeta:
         with self._lock:
-            self._load_metadata()
-            partition = self._partitions.get(partition_id)
-            if partition is None:
-                raise KeyError(f'unknown partition: {partition_id}')
+            partition = self.get_rollout_partition(partition_id)
             partition.status = status
             partition.touch()
             self._put_partition_tag(partition)
@@ -133,14 +125,11 @@ class TransferQueueDataPlane:
         runtime_state: LoraRuntimeState,
     ) -> PromptGroupRef:
         with self._lock:
-            self._load_metadata()
-            stored_partition = self._partitions.get(partition.partition_id)
-            if stored_partition is None:
-                raise KeyError(f'unknown partition: {partition.partition_id}')
+            stored_partition = self.get_rollout_partition(partition.partition_id)
             if stored_partition.context.key != context.key:
                 raise ValueError(
                     f'partition {partition.partition_id} belongs to {stored_partition.context.key}, not {context.key}')
-            group_id = self._next_group_id(stored_partition)
+            group_id = str(uuid.uuid4())
             group = PromptGroupMeta(
                 context=context,
                 partition_id=stored_partition.partition_id,
@@ -150,25 +139,22 @@ class TransferQueueDataPlane:
                 num_samples=0,
                 status=PromptGroupStatus.PENDING,
             )
-            self._prompt_groups[stored_partition.partition_id][group_id] = group
             self._put_group_tag(group)
             return PromptGroupRef(partition_id=stored_partition.partition_id, group_id=group_id)
 
     def get_prompt_group(self, group_ref: PromptGroupRef) -> PromptGroupMeta:
-        with self._lock:
-            self._load_metadata()
-            group = self._prompt_groups.get(group_ref.partition_id, {}).get(group_ref.group_id)
-            if group is None:
-                raise KeyError(f'unknown prompt group: {group_ref.partition_id}/{group_ref.group_id}')
-            return group
+        tags_by_key = self._list_partition_tags(group_ref.partition_id)
+        group = self._prompt_group_from_tag(tags_by_key.get(group_ref.key, {}))
+        if group is None:
+            raise KeyError(f'unknown prompt group: {group_ref.partition_id}/{group_ref.group_id}')
+        return group
 
     def get_rollout_partition(self, partition_id: str) -> PartitionMeta:
-        with self._lock:
-            self._load_metadata()
-            partition = self._partitions.get(partition_id)
-            if partition is None:
-                raise KeyError(f'unknown partition: {partition_id}')
-            return partition
+        partition_tag = self._list_partition_tags(partition_id).get(PARTITION_KEY, {})
+        partition = self._partition_from_tag(partition_id, partition_tag)
+        if partition is None:
+            raise KeyError(f'unknown partition: {partition_id}')
+        return partition
 
     def update_prompt_group_status(
         self,
@@ -217,15 +203,18 @@ class TransferQueueDataPlane:
         *,
         statuses: Iterable[PartitionStatus] | None = None,
     ) -> list[PartitionMeta]:
-        with self._lock:
-            self._load_metadata()
-            status_set = set(statuses) if statuses is not None else None
-            partitions = list(self._partitions.values())
-            if context is not None:
-                partitions = [p for p in partitions if p.context.key == context.key]
-            if status_set is not None:
-                partitions = [p for p in partitions if p.status in status_set]
-            return sorted(partitions, key=lambda p: (p.created_at, p.partition_id))
+        status_set = set(statuses) if statuses is not None else None
+        partitions = []
+        for partition_id, tags_by_key in self._list_all_tags().items():
+            partition = self._partition_from_tag(partition_id, tags_by_key.get(PARTITION_KEY, {}))
+            if partition is None:
+                continue
+            if context is not None and partition.context.key != context.key:
+                continue
+            if status_set is not None and partition.status not in status_set:
+                continue
+            partitions.append(partition)
+        return sorted(partitions, key=lambda p: (p.created_at, p.partition_id))
 
     def read_batch_fields(self, batch: Any, fields: list[str] | str | None = None) -> Any:
         start = time.perf_counter()
@@ -261,18 +250,9 @@ class TransferQueueDataPlane:
         if max_groups <= 0:
             raise ValueError(f'max_groups must be positive, got {max_groups}')
         with self._lock:
-            self._load_metadata()
-            start = time.perf_counter()
-            tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
-            self._record_tq_event(
-                'kv_list',
-                start,
-                context=context,
-                partition_id=partition_id,
-                metrics={'keys': len(tags_by_key)},
-            )
+            tags_by_key = self._list_partition_tags(partition_id, context=context)
             groups = [
-                group for group in self._prompt_groups.get(partition_id, {}).values()
+                group for group in self._groups_from_tags(tags_by_key.values())
                 if group.context.key == context.key and group.status == ready_status
             ]
             groups = sorted(groups, key=lambda group: (group.created_at, group.partition_id, group.group_id))
@@ -314,18 +294,22 @@ class TransferQueueDataPlane:
             self._put_group_tags(selected_groups)
             return batch
 
-    def mark_batch_groups(self, batch: Any, status: PromptGroupStatus, *, extra_tag: dict[str, Any] | None = None):
-        group_ids = self._group_ids_from_sample_tags(getattr(batch, 'tags', None) or [])
+    def mark_groups(
+        self,
+        *,
+        partition_id: str,
+        group_ids: Iterable[str],
+        status: PromptGroupStatus,
+        extra_tag: dict[str, Any] | None = None,
+    ) -> None:
+        group_ids = [str(group_id) for group_id in group_ids]
         if not group_ids:
-            raise ValueError('prompt-group batch tags missing group_id')
-        partition_id = getattr(batch, 'partition_id', None)
-        if not partition_id:
-            raise ValueError('prompt-group batch missing partition_id')
+            raise ValueError('group_ids must not be empty')
         with self._lock:
-            self._load_metadata()
+            tags_by_key = self._list_partition_tags(partition_id)
             groups = []
             for group_id in group_ids:
-                group = self._prompt_groups.get(partition_id, {}).get(str(group_id))
+                group = self._prompt_group_from_tag(tags_by_key.get(f'groups/{group_id}', {}))
                 if group is None:
                     raise KeyError(f'unknown prompt group: {partition_id}/{group_id}')
                 group.status = status
@@ -333,35 +317,13 @@ class TransferQueueDataPlane:
                 groups.append(group)
             self._put_group_tags(groups, extra_tag=extra_tag)
 
-    @staticmethod
-    def _group_ids_from_sample_tags(tags: Iterable[dict[str, Any]]) -> list[str]:
-        group_ids: list[str] = []
-        seen: set[str] = set()
-        for tag in tags:
-            group_id = tag.get('group_id') if isinstance(tag, dict) else None
-            if group_id is None:
-                raise ValueError('prompt-group batch sample tag missing group_id')
-            group_id = str(group_id)
-            if group_id not in seen:
-                seen.add(group_id)
-                group_ids.append(group_id)
-        return group_ids
-
     def clear_partition(self, context: LoraContext, partition_id: str) -> None:
         with self._lock:
-            self._load_metadata()
-            partition = self._partitions.get(partition_id)
+            tags_by_key = self._list_partition_tags(partition_id, context=context)
+            partition = self._partition_from_tag(partition_id, tags_by_key.get(PARTITION_KEY, {}))
             if partition is not None and partition.context.key != context.key:
                 raise ValueError(f'partition {partition_id} belongs to {partition.context.key}, not {context.key}')
-            start = time.perf_counter()
-            keys = list(self.tq.kv_list(partition_id=partition_id).get(partition_id, {}))
-            self._record_tq_event(
-                'kv_list',
-                start,
-                context=context,
-                partition_id=partition_id,
-                metrics={'keys': len(keys)},
-            )
+            keys = list(tags_by_key)
             if keys:
                 start = time.perf_counter()
                 self.tq.kv_clear(keys=keys, partition_id=partition_id)
@@ -372,10 +334,6 @@ class TransferQueueDataPlane:
                     partition_id=partition_id,
                     metrics={'cleared_keys': len(keys)},
                 )
-            if partition is not None:
-                partition.status = PartitionStatus.CLEARED
-                partition.touch()
-            self._prompt_groups.pop(partition_id, None)
 
     def list_prompt_groups(
         self,
@@ -384,18 +342,20 @@ class TransferQueueDataPlane:
         partition_id: str | None = None,
         statuses: Iterable[PromptGroupStatus] | None = None,
     ) -> list[PromptGroupMeta]:
-        with self._lock:
-            self._load_metadata()
-            status_set = set(statuses) if statuses is not None else None
-            groups = []
-            partition_ids = [partition_id] if partition_id is not None else list(self._prompt_groups)
-            for pid in partition_ids:
-                groups.extend(self._prompt_groups.get(pid, {}).values())
-            if context is not None:
-                groups = [group for group in groups if group.context.key == context.key]
-            if status_set is not None:
-                groups = [group for group in groups if group.status in status_set]
-            return sorted(groups, key=lambda group: (group.created_at, group.partition_id, group.group_id))
+        status_set = set(statuses) if statuses is not None else None
+        groups = []
+        if partition_id is not None:
+            tags_by_partition = {partition_id: self._list_partition_tags(partition_id, context=context)}
+        else:
+            tags_by_partition = self._list_all_tags()
+        for tags_by_key in tags_by_partition.values():
+            for group in self._groups_from_tags(tags_by_key.values()):
+                if context is not None and group.context.key != context.key:
+                    continue
+                if status_set is not None and group.status not in status_set:
+                    continue
+                groups.append(group)
+        return sorted(groups, key=lambda group: (group.created_at, group.partition_id, group.group_id))
 
     def _put_partition_tag(self, partition: PartitionMeta) -> None:
         tag = dict(partition.tag())
@@ -426,7 +386,6 @@ class TransferQueueDataPlane:
             tag = dict(group.tag())
             if extra_tag:
                 tag.update(extra_tag)
-            self._prompt_groups[group.partition_id][group.group_id] = group
             keys.append(group.key)
             tags.append(tag)
         start = time.perf_counter()
@@ -439,30 +398,39 @@ class TransferQueueDataPlane:
             metrics={'write_group_tags': len(keys)},
         )
 
-    def _next_group_id(self, partition: PartitionMeta) -> str:
-        with self._lock:
-            groups = list(self._prompt_groups.get(partition.partition_id, {}).values())
-            used = {group.group_id for group in groups}
-            index = len(groups)
-            while f'group_{index}' in used:
-                index += 1
-            return f'group_{index}'
-
-    def _load_metadata(self) -> None:
+    def _list_all_tags(self) -> dict[str, dict[str, dict[str, Any]]]:
         start = time.perf_counter()
         all_tags = self.tq.kv_list()
         self._record_tq_event('kv_list', start, metrics={'partitions': len(all_tags)})
-        for partition_id, tags_by_key in all_tags.items():
-            partition_tag = tags_by_key.get(PARTITION_KEY)
-            partition = self._partition_from_tag(partition_id, partition_tag or {})
-            if partition is not None:
-                self._partitions[partition_id] = partition
-            for group_tag in tags_by_key.values():
-                if group_tag.get('record_type') != 'group':
-                    continue
-                group = self._prompt_group_from_tag(group_tag)
-                if group is not None:
-                    self._prompt_groups[partition_id][group.group_id] = group
+        return all_tags
+
+    def _list_partition_tags(
+        self,
+        partition_id: str,
+        *,
+        context: LoraContext | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        start = time.perf_counter()
+        tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        self._record_tq_event(
+            'kv_list',
+            start,
+            context=context,
+            partition_id=partition_id,
+            metrics={'keys': len(tags_by_key)},
+        )
+        return tags_by_key
+
+    @staticmethod
+    def _groups_from_tags(tags: Iterable[dict[str, Any]]) -> list[PromptGroupMeta]:
+        groups = []
+        for tag in tags:
+            if tag.get('record_type') != 'group':
+                continue
+            group = TransferQueueDataPlane._prompt_group_from_tag(tag)
+            if group is not None:
+                groups.append(group)
+        return groups
 
     @staticmethod
     def _partition_from_tag(partition_id: str, tag: dict[str, Any]) -> PartitionMeta | None:
@@ -482,6 +450,8 @@ class TransferQueueDataPlane:
                 partition_id=partition_id,
                 target_groups=int(tag.get('target_groups', 0)),
                 status=PartitionStatus(tag.get('partition_status', tag.get('status', PartitionStatus.ACTIVE.value))),
+                created_at=float(tag.get('created_at', 0.0)) or 0.0,
+                updated_at=float(tag.get('updated_at', 0.0)) or 0.0,
             )
         except (KeyError, ValueError):
             return None

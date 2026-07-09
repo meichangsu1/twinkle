@@ -125,7 +125,7 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
     assert model.save_calls[0]['is_sampler'] is True
     assert received[0].policy_version == 1
     assert received[0].adapter_path == '/tmp/lora_a-v1'
-    assert pipeline.data_plane.list_partitions(pipeline.context)[0].status == PartitionStatus.CLEARED
+    assert pipeline.data_plane.list_partitions(pipeline.context) == []
 
 
 def test_base_pipeline_uses_latest_adapter_path_for_next_rollout():
@@ -196,10 +196,8 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
     assert {call['adapter_name'] for call in model.step_calls} == {'lora_a', 'lora_b'}
     assert {call['adapter_name'] for call in model.save_calls} == {'lora_a', 'lora_b'}
     assert {context.adapter_name for context in received} == {'lora_a', 'lora_b'}
-    assert all(
-        partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_a))
-    assert all(
-        partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_b))
+    assert pipeline.data_plane.list_partitions(context_a) == []
+    assert pipeline.data_plane.list_partitions(context_b) == []
 
 
 def test_base_pipeline_feeds_prompts_from_prompt_loaders():
