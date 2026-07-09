@@ -402,10 +402,12 @@ def _processor_from_config(processor_cfg: dict[str, Any], *, default_cls: str) -
 
 
 def _dataset_format(dataset_cfg: dict[str, Any], dataset_id: str) -> str:
+    suffix = Path(dataset_id).suffix.lower().lstrip('.')
+    if suffix in {'json', 'jsonl'}:
+        return suffix
     configured = dataset_cfg.get('format') or dataset_cfg.get('file_type')
     if configured:
         return str(configured).lower().lstrip('.')
-    suffix = Path(dataset_id).suffix.lower().lstrip('.')
     if suffix:
         return suffix
     return ''
@@ -436,9 +438,11 @@ def _local_json_dataset_path(dataset_id: str, dataset_cfg: dict[str, Any]) -> Pa
     dataset_format = _dataset_format(dataset_cfg, dataset_id)
     if path.is_file() and dataset_format in {'json', 'jsonl'}:
         return path
-    if path.is_dir() and dataset_format in {'json', 'jsonl'}:
+    if path.is_dir() and dataset_format not in {'parquet', 'csv', 'arrow'}:
         split = str(dataset_cfg.get('split', 'train'))
-        for suffix in (dataset_format, 'jsonl', 'json'):
+        suffixes = [dataset_format] if dataset_format in {'json', 'jsonl'} else []
+        suffixes.extend(['jsonl', 'json'])
+        for suffix in suffixes:
             candidate = path / f'{split}.{suffix}'
             if candidate.exists():
                 return candidate
@@ -957,6 +961,15 @@ def main():
     args = parser.parse_args()
     config = load_yaml_config(args.config)
     contexts = build_lora_contexts(config)
+    logger.info('Loaded sync multi-LoRA config: %s', args.config or '<defaults>')
+    logger.info('Configured LoRA contexts: %s', [
+        {
+            'adapter_name': context.adapter_name,
+            'dataset': context.dataset_name,
+            'eval_dataset': context.eval_dataset_name,
+        }
+        for context in contexts
+    ])
     metrics_writer = JSONLMetricsWriter(METRICS_JSONL, run_id=RUN_ID, mode=MODE)
     metrics_writer.write_metadata(contexts)
     try:
