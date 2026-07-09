@@ -333,6 +333,9 @@ def _safe_name(value: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', value)
 
 
+SCRIPT_INSTANCE_ID = f'{_safe_name(RUN_ID)}-{os.getpid()}'
+
+
 def _adapter_path_from_save_result(save_result: Any) -> str | None:
     if isinstance(save_result, str):
         return save_result
@@ -720,6 +723,7 @@ def build_eval_batches(contexts: List[LoraRunContext]) -> dict[str, list[list[An
             batch_size=EVAL_BATCH_SIZE,
             min_batch_size=1,
             remote_group='model',
+            instance_id=f'{SCRIPT_INSTANCE_ID}-{_safe_name(context.adapter_name)}-eval-',
         )
         batches = [batch for batch in dataloader]
         batches_by_adapter[context.adapter_name] = batches
@@ -945,6 +949,7 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
                 min_batch_size=global_batch_size,
                 device_mesh=model_mesh,
                 remote_group='model',
+                instance_id=f'{SCRIPT_INSTANCE_ID}-{_safe_name(context.adapter_name)}-train-',
             ))
         for context in contexts
     }
