@@ -47,4 +47,4 @@ lora_contexts:
       data_num: 128
       max_length: 4096
       processor:
-        cls: AIMEProcessor
+        cls: DAPOMathProcessor

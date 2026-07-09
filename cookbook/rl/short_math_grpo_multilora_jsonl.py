@@ -125,6 +125,7 @@ class LoraRunContext:
     dataset_factory: Callable[[], Dataset]
     eval_dataset_name: str | None
     eval_dataset_factory: Callable[[], Dataset] | None
+    eval_data_num: int
     accuracy_reward: Reward
     brevity_reward: Reward
     policy_version: int = 0
@@ -180,6 +181,10 @@ class JSONLMetricsWriter:
                 },
                 'eval_datasets': {
                     context.adapter_name: context.eval_dataset_name
+                    for context in contexts
+                },
+                'eval_data_nums': {
+                    context.adapter_name: context.eval_data_num or None
                     for context in contexts
                 },
                 'lora_rank': LORA_RANK,
@@ -676,12 +681,14 @@ def _lora_context_from_config(context_cfg: dict[str, Any]) -> LoraRunContext:
     dataset_name = str(dataset_cfg.get('name') or context_cfg.get('dataset_name') or reward_type)
     eval_dataset_name = None
     eval_dataset_factory = None
+    eval_data_num = 0
     if eval_dataset_cfg:
         eval_dataset_name = str(
             eval_dataset_cfg.get('name')
             or f'{eval_dataset_cfg.get("dataset_id")}:{eval_dataset_cfg.get("split", "train")}')
         eval_processor_cfg = _cfg_dict(eval_dataset_cfg.get('processor'))
         eval_default_processor = str(eval_processor_cfg.get('cls') or default_processor_cls)
+        eval_data_num = _cfg_int(eval_dataset_cfg, 'data_num', 0)
         eval_dataset_factory = _dataset_factory_from_config(
             eval_dataset_cfg,
             default_processor_cls=eval_default_processor,
@@ -695,6 +702,7 @@ def _lora_context_from_config(context_cfg: dict[str, Any]) -> LoraRunContext:
         dataset_factory=_dataset_factory_from_config(dataset_cfg, default_processor_cls=default_processor_cls),
         eval_dataset_name=eval_dataset_name,
         eval_dataset_factory=eval_dataset_factory,
+        eval_data_num=eval_data_num,
         accuracy_reward=accuracy_reward,
         brevity_reward=brevity_reward,
     )
@@ -719,6 +727,7 @@ def build_lora_contexts(config: dict[str, Any] | None = None) -> List[LoraRunCon
             dataset_factory=create_gsm8k_dataset,
             eval_dataset_name=f'gsm8k/{GSM8K_EVAL_SPLIT}',
             eval_dataset_factory=create_gsm8k_eval_dataset,
+            eval_data_num=GSM8K_EVAL_DATA_NUM,
             accuracy_reward=GSM8KAccuracyReward(),
             brevity_reward=GSM8KBrevityReward(),
         ),
@@ -730,6 +739,7 @@ def build_lora_contexts(config: dict[str, Any] | None = None) -> List[LoraRunCon
             dataset_factory=create_dapo_math_dataset,
             eval_dataset_name=f'{DAPO_EVAL_DATASET_ID or "none"}:{DAPO_EVAL_SPLIT}:{DAPO_EVAL_FORMAT}',
             eval_dataset_factory=create_dapo_math_eval_dataset if DAPO_EVAL_DATASET_ID else None,
+            eval_data_num=DAPO_EVAL_DATA_NUM,
             accuracy_reward=DAPOMathAccuracyReward(),
             brevity_reward=GSM8KBrevityReward(),
         ),
@@ -777,9 +787,11 @@ def build_eval_batches(contexts: List[LoraRunContext]) -> dict[str, list[list[An
                         context.adapter_name, context.dataset_name)
             continue
         dataset = context.eval_dataset_factory()
+        dataset_len = len(dataset)
+        max_prompts = min(context.eval_data_num, dataset_len) if context.eval_data_num > 0 else dataset_len
         batches = []
         batch = []
-        for index in range(len(dataset)):
+        for index in range(max_prompts):
             batch.append(dataset[index])
             if len(batch) == EVAL_BATCH_SIZE:
                 batches.append(batch)
@@ -788,9 +800,11 @@ def build_eval_batches(contexts: List[LoraRunContext]) -> dict[str, list[list[An
             batches.append(batch)
         batches_by_adapter[context.adapter_name] = batches
         logger.info(
-            'Loaded validation batches for adapter=%s eval_dataset=%s batches=%s',
+            'Loaded validation batches for adapter=%s eval_dataset=%s dataset_len=%s max_prompts=%s batches=%s',
             context.adapter_name,
             context.eval_dataset_name,
+            dataset_len,
+            max_prompts,
             len(batches),
         )
     return batches_by_adapter
@@ -967,6 +981,7 @@ def main():
             'adapter_name': context.adapter_name,
             'dataset': context.dataset_name,
             'eval_dataset': context.eval_dataset_name,
+            'eval_data_num': context.eval_data_num or None,
         }
         for context in contexts
     ])

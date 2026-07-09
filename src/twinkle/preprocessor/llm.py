@@ -209,9 +209,10 @@ class AIMEProcessor(Preprocessor):
     """Preprocessor for original AIME rows.
 
     Expected fields:
+      ID: problem id
       Problem: math problem text
+      Solution: optional reference solution
       Answer: final answer
-      ID / Solution: optional metadata
     """
     prompt_template = (
         'Solve the following math problem step by step. The last line of your response should be of the form '
@@ -225,6 +226,11 @@ class AIMEProcessor(Preprocessor):
         return self.map_row_to_col(rows)
 
     def preprocess(self, row) -> Trajectory:
+        missing = [field for field in ('ID', 'Problem', 'Answer') if row.get(field) is None]
+        if missing:
+            keys = sorted(str(key) for key in row.keys())
+            raise KeyError(f'AIMEProcessor expected ID/Problem/Answer fields, missing {missing}; got fields: {keys}')
+
         problem = str(row['Problem']).strip()
         ground_truth = str(row['Answer']).strip()
         user_data = [
@@ -232,8 +238,7 @@ class AIMEProcessor(Preprocessor):
             ('data_source', 'aime'),
             ('ability', 'MATH'),
         ]
-        if row.get('ID') is not None:
-            user_data.append(('id', str(row['ID'])))
+        user_data.append(('id', str(row['ID'])))
         if row.get('Solution') is not None:
             user_data.append(('solution', str(row['Solution'])))
 
