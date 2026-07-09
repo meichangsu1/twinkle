@@ -5,7 +5,6 @@ from numbers import Number
 from typing import Any
 
 from twinkle.data_format import InputFeature
-
 from .data_plane import TransferQueueDataPlane
 from .types import TransformersTrainBatch
 

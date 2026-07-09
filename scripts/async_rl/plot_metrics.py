@@ -55,6 +55,24 @@ def main() -> None:
     ):
         _plot_metric_over_wall_time(plt, run_metrics, metric_key, output_dir / f'{file_prefix}_vs_wall_time.png')
         _plot_metric_over_step(plt, run_metrics, metric_key, output_dir / f'{file_prefix}_vs_train_step.png')
+    for metric_key, file_prefix in (
+        ('eval/accuracy', 'eval_accuracy'),
+        ('eval/completion_length', 'eval_completion_length'),
+    ):
+        _plot_event_metric_over_wall_time(
+            plt,
+            run_metrics,
+            metric_key,
+            'eval_done',
+            output_dir / f'{file_prefix}_vs_wall_time.png',
+        )
+        _plot_event_metric_over_step(
+            plt,
+            run_metrics,
+            metric_key,
+            'eval_done',
+            output_dir / f'{file_prefix}_vs_train_step.png',
+        )
     _plot_train_partitions_per_hour(plt, run_metrics, output_dir / 'train_partitions_per_hour.png')
     _plot_overlap_timeline(plt, run_metrics, output_dir / 'rollout_train_overlap_timeline.png')
     _plot_policy_gap_histogram(plt, run_metrics, output_dir / 'policy_version_gap_histogram.png')
@@ -151,6 +169,33 @@ def _train_points(run: dict[str, Any], metric_key: str) -> tuple[list[float], li
     return wall_time, steps, values
 
 
+def _event_metric_points(
+    run: dict[str, Any],
+    metric_key: str,
+    event_name: str,
+) -> tuple[list[float], list[int], list[float]]:
+    wall_time = []
+    steps = []
+    values = []
+    fallback_step = 0
+    for event in run['events']:
+        if event.get('event') != event_name:
+            continue
+        value = _metric(event, metric_key)
+        if value is None:
+            continue
+        fallback_step += 1
+        logged_step = _metric(event, 'optimizer_step')
+        if logged_step is None:
+            logged_step = _metric(event, 'step')
+        if logged_step is None:
+            logged_step = _metric(event, 'policy_version')
+        wall_time.append(float(event.get('elapsed_s') or 0.0))
+        steps.append(int(logged_step) if logged_step is not None else fallback_step)
+        values.append(value)
+    return wall_time, steps, values
+
+
 def _plot_metric_over_wall_time(plt, runs: list[dict[str, Any]], metric_key: str, output: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 4.5))
     plotted = False
@@ -171,11 +216,63 @@ def _plot_metric_over_wall_time(plt, runs: list[dict[str, Any]], metric_key: str
     )
 
 
+def _plot_event_metric_over_wall_time(
+    plt,
+    runs: list[dict[str, Any]],
+    metric_key: str,
+    event_name: str,
+    output: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    plotted = False
+    for run in runs:
+        wall_time, _, values = _event_metric_points(run, metric_key, event_name)
+        if not values:
+            continue
+        ax.plot(wall_time, values, marker='o', linewidth=1.5, label=run['label'])
+        plotted = True
+    _finish_line_plot(
+        fig,
+        ax,
+        output,
+        title=f'{metric_key} vs wall-clock',
+        xlabel='wall-clock time (s)',
+        ylabel=metric_key,
+        plotted=plotted,
+    )
+
+
 def _plot_metric_over_step(plt, runs: list[dict[str, Any]], metric_key: str, output: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 4.5))
     plotted = False
     for run in runs:
         _, steps, values = _train_points(run, metric_key)
+        if not values:
+            continue
+        ax.plot(steps, values, marker='o', linewidth=1.5, label=run['label'])
+        plotted = True
+    _finish_line_plot(
+        fig,
+        ax,
+        output,
+        title=f'{metric_key} vs train step',
+        xlabel='train step',
+        ylabel=metric_key,
+        plotted=plotted,
+    )
+
+
+def _plot_event_metric_over_step(
+    plt,
+    runs: list[dict[str, Any]],
+    metric_key: str,
+    event_name: str,
+    output: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    plotted = False
+    for run in runs:
+        _, steps, values = _event_metric_points(run, metric_key, event_name)
         if not values:
             continue
         ax.plot(steps, values, marker='o', linewidth=1.5, label=run['label'])

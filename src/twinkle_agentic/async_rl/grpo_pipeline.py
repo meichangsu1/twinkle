@@ -490,7 +490,9 @@ class GSM8KBrevityReward:
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
-            has_answer = bool(re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion))
+            has_answer = bool(
+                re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion)
+                or re.search(r'(?im)^\s*Answer\s*:\s*\S+', completion))
             if not has_answer:
                 rewards.append(0.0)
                 continue
@@ -521,6 +523,38 @@ class GSM8KReward:
             completion_length = _as_float(trajectory.get('completion_length'))
             if completion_length is not None:
                 metadata['completion_length'] = completion_length
+            trajectory['metadata'] = metadata
+        return total
+
+    def metric_payload(
+        self,
+        trajectories: list[dict[str, Any]],
+        *,
+        rewards: list[float] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        return _short_math_reward_metrics(trajectories, total_rewards=rewards)
+
+
+class DAPOMathReward:
+
+    def __init__(self):
+        from twinkle.reward import DAPOMathAccuracyReward
+
+        self.accuracy = DAPOMathAccuracyReward()
+        self.brevity = GSM8KBrevityReward()
+
+    def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[float]:
+        accuracy = self.accuracy(trajectories)
+        brevity = self.brevity(trajectories)
+        total = [a + b for a, b in zip(accuracy, brevity)]
+        for trajectory, total_reward, accuracy_reward, brevity_reward in zip(trajectories, total, accuracy, brevity):
+            metadata = dict(trajectory.get('metadata') or {})
+            metadata.update({
+                'total_reward': float(total_reward),
+                'accuracy_reward': float(accuracy_reward),
+                'brevity_reward': float(brevity_reward),
+            })
             trajectory['metadata'] = metadata
         return total
 
@@ -768,6 +802,8 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         for context_cfg in lora_context_configs(self.cfg):
             if context_cfg.reward_type == 'gsm8k':
                 registry[context_cfg.reward_type] = GSM8KReward()
+            elif context_cfg.reward_type == 'dapo_math':
+                registry[context_cfg.reward_type] = DAPOMathReward()
             else:
                 raise ValueError(f'unsupported reward_type for AsyncMultiLoraGRPOPipeline: {context_cfg.reward_type}')
         return registry

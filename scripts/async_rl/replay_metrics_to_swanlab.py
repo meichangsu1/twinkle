@@ -216,6 +216,5 @@ def _safe_name(value: str) -> str:
 
 _NUMERIC_RE = re.compile(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?')
 
-
 if __name__ == '__main__':
     main()

@@ -1,0 +1,50 @@
+lora_contexts:
+  - tenant_id: tenant_a
+    training_run_id: gsm8k_dapo_sync_multilora_gsm8k
+    adapter_name: tenant_a_gsm8k_lora
+    reward_type: gsm8k
+    dataset:
+      name: gsm8k
+      dataset_id: ms://modelscope/gsm8k
+      subset_name: main
+      split: train
+      data_num: 2000
+      max_length: 4096
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
+    eval_dataset:
+      name: gsm8k/test
+      dataset_id: ms://modelscope/gsm8k
+      subset_name: main
+      split: test
+      data_num: 128
+      max_length: 4096
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
+
+  - tenant_id: tenant_b
+    training_run_id: gsm8k_dapo_sync_multilora_dapo_math
+    adapter_name: tenant_b_dapo_math_lora
+    reward_type: dapo_math
+    dataset:
+      name: dapo_math
+      dataset_id: data/dapo-math-17k.parquet
+      split: train
+      data_num: 2000
+      max_length: 4096
+      processor:
+        cls: DAPOMathProcessor
+    eval_dataset:
+      name: aime2024
+      dataset_id: data/aime-2024.parquet
+      split: train
+      data_num: 128
+      max_length: 4096
+      processor:
+        cls: AIMEProcessor
