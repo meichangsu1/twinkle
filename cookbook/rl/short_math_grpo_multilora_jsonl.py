@@ -401,6 +401,50 @@ def _processor_from_config(processor_cfg: dict[str, Any], *, default_cls: str) -
     raise ValueError(f'Unsupported processor cls={processor_cls!r}')
 
 
+def _dataset_format(dataset_cfg: dict[str, Any], dataset_id: str) -> str:
+    configured = dataset_cfg.get('format') or dataset_cfg.get('file_type')
+    if configured:
+        return str(configured).lower().lstrip('.')
+    suffix = Path(dataset_id).suffix.lower().lstrip('.')
+    if suffix:
+        return suffix
+    return ''
+
+
+def _read_local_json_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == '.jsonl':
+        rows = []
+        with path.open(encoding='utf-8') as file:
+            for line in file:
+                if line.strip():
+                    rows.append(json.loads(line))
+        return rows
+    with path.open(encoding='utf-8') as file:
+        payload = json.load(file)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ('data', 'rows', 'train'):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    raise ValueError(f'JSON dataset must be a row list or contain data/rows/train list: {path}')
+
+
+def _local_json_dataset_path(dataset_id: str, dataset_cfg: dict[str, Any]) -> Path | None:
+    path = Path(dataset_id)
+    dataset_format = _dataset_format(dataset_cfg, dataset_id)
+    if path.is_file() and dataset_format in {'json', 'jsonl'}:
+        return path
+    if path.is_dir() and dataset_format in {'json', 'jsonl'}:
+        split = str(dataset_cfg.get('split', 'train'))
+        for suffix in (dataset_format, 'jsonl', 'json'):
+            candidate = path / f'{split}.{suffix}'
+            if candidate.exists():
+                return candidate
+    return None
+
+
 def create_dataset_from_config(dataset_cfg: dict[str, Any], *, default_processor_cls: str) -> Dataset:
     dataset_id = dataset_cfg.get('dataset_id')
     if not dataset_id:
@@ -408,13 +452,23 @@ def create_dataset_from_config(dataset_cfg: dict[str, Any], *, default_processor
     data_num = _cfg_int(dataset_cfg, 'data_num', 0)
     data_slice = range(data_num) if data_num else None
     dataset = Dataset()
-    dataset.add_dataset(
-        DatasetMeta(
-            str(dataset_id),
-            subset_name=str(dataset_cfg.get('subset_name', 'default')),
-            split=str(dataset_cfg.get('split', 'train')),
-            data_slice=data_slice,
-        ))
+    local_json_path = _local_json_dataset_path(str(dataset_id), dataset_cfg)
+    if local_json_path is not None:
+        dataset.add_dataset(
+            DatasetMeta(
+                subset_name=str(dataset_cfg.get('subset_name', 'default')),
+                split=str(dataset_cfg.get('split', 'train')),
+                data_slice=data_slice,
+                data=_read_local_json_rows(local_json_path),
+            ))
+    else:
+        dataset.add_dataset(
+            DatasetMeta(
+                str(dataset_id),
+                subset_name=str(dataset_cfg.get('subset_name', 'default')),
+                split=str(dataset_cfg.get('split', 'train')),
+                data_slice=data_slice,
+            ))
     dataset.set_template(
         str(dataset_cfg.get('template_cls', 'Qwen3_5Template')),
         model_id=MODEL_ID,
@@ -718,15 +772,15 @@ def build_eval_batches(contexts: List[LoraRunContext]) -> dict[str, list[list[An
             logger.info('Validation disabled for adapter=%s dataset=%s: no eval dataset configured',
                         context.adapter_name, context.dataset_name)
             continue
-        dataloader = DataLoader(
-            dataset=context.eval_dataset_factory,
-            batch_size=EVAL_BATCH_SIZE,
-            min_batch_size=1,
-            remote_group='model',
-            instance_id=f'{SCRIPT_INSTANCE_ID}-{_safe_name(context.adapter_name)}-eval-',
-        )
+        dataset = context.eval_dataset_factory()
         batches = []
-        for batch in dataloader:
+        batch = []
+        for index in range(len(dataset)):
+            batch.append(dataset[index])
+            if len(batch) == EVAL_BATCH_SIZE:
+                batches.append(batch)
+                batch = []
+        if batch:
             batches.append(batch)
         batches_by_adapter[context.adapter_name] = batches
         logger.info(
