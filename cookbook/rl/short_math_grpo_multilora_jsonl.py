@@ -41,6 +41,14 @@ from twinkle.sampler import vLLMSampler
 
 logger = get_logger()
 
+
+def _optional_step_limit(value: str | None, *, default: int) -> int | None:
+    if value is None:
+        return default
+    parsed = int(value)
+    return None if parsed <= 0 else parsed
+
+
 # ========== Configuration ==========
 MODEL_ID = os.environ.get('MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
@@ -58,7 +66,8 @@ MIXED_PRECISION = os.environ.get('MIXED_PRECISION', 'bf16')
 NUM_GENERATIONS = int(os.environ.get('NUM_GENERATIONS', 8))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 4096))
 LEARNING_RATE = float(os.environ.get('LR', 1e-5))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 1000))
+MAX_STEPS = _optional_step_limit(os.environ.get('MAX_STEPS'), default=1000)
+LR_SCHEDULER_T_MAX = int(os.environ.get('LR_SCHEDULER_T_MAX', str(MAX_STEPS or 1000)))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 8))
 MINI_BATCH_SIZE = int(os.environ.get('MINI_BATCH_SIZE', 8))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 1))
@@ -350,6 +359,10 @@ def _adapter_path_from_save_result(save_result: Any) -> str | None:
     if isinstance(save_result, dict):
         return save_result.get('twinkle_path') or save_result.get('path')
     return None
+
+
+def _step_limit_reached(context: LoraRunContext) -> bool:
+    return MAX_STEPS is not None and context.optimizer_steps >= MAX_STEPS
 
 
 def _default_config_path() -> str | None:
@@ -933,7 +946,7 @@ def build_model(model_mesh: DeviceMesh, contexts: List[LoraRunContext]) -> Multi
             gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         )
         model.set_optimizer('AdamW', lr=LEARNING_RATE, adapter_name=context.adapter_name)
-        model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0, adapter_name=context.adapter_name)
+        model.set_lr_scheduler('CosineAnnealingLR', T_max=LR_SCHEDULER_T_MAX, eta_min=0, adapter_name=context.adapter_name)
         model.set_loss('GRPOLoss', epsilon=0.2, adapter_name=context.adapter_name)
         model.add_metric('GRPOMetric', adapter_name=context.adapter_name, epsilon=0.2)
         model.set_processor(InputProcessor, adapter_name=context.adapter_name, padding_free=True)
@@ -1055,9 +1068,9 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
     logger.info('Starting GSM8K + DAPO GRPO training (MultiLoraTransformersModel sync JSONL baseline)')
     logger.info(get_device_placement())
 
-    while any(not context.exhausted and context.optimizer_steps < MAX_STEPS for context in contexts):
+    while any(not context.exhausted and not _step_limit_reached(context) for context in contexts):
         active_contexts = [
-            context for context in contexts if not context.exhausted and context.optimizer_steps < MAX_STEPS
+            context for context in contexts if not context.exhausted and not _step_limit_reached(context)
         ]
         rollout_batches = []
 
@@ -1158,7 +1171,7 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
             total_completions = len(all_input_data)
             trained_samples = 0
             for mb_start in range(0, total_completions, MINI_BATCH_SIZE):
-                if context.optimizer_steps >= MAX_STEPS:
+                if _step_limit_reached(context):
                     break
                 mb_end = min(mb_start + MINI_BATCH_SIZE, total_completions)
                 mb_inputs = all_input_data[mb_start:mb_end]
@@ -1204,7 +1217,8 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
                     'policy_version_gap': 0.0,
                     'train_batch_latency_s': time.time() - train_start,
                 })
-                logger.info('[%s Step %s/%s] %s', context.adapter_name, context.optimizer_steps, MAX_STEPS, log_dict)
+                logger.info('[%s Step %s/%s] %s', context.adapter_name, context.optimizer_steps,
+                            MAX_STEPS or 'all', log_dict)
                 metrics_writer.write_train_metrics(
                     context=context,
                     optimizer_step=context.optimizer_steps,

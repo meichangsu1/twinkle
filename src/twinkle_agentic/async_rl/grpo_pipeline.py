@@ -1,10 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from twinkle import get_logger
@@ -112,6 +116,12 @@ def rollout_batch_groups_for_context(cfg, context_cfg) -> int:
     return int(lora_rollout_config(cfg, context_cfg).batch_size)
 
 
+def max_pending_prompt_groups_for_context(cfg, context_cfg) -> int:
+    rollout_batch_groups = rollout_batch_groups_for_context(cfg, context_cfg)
+    staleness_window = max(1, int(cfg.pipeline.max_staleness) + 1)
+    return rollout_batch_groups * staleness_window
+
+
 def rollout_batch_groups_by_context(cfg, contexts: list[LoraContext]) -> dict[str, int]:
     result = {}
     for context_cfg, context in zip(lora_context_configs(cfg), contexts):
@@ -140,9 +150,10 @@ def async_rl_metrics_config(cfg) -> AsyncRLMetricsConfig | None:
     metrics_cfg = experiment_cfg.get('metrics') or {}
     if metrics_cfg.get('enabled') is False:
         return None
+    max_steps = _optional_step_limit(cfg.pipeline.get('max_steps'))
     metadata = {
         'model_id': cfg.model.get('model_id', None),
-        'max_steps': int(cfg.pipeline.max_steps),
+        'max_steps': max_steps,
         'max_staleness': int(cfg.pipeline.max_staleness),
         'default_rollout_batch_size': int(cfg.pipeline.default_rollout_batch_size),
         'default_mini_batch_size': int(cfg.pipeline.default_mini_batch_size),
@@ -171,6 +182,11 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     return cfg.get(key, default)
 
 
+def _cfg_text(cfg: Any, key: str, default: str) -> str:
+    value = _cfg_get(cfg, key, default)
+    return str(default if value is None else value)
+
+
 def _config_to_dict(cfg: Any) -> dict[str, Any]:
     from omegaconf import OmegaConf
 
@@ -186,6 +202,54 @@ def _config_kwargs(cfg: Any, *, exclude: set[str] | None = None) -> dict[str, An
     if exclude:
         excluded.update(exclude)
     return {key: value for key, value in _config_to_dict(cfg).items() if key not in excluded}
+
+
+def _dataset_format(dataset_cfg: Any, dataset_id: str) -> str:
+    suffix = Path(dataset_id).suffix.lower().lstrip('.')
+    if suffix in {'json', 'jsonl'}:
+        return suffix
+    configured = _cfg_get(dataset_cfg, 'format') or _cfg_get(dataset_cfg, 'file_type')
+    if configured:
+        return str(configured).lower().lstrip('.')
+    if suffix:
+        return suffix
+    return ''
+
+
+def _read_local_json_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == '.jsonl':
+        rows = []
+        with path.open(encoding='utf-8') as file:
+            for line in file:
+                if line.strip():
+                    rows.append(json.loads(line))
+        return rows
+    with path.open(encoding='utf-8') as file:
+        payload = json.load(file)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ('data', 'rows', 'train'):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    raise ValueError(f'JSON dataset must be a row list or contain data/rows/train list: {path}')
+
+
+def _local_json_dataset_path(dataset_cfg: Any, dataset_id: str) -> Path | None:
+    path = Path(dataset_id)
+    dataset_format = _dataset_format(dataset_cfg, dataset_id)
+    if path.is_file() and dataset_format in {'json', 'jsonl'}:
+        return path
+    if path.is_dir() and dataset_format not in {'parquet', 'csv', 'arrow'}:
+        split = str(_cfg_get(dataset_cfg, 'split', 'train'))
+        suffixes = [dataset_format] if dataset_format in {'json', 'jsonl'} else []
+        suffixes.extend(['jsonl', 'json'])
+        for suffix in suffixes:
+            candidate = path / f'{split}.{suffix}'
+            if candidate.exists():
+                return candidate
+    return None
 
 
 def _build_lora_config(lora_cfg):
@@ -212,6 +276,13 @@ def _model_dp_size(cfg) -> int:
         raise ValueError(f'runtime.model_gpus={model_gpus} must be divisible by '
                          f'model.mesh tp_size*ep_size*pp_size={parallel_size}')
     return int(mesh_cfg.get('dp_size', model_gpus // parallel_size))
+
+
+def _optional_step_limit(value: Any) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    return None if parsed <= 0 else parsed
 
 
 def _validate_train_batch_config(cfg) -> None:
@@ -402,13 +473,29 @@ def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: 
     data_num = _cfg_get(dataset_cfg, 'data_num')
     data_slice = range(int(data_num)) if data_num else None
     dataset = Dataset()
-    dataset.add_dataset(
-        DatasetMeta(
-            _cfg_get(dataset_cfg, 'dataset_id'),
-            subset_name=_cfg_get(dataset_cfg, 'subset_name'),
-            split=_cfg_get(dataset_cfg, 'split', 'train'),
-            data_slice=data_slice,
-        ))
+    dataset_id = _cfg_get(dataset_cfg, 'dataset_id')
+    if dataset_id is None:
+        raise ValueError(f'lora context {context_cfg.get("training_run_id")} dataset config missing dataset_id')
+    dataset_id = str(dataset_id)
+    subset_name = _cfg_text(dataset_cfg, 'subset_name', 'default')
+    split = _cfg_text(dataset_cfg, 'split', 'train')
+    local_json_path = _local_json_dataset_path(dataset_cfg, dataset_id)
+    if local_json_path is not None:
+        dataset.add_dataset(
+            DatasetMeta(
+                subset_name=subset_name,
+                split=split,
+                data_slice=data_slice,
+                data=_read_local_json_rows(local_json_path),
+            ))
+    else:
+        dataset.add_dataset(
+            DatasetMeta(
+                dataset_id,
+                subset_name=subset_name,
+                split=split,
+                data_slice=data_slice,
+            ))
     dataset.set_template(
         _cfg_get(template_cfg, 'cls'),
         model_id=_cfg_get(context_cfg, 'base_model_id'),
@@ -447,7 +534,7 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         max_concurrency=int(rollout_cfg.get('max_concurrency', 16)),
         default_mini_batch_size=int(cfg.pipeline.default_mini_batch_size),
         mini_batch_size_by_context=context_mini_batch_sizes,
-        max_train_steps=int(cfg.pipeline.max_steps),
+        max_train_steps=_optional_step_limit(cfg.pipeline.get('max_steps')),
         save_name_prefix=cfg.pipeline.save_name_prefix,
         adapter_checkpoint_dir=cfg.model.adapter_checkpoint_dir,
         is_sampler_checkpoint=bool(cfg.pipeline.is_sampler_checkpoint),
@@ -626,6 +713,12 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         self.cfg = cfg
         self.model_mesh = model_mesh
         self.sampler_mesh = sampler_mesh
+        self._optimizer_steps_by_context: dict[str, int] = {}
+        self._adapter_paths_by_context: dict[str, list[Path]] = {}
+        self._adapter_prune_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix='async-rl-adapter-prune',
+        )
         super().__init__(config=build_base_pipeline_config(cfg))
 
     def build_model(self):
@@ -761,7 +854,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         for context_cfg, context in zip(lora_context_configs(self.cfg), self.contexts):
             context_model_cfg = lora_model_config(self.cfg, context_cfg)
             prompt_batch_size = rollout_batch_groups_for_context(self.cfg, context_cfg)
-            max_pending_groups = prompt_batch_size * 2
+            max_pending_groups = max_pending_prompt_groups_for_context(self.cfg, context_cfg)
             safe_context_key = re.sub(r'[^A-Za-z0-9_.-]+', '_', context.key)
             dataset_factory = partial(
                 build_prompt_dataset_from_config,
@@ -882,10 +975,10 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 ))
             last_metrics.update(_short_math_reward_metrics(sample_tags, total_rewards=rewards))
             last_metrics.update(batch_diagnostics)
-            optimizer_step = last_metrics.get('iters')
-            if optimizer_step is not None:
-                last_metrics['optimizer_step'] = optimizer_step
-                last_metrics['step'] = optimizer_step
+            optimizer_step = self._optimizer_steps_by_context.get(context.key, 0) + 1
+            self._optimizer_steps_by_context[context.key] = optimizer_step
+            last_metrics['optimizer_step'] = optimizer_step
+            last_metrics['step'] = optimizer_step
             last_metrics.update({
                 'sample_count': len(inputs),
                 'prompt_count': len(inputs) / num_generations,
@@ -914,7 +1007,40 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             is_sampler=bool(self.cfg.pipeline.is_sampler_checkpoint),
         )
         adapter_path = save_result if isinstance(save_result, str) else getattr(save_result, 'twinkle_path', None)
+        self._record_and_prune_adapter_paths(context, adapter_path)
         return TrainerStepResult(adapter_path=adapter_path)
+
+    def _record_and_prune_adapter_paths(self, context, adapter_path: str | None) -> None:
+        keep_versions = int(self.cfg.pipeline.get('keep_adapter_versions', 0) or 0)
+        if keep_versions <= 0 or adapter_path is None:
+            return
+        path = Path(adapter_path)
+        if not path.exists():
+            return
+        paths = self._adapter_paths_by_context.setdefault(context.key, [])
+        paths.append(path)
+        stale_paths = paths[:-keep_versions]
+        self._adapter_paths_by_context[context.key] = paths[-keep_versions:]
+        for stale_path in stale_paths:
+            if stale_path in self._adapter_paths_by_context[context.key]:
+                continue
+            self._adapter_prune_executor.submit(self._prune_adapter_path, context.key, stale_path)
+
+    @staticmethod
+    def _prune_adapter_path(context_key: str, path: Path) -> None:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            logger.info('Pruned stale adapter checkpoint: context=%s path=%s', context_key, path)
+        except OSError as exc:
+            logger.warning('Failed to prune stale adapter checkpoint: context=%s path=%s error=%s',
+                           context_key, path, exc)
+
+    def shutdown(self) -> None:
+        super().shutdown()
+        self._adapter_prune_executor.shutdown(wait=False, cancel_futures=False)
 
 
 def grpo_advantage_fn(batch: GRPOAdvantageBatch, context) -> tuple[list[float], list[float]]:

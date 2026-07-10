@@ -168,10 +168,9 @@ sampler:
     top_p: 0.95
 
 pipeline:
-  # Async max_steps counts completed train partitions, not optimizer steps.
-  # 2 LoRA * 25 partitions/context * 4 mini-batches/partition = 200 train batches,
-  # matching sync MAX_STEPS=100 for each LoRA when BATCH_SIZE=4 and MINI_BATCH_SIZE=8.
-  max_steps: 50
+  # null means train until all configured training data is consumed and the
+  # rollout/advantage/train queues are drained.
+  max_steps: null
   max_staleness: 0
   default_rollout_batch_size: 4
   # Measured in prompt groups. 1 prompt group * 8 generations = 8 train samples,
@@ -183,6 +182,7 @@ pipeline:
     num_generations: 8
     max_concurrency: 4
   save_name_prefix: async-multilora-strict-match-sync
+  keep_adapter_versions: 2
   save_optimizer: false
   is_sampler_checkpoint: false
   max_grad_norm: 1.0
@@ -206,7 +206,8 @@ transfer_queue:
 # NUM_GENERATIONS=8 \
 # MAX_NEW_TOKENS=1024 \
 # LR=5e-5 \
-# MAX_STEPS=100 \
+# MAX_STEPS=0 \
+# LR_SCHEDULER_T_MAX=2000 \
 # BATCH_SIZE=4 \
 # MINI_BATCH_SIZE=8 \
 # GRADIENT_ACCUMULATION_STEPS=1 \
