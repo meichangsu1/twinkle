@@ -31,7 +31,7 @@ lora_context:
     subset_name: main
     split: train
     data_num: 2000
-    max_length: 4096
+    max_length: 8192
     processor:
       cls: GSM8KProcessor
       system: >-
@@ -43,7 +43,7 @@ lora_context:
     subset_name: main
     split: test
     data_num: 128
-    max_length: 4096
+    max_length: 8192
     processor:
       cls: GSM8KProcessor
       system: >-
@@ -67,7 +67,7 @@ lora_contexts:
       subset_name: main
       split: train
       data_num: 2000
-      max_length: 4096
+      max_length: 8192
       processor:
         cls: GSM8KProcessor
         system: >-
@@ -79,7 +79,7 @@ lora_contexts:
       subset_name: main
       split: test
       data_num: 128
-      max_length: 4096
+      max_length: 8192
       processor:
         cls: GSM8KProcessor
         system: >-
@@ -97,21 +97,23 @@ lora_contexts:
     train:
       mini_batch_size: 1
     dataset:
-      name: dapo_math
-      dataset_id: data/dapo-math-17k.parquet
+      name: byted_dapo_math_17k
+      dataset_id: hf://BytedTsinghua-SIA/DAPO-Math-17k
+      subset_name: default
       split: train
-      data_num: 2000
-      max_length: 4096
+      data_num: 0
+      max_length: 8192
       processor:
         cls: DAPOMathProcessor
     eval_dataset:
-      name: aime2024
-      dataset_id: data/aime-2024.parquet
+      name: maxwell_aime2024
+      dataset_id: hf://Maxwell-Jia/AIME_2024
+      subset_name: default
       split: train
-      data_num: 128
-      max_length: 4096
+      data_num: 0
+      max_length: 8192
       processor:
-        cls: DAPOMathProcessor
+        cls: AIMEProcessor
 
 model:
   mesh:
@@ -141,10 +143,10 @@ model:
     eta_min: 0
   processor:
     cls: InputProcessor
-    padding_free: true
+    padding_free: false
   template:
     cls: Qwen3_5Template
-    max_length: 4096
+    max_length: 8192
     truncation_strategy: delete
     enable_thinking: false
   adapter_checkpoint_dir: output/async_multi_lora_grpo_strict_match_sync/lora_sync
@@ -181,6 +183,14 @@ pipeline:
   rollout:
     num_generations: 8
     max_concurrency: 4
+  eval:
+    enabled: true
+    batch_size: 16
+    sampling_params:
+      max_tokens: 1024
+      num_samples: 1
+      temperature: 0.0
+      top_p: 1.0
   save_name_prefix: async-multilora-strict-match-sync
   keep_adapter_versions: 2
   save_optimizer: false

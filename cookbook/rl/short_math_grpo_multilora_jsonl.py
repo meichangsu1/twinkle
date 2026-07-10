@@ -79,7 +79,7 @@ LORA_ALPHA = int(os.environ.get('LORA_ALPHA', LORA_RANK * 2))
 LORA_DROPOUT = float(os.environ.get('LORA_DROPOUT', 0.05))
 MODEL_MAX_R = int(os.environ.get('MODEL_MAX_R', LORA_RANK))
 MAX_LORAS = int(os.environ.get('MAX_LORAS', 2))
-MODEL_MAX_LENGTH = int(os.environ.get('MODEL_MAX_LENGTH', 4096))
+MODEL_MAX_LENGTH = int(os.environ.get('MODEL_MAX_LENGTH', 8192))
 SAMPLER_MAX_MODEL_LEN = int(os.environ.get('SAMPLER_MAX_MODEL_LEN', 8192))
 SAMPLER_MAX_LORA_RANK = int(os.environ.get('SAMPLER_MAX_LORA_RANK', LORA_RANK))
 DATA_NUM = int(os.environ.get('DATA_NUM', '0') or 0)
@@ -244,24 +244,57 @@ class JSONLMetricsWriter:
             metrics=event_metrics,
         )
 
-    def write_completed(self, *, contexts: List[LoraRunContext]) -> None:
+    def _completion_metrics(
+        self,
+        *,
+        contexts: List[LoraRunContext],
+        train_wall_time_s: float,
+        total_wall_time_s: float,
+    ) -> dict[str, Any]:
+        return {
+            'optim_step': sum(context.optimizer_steps for context in contexts),
+            'optimizer_steps': sum(context.optimizer_steps for context in contexts),
+            'max_policy_version': max(context.policy_version for context in contexts),
+            'wall_time_s': train_wall_time_s,
+            'train_wall_time_s': train_wall_time_s,
+            'total_wall_time_s': total_wall_time_s,
+            'eval_wall_time_s': max(0.0, total_wall_time_s - train_wall_time_s),
+            'per_context': {
+                context.context_key: {
+                    'adapter_name': context.adapter_name,
+                    'dataset': context.dataset_name,
+                    'optimizer_steps': context.optimizer_steps,
+                    'policy_version': context.policy_version,
+                }
+                for context in contexts
+            },
+        }
+
+    def write_training_completed(self, *, contexts: List[LoraRunContext], train_wall_time_s: float) -> None:
+        self.write_event(
+            event='training_completed',
+            phase='run',
+            elapsed_s=train_wall_time_s,
+            metrics=self._completion_metrics(
+                contexts=contexts,
+                train_wall_time_s=train_wall_time_s,
+                total_wall_time_s=train_wall_time_s,
+            ),
+        )
+
+    def write_completed(self, *, contexts: List[LoraRunContext], train_wall_time_s: float | None = None) -> None:
+        total_wall_time_s = time.time() - self.start_time
+        if train_wall_time_s is None:
+            train_wall_time_s = total_wall_time_s
         self.write_event(
             event='run_completed',
             phase='run',
-            elapsed_s=time.time() - self.start_time,
-            metrics={
-                'optim_step': sum(context.optimizer_steps for context in contexts),
-                'max_policy_version': max(context.policy_version for context in contexts),
-                'per_context': {
-                    context.context_key: {
-                        'adapter_name': context.adapter_name,
-                        'dataset': context.dataset_name,
-                        'optimizer_steps': context.optimizer_steps,
-                        'policy_version': context.policy_version,
-                    }
-                    for context in contexts
-                },
-            },
+            elapsed_s=total_wall_time_s,
+            metrics=self._completion_metrics(
+                contexts=contexts,
+                train_wall_time_s=train_wall_time_s,
+                total_wall_time_s=total_wall_time_s,
+            ),
         )
 
     def write_event(
@@ -949,7 +982,7 @@ def build_model(model_mesh: DeviceMesh, contexts: List[LoraRunContext]) -> Multi
         model.set_lr_scheduler('CosineAnnealingLR', T_max=LR_SCHEDULER_T_MAX, eta_min=0, adapter_name=context.adapter_name)
         model.set_loss('GRPOLoss', epsilon=0.2, adapter_name=context.adapter_name)
         model.add_metric('GRPOMetric', adapter_name=context.adapter_name, epsilon=0.2)
-        model.set_processor(InputProcessor, adapter_name=context.adapter_name, padding_free=True)
+        model.set_processor(InputProcessor, adapter_name=context.adapter_name, padding_free=False)
         model.set_template('Qwen3_5Template', model_id=MODEL_ID, enable_thinking=False, adapter_name=context.adapter_name)
     return model
 
@@ -1294,6 +1327,7 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
         }
         for context in contexts
     })
+    final_adapter_paths: dict[str, str] = {}
     for context in contexts:
         final_save_result = model.save(
             f'math-grpo-multilora-final-{_safe_name(context.adapter_name)}',
@@ -1306,6 +1340,12 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
         if final_adapter_path is None:
             raise RuntimeError(f'Final adapter save did not return a sampler adapter path: {context.adapter_name}')
         context.latest_adapter_path = final_adapter_path
+        final_adapter_paths[context.adapter_name] = final_adapter_path
+
+    train_wall_time_s = time.time() - metrics_writer.start_time
+    metrics_writer.write_training_completed(contexts=contexts, train_wall_time_s=train_wall_time_s)
+
+    for context in contexts:
         eval_batches = eval_batches_by_adapter.get(context.adapter_name) or []
         if EVAL_AT_END and eval_batches:
             run_validation(
@@ -1314,10 +1354,10 @@ def _main(metrics_writer: JSONLMetricsWriter, contexts: List[LoraRunContext]):
                 context=context,
                 eval_batches=eval_batches,
                 sampling_params=eval_sampling_params,
-                adapter_path=final_adapter_path,
+                adapter_path=final_adapter_paths[context.adapter_name],
                 partition_id=f'{context.context_key}/final_eval',
             )
-    metrics_writer.write_completed(contexts=contexts)
+    metrics_writer.write_completed(contexts=contexts, train_wall_time_s=train_wall_time_s)
 
 
 if __name__ == '__main__':

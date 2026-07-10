@@ -23,7 +23,8 @@ def main() -> None:
 
 
 def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
-    wall_time_s = max((float(event.get('elapsed_s') or 0.0) for event in events), default=0.0)
+    total_wall_time_s = max((float(event.get('elapsed_s') or 0.0) for event in events), default=0.0)
+    wall_time_s = _training_wall_time_s(events, fallback=total_wall_time_s)
     train_events = [event for event in events if event.get('event') == 'train_batch_done']
     partition_done_events = [event for event in events if event.get('event') == 'partition_train_done']
     rollout_done_events = [event for event in events if event.get('event') == 'rollout_done']
@@ -70,6 +71,9 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         'wall_time_s': wall_time_s,
+        'train_wall_time_s': wall_time_s,
+        'total_wall_time_s': total_wall_time_s,
+        'eval_wall_time_s': max(0.0, total_wall_time_s - wall_time_s),
         'train_steps': train_steps,
         'optimizer_steps': int(max(optimizer_steps)) if optimizer_steps else train_steps,
         'train_partitions': train_partitions,
@@ -103,6 +107,39 @@ def _event_counts(events: list[dict[str, Any]]) -> dict[str, int]:
     for event in events:
         counts[str(event.get('event') or 'unknown')] += 1
     return dict(sorted(counts.items()))
+
+
+def _training_wall_time_s(events: list[dict[str, Any]], *, fallback: float) -> float:
+    for event in reversed(events):
+        if event.get('event') != 'run_completed':
+            continue
+        wall_time = _metric_optional_number(event, 'train_wall_time_s')
+        if wall_time is None:
+            wall_time = _metric_optional_number(event, 'wall_time_s')
+        if wall_time is not None and wall_time > 0:
+            return wall_time
+
+    for event in reversed(events):
+        if event.get('event') != 'training_completed':
+            continue
+        wall_time = _metric_optional_number(event, 'train_wall_time_s')
+        if wall_time is None:
+            try:
+                wall_time = float(event.get('elapsed_s') or 0.0)
+            except (TypeError, ValueError):
+                wall_time = None
+        if wall_time is not None and wall_time > 0:
+            return wall_time
+
+    non_eval_wall_time = max(
+        (
+            float(event.get('elapsed_s') or 0.0)
+            for event in events
+            if event.get('phase') != 'eval'
+        ),
+        default=0.0,
+    )
+    return non_eval_wall_time if non_eval_wall_time > 0 else fallback
 
 
 def _metric_optional_number(event: dict[str, Any], key: str) -> float | None:

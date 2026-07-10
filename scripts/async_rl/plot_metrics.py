@@ -146,6 +146,40 @@ def _metric(event: dict[str, Any], key: str) -> float | None:
     return value
 
 
+def _training_wall_time(events: list[dict[str, Any]]) -> float:
+    total_wall_time = max((float(event.get('elapsed_s') or 0.0) for event in events), default=0.0)
+    for event in reversed(events):
+        if event.get('event') != 'run_completed':
+            continue
+        wall_time = _metric(event, 'train_wall_time_s')
+        if wall_time is None:
+            wall_time = _metric(event, 'wall_time_s')
+        if wall_time is not None and wall_time > 0:
+            return wall_time
+
+    for event in reversed(events):
+        if event.get('event') != 'training_completed':
+            continue
+        wall_time = _metric(event, 'train_wall_time_s')
+        if wall_time is None:
+            try:
+                wall_time = float(event.get('elapsed_s') or 0.0)
+            except (TypeError, ValueError):
+                wall_time = None
+        if wall_time is not None and wall_time > 0:
+            return wall_time
+
+    non_eval_wall_time = max(
+        (
+            float(event.get('elapsed_s') or 0.0)
+            for event in events
+            if event.get('phase') != 'eval'
+        ),
+        default=0.0,
+    )
+    return non_eval_wall_time if non_eval_wall_time > 0 else total_wall_time
+
+
 def _train_points(run: dict[str, Any], metric_key: str) -> tuple[list[float], list[int], list[float]]:
     wall_time = []
     steps = []
@@ -292,7 +326,7 @@ def _plot_train_partitions_per_hour(plt, runs: list[dict[str, Any]], output: Pat
     labels = []
     values = []
     for run in runs:
-        wall_time = max((float(event.get('elapsed_s') or 0.0) for event in run['events']), default=0.0)
+        wall_time = _training_wall_time(run['events'])
         partitions = sum(1 for event in run['events'] if event.get('event') == 'partition_train_done')
         labels.append(run['label'])
         values.append(partitions / (wall_time / 3600.0) if wall_time > 0 else 0.0)
