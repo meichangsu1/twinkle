@@ -278,9 +278,9 @@ class SyncBarrierMultiLoraGRPORunner:
         self.trained_partitions = 0
         self._write_config_snapshot()
 
-    def run(self, *, max_steps: int) -> int:
+    def run(self, *, max_steps: int | None) -> int:
         round_idx = 0
-        while self.trained_partitions < max_steps:
+        while max_steps is None or self.trained_partitions < max_steps:
             round_start = time.perf_counter()
             self.metrics_recorder.log_event(
                 event='barrier_round_started',
@@ -653,6 +653,13 @@ def _sync_run_id(run_id: str) -> str:
     return run_id
 
 
+def _optional_step_limit(value: Any) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    return None if parsed <= 0 else parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -675,7 +682,7 @@ def main() -> None:
     logger.info('Starting sync-barrier multi-LoRA GRPO baseline')
     logger.info(get_device_placement())
     try:
-        trained = runner.run(max_steps=int(cfg.pipeline.max_steps))
+        trained = runner.run(max_steps=_optional_step_limit(cfg.pipeline.get('max_steps')))
     finally:
         runner.close()
 
