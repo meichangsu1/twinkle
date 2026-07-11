@@ -145,6 +145,37 @@ def _batch_policy_gap_metrics(batch: Any, *, current_policy_version: int) -> dic
     return prefixed_summary('policy_version_gap', gaps)
 
 
+def _assert_generation_tag_schema(
+    tags: Iterable[dict[str, Any]],
+    *,
+    expected_num_generations: int,
+    context_key: str,
+    partition_id: str,
+) -> None:
+    tags = list(tags)
+    assert expected_num_generations > 0, (
+        f'num_generations must be positive for context {context_key}, got {expected_num_generations}')
+    assert tags, f'empty sample tags for context {context_key}, partition {partition_id}'
+    assert len(tags) % expected_num_generations == 0, (
+        f'sample tag count must be divisible by num_generations for context {context_key}, '
+        f'partition {partition_id}: {len(tags)} % {expected_num_generations} != 0')
+    for offset in range(0, len(tags), expected_num_generations):
+        chunk = tags[offset:offset + expected_num_generations]
+        group_id = chunk[0].get('group_id')
+        assert group_id is not None, f'missing group_id at sample offset {offset} in partition {partition_id}'
+        for tag_index, tag in enumerate(chunk):
+            assert 'generation_idx' in tag, (
+                f'missing generation_idx at sample offset {offset + tag_index} in partition {partition_id}')
+        group_ids = [tag.get('group_id') for tag in chunk]
+        generation_indices = [int(tag['generation_idx']) for tag in chunk]
+        assert all(item == group_id for item in group_ids), (
+            f'samples for one GRPO group must be contiguous in partition {partition_id}, '
+            f'offset={offset}, group_ids={group_ids}')
+        assert generation_indices == list(range(expected_num_generations)), (
+            f'group {group_id} generation_idx must be 0..{expected_num_generations - 1} in order, '
+            f'got {generation_indices}')
+
+
 def _partition_train_id(partition_id: str) -> int:
     suffix = partition_id.rsplit('/', 1)[-1]
     if not suffix.startswith('train_'):
@@ -171,6 +202,8 @@ class AsyncRollouter:
         max_concurrency: int = 16,
         target_groups_per_partition: int = 1,
         target_groups_by_context: dict[str, int] | None = None,
+        num_generations: int = 1,
+        num_generations_by_context: dict[str, int] | None = None,
         metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
         self.data_plane = data_plane
@@ -183,6 +216,8 @@ class AsyncRollouter:
         self.max_concurrency = max_concurrency
         self.target_groups_per_partition = target_groups_per_partition
         self.target_groups_by_context = dict(target_groups_by_context or {})
+        self.num_generations = int(num_generations)
+        self.num_generations_by_context = dict(num_generations_by_context or {})
         self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
         self.pending_prompt_groups_by_context: dict[str, Deque[tuple[LoraContext, Trajectory]]] = defaultdict(deque)
         self.active_tasks: set[asyncio.Task] = set()
@@ -272,6 +307,11 @@ class AsyncRollouter:
     def _target_groups_for_context(self, context: LoraContext) -> int:
         return int(self.target_groups_by_context.get(context.key, self.target_groups_per_partition))
 
+    def _num_generations_for_context(self, context: LoraContext) -> int:
+        value = int(self.num_generations_by_context.get(context.key, self.num_generations))
+        assert value > 0, f'num_generations must be positive for context {context.key}, got {value}'
+        return value
+
     def _peek_next_train_id(self, context: LoraContext) -> int:
         if context.key not in self._next_train_id_by_context:
             self._next_train_id_by_context[context.key] = self.data_plane.peek_next_train_id(context)
@@ -324,13 +364,16 @@ class AsyncRollouter:
             metrics={
                 'group_id': group_ref.group_id,
                 'inflight_rollout_groups': self.lora_runtime_registry.get(context).in_flight_groups,
+                'num_generations': self._num_generations_for_context(context),
             },
         )
         try:
+            num_generations = self._num_generations_for_context(context)
             rollout_kwargs = {
                 'tool_manager': tool_manager,
                 'adapter_name': context.adapter_name,
                 'policy_version': group.rollout_policy_version,
+                'num_generations': num_generations,
             }
             if group.rollout_adapter_path is not None:
                 rollout_kwargs['adapter_path'] = group.rollout_adapter_path
@@ -361,7 +404,12 @@ class AsyncRollouter:
                     },
                 )
                 return self.data_plane.get_rollout_partition(group_ref.partition_id)
-            meta, sample_keys = self._write_rollout_samples(group_ref, rollout_rows, rewards=rewards)
+            meta, sample_keys = self._write_rollout_samples(
+                group_ref,
+                rollout_rows,
+                rewards=rewards,
+                expected_num_generations=num_generations,
+            )
             self.data_plane.update_prompt_group_status(
                 group_ref,
                 PromptGroupStatus.ROLLOUT_DONE,
@@ -381,6 +429,7 @@ class AsyncRollouter:
                     'rollout_latency_s': time.perf_counter() - start,
                     'rollout_policy_version': group.rollout_policy_version,
                     'policy_version_gap': current_policy_version - group.rollout_policy_version,
+                    'num_generations': num_generations,
                     **reward_metrics,
                 },
             )
@@ -442,10 +491,16 @@ class AsyncRollouter:
         samples: Iterable[RolloutOutput],
         *,
         rewards: list[float] | None = None,
+        expected_num_generations: int,
     ) -> tuple[PartitionMeta, list[str]]:
         group_samples = [dict(sample) for sample in samples]
-        if rewards is not None and len(rewards) != len(group_samples):
-            raise ValueError(f'reward count {len(rewards)} does not match sample count {len(group_samples)}')
+        assert expected_num_generations > 0, f'expected_num_generations must be positive, got {expected_num_generations}'
+        assert len(group_samples) == expected_num_generations, (
+            f'group {group_ref.group_id} expected {expected_num_generations} rollout samples, '
+            f'got {len(group_samples)}')
+        if rewards is not None:
+            assert len(rewards) == len(group_samples), (
+                f'reward count {len(rewards)} does not match sample count {len(group_samples)}')
         group = self.data_plane.get_prompt_group(group_ref)
         if group.status not in {PromptGroupStatus.PENDING, PromptGroupStatus.RUNNING}:
             raise ValueError(f'group {group.group_id} is not pending/running: {group.status}')
@@ -454,6 +509,7 @@ class AsyncRollouter:
         sample_keys: list[str] = []
         sample_fields: list[dict[str, Any]] = []
         sample_tags: list[dict[str, Any]] = []
+        generation_indices: list[int] = []
         reward_iter = iter(rewards or [])
         for sample_index, trajectory in enumerate(group_samples):
             sample = dict(trajectory)
@@ -463,6 +519,7 @@ class AsyncRollouter:
             key = f'samples/{group_ref.group_id}/{generation_idx}'
             if key in sample_keys:
                 raise ValueError(f'duplicate rollout sample key {key!r}')
+            generation_indices.append(generation_idx)
             logprobs = _require_rollout_logprobs(sample, sample_key=key)
             sample['logprobs'] = logprobs
             fields = _rollout_sample_fields(sample)
@@ -477,6 +534,10 @@ class AsyncRollouter:
             sample_keys.append(key)
             sample_fields.append(fields)
             sample_tags.append(tag)
+
+        assert generation_indices == list(range(expected_num_generations)), (
+            f'group {group.group_id} generation_idx must be 0..{expected_num_generations - 1} in order, '
+            f'got {generation_indices}')
 
         self.data_plane.write_sample_batch(
             partition_id=group_ref.partition_id,
@@ -591,6 +652,8 @@ class AdvantageWorker:
         lora_runtime_registry: LoraRuntimeRegistry | None = None,
         batch_size: int = 1024,
         batch_size_by_context: dict[str, int] | None = None,
+        num_generations: int = 1,
+        num_generations_by_context: dict[str, int] | None = None,
         advantage_fn: Callable[[GRPOAdvantageBatch, LoraContext], tuple[list[float], list[float]]] | None = None,
         metrics_recorder: AsyncRLMetricsRecorder | None = None,
     ):
@@ -599,6 +662,8 @@ class AdvantageWorker:
         self.lora_runtime_registry = lora_runtime_registry
         self.batch_size = batch_size
         self.batch_size_by_context = dict(batch_size_by_context or {})
+        self.num_generations = int(num_generations)
+        self.num_generations_by_context = dict(num_generations_by_context or {})
         self.advantage_fn = advantage_fn or self._default_advantage_fn
         self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
 
@@ -671,10 +736,19 @@ class AdvantageWorker:
 
     def _compute_advantages(self, context: LoraContext, batch: Any) -> Any:
         columns = self.data_plane.read_batch_fields(batch, fields=['rewards'])
+        num_generations = self.num_generations_for_context(context)
+        _assert_generation_tag_schema(
+            batch.tags,
+            expected_num_generations=num_generations,
+            context_key=context.key,
+            partition_id=batch.partition_id,
+        )
         advantage_batch = GRPOAdvantageBatch(
             rewards=columns['rewards'],
             sample_keys=list(batch.keys),
+            group_ids=[str(tag['group_id']) for tag in batch.tags],
             generation_indices=[int(tag['generation_idx']) for tag in batch.tags],
+            num_generations=num_generations,
         )
         advantages, returns = self.advantage_fn(advantage_batch, context)
         sample_count = len(batch.keys)
@@ -713,6 +787,11 @@ class AdvantageWorker:
 
     def batch_size_for_context(self, context: LoraContext) -> int:
         return int(self.batch_size_by_context.get(context.key, self.batch_size))
+
+    def num_generations_for_context(self, context: LoraContext) -> int:
+        value = int(self.num_generations_by_context.get(context.key, self.num_generations))
+        assert value > 0, f'num_generations must be positive for context {context.key}, got {value}'
+        return value
 
     def is_idle(self) -> bool:
         if self.lora_runtime_registry is None:

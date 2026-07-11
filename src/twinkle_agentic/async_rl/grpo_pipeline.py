@@ -116,6 +116,12 @@ def rollout_batch_groups_for_context(cfg, context_cfg) -> int:
     return int(lora_rollout_config(cfg, context_cfg).batch_size)
 
 
+def num_generations_for_context(cfg, context_cfg) -> int:
+    value = int(lora_rollout_config(cfg, context_cfg).get('num_generations', 1))
+    assert value > 0, f'num_generations must be positive for context {context_cfg.adapter_name}, got {value}'
+    return value
+
+
 def max_pending_prompt_groups_for_context(cfg, context_cfg) -> int:
     rollout_batch_groups = rollout_batch_groups_for_context(cfg, context_cfg)
     staleness_window = max(1, int(cfg.pipeline.max_staleness) + 1)
@@ -126,6 +132,13 @@ def rollout_batch_groups_by_context(cfg, contexts: list[LoraContext]) -> dict[st
     result = {}
     for context_cfg, context in zip(lora_context_configs(cfg), contexts):
         result[context.key] = rollout_batch_groups_for_context(cfg, context_cfg)
+    return result
+
+
+def num_generations_by_context(cfg, contexts: list[LoraContext]) -> dict[str, int]:
+    result = {}
+    for context_cfg, context in zip(lora_context_configs(cfg), contexts):
+        result[context.key] = num_generations_for_context(cfg, context_cfg)
     return result
 
 
@@ -286,25 +299,24 @@ def _optional_step_limit(value: Any) -> int | None:
 
 
 def _validate_train_batch_config(cfg) -> None:
-    mini_batch_groups = int(cfg.pipeline.default_mini_batch_size)
-    num_generations = int(cfg.pipeline.rollout.get('num_generations', 1))
     for context_cfg in lora_context_configs(cfg):
+        mini_batch_groups = mini_batch_size_for_context(cfg, context_cfg) or int(cfg.pipeline.default_mini_batch_size)
+        num_generations = num_generations_for_context(cfg, context_cfg)
         rollout_batch_groups = rollout_batch_groups_for_context(cfg, context_cfg)
         if rollout_batch_groups % mini_batch_groups != 0:
-            raise ValueError('resolved rollout batch size must be divisible by pipeline.default_mini_batch_size. '
+            raise ValueError('resolved rollout batch size must be divisible by resolved mini_batch_size. '
                              'Both values are measured in prompt groups. '
                              f'Got context={context_cfg.adapter_name}, rollout_batch_size={rollout_batch_groups}, '
-                             f'default_mini_batch_size={mini_batch_groups}.')
-    mini_batch_samples = mini_batch_groups * num_generations
-    dp_size = _model_dp_size(cfg)
-    if mini_batch_samples < dp_size:
-        raise ValueError('pipeline.default_mini_batch_size is measured in prompt groups, and '
-                         'default_mini_batch_size * pipeline.rollout.num_generations must be >= '
-                         'model data-parallel size. '
-                         f'Got default_mini_batch_size={mini_batch_groups}, num_generations={num_generations}, '
-                         f'mini_batch_samples={mini_batch_samples}, model_dp_size={dp_size}. '
-                         'Increase pipeline.default_mini_batch_size or pipeline.rollout.num_generations, '
-                         'or reduce model.mesh.dp_size.')
+                             f'mini_batch_size={mini_batch_groups}.')
+        mini_batch_samples = mini_batch_groups * num_generations
+        dp_size = _model_dp_size(cfg)
+        if mini_batch_samples < dp_size:
+            raise ValueError('mini_batch_size is measured in prompt groups, and '
+                             'mini_batch_size * num_generations must be >= model data-parallel size. '
+                             f'Got context={context_cfg.adapter_name}, mini_batch_size={mini_batch_groups}, '
+                             f'num_generations={num_generations}, mini_batch_samples={mini_batch_samples}, '
+                             f'model_dp_size={dp_size}. Increase mini_batch_size or num_generations, '
+                             'or reduce model.mesh.dp_size.')
 
 
 def _metric_payload(metric: Any) -> dict[str, Any]:
@@ -416,6 +428,96 @@ def _async_train_batch_data_diagnostics(
     return diagnostics
 
 
+def _flatten_values(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if hasattr(value, 'detach'):
+        value = value.detach()
+    if hasattr(value, 'cpu'):
+        value = value.cpu()
+    if hasattr(value, 'flatten'):
+        value = value.flatten()
+    if hasattr(value, 'tolist'):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        result = []
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                result.extend(_flatten_values(item))
+            else:
+                result.append(item)
+        return result
+    return [value]
+
+
+def _assert_generation_tag_schema(
+    tags: list[dict[str, Any]],
+    *,
+    expected_num_generations: int,
+    context_key: str,
+    partition_id: str,
+) -> None:
+    assert expected_num_generations > 0, (
+        f'num_generations must be positive for context {context_key}, got {expected_num_generations}')
+    assert tags, f'empty sample tags for context {context_key}, partition {partition_id}'
+    assert len(tags) % expected_num_generations == 0, (
+        f'sample tag count must be divisible by num_generations for context {context_key}, '
+        f'partition {partition_id}: {len(tags)} % {expected_num_generations} != 0')
+    for offset in range(0, len(tags), expected_num_generations):
+        chunk = tags[offset:offset + expected_num_generations]
+        group_id = chunk[0].get('group_id')
+        assert group_id is not None, f'missing group_id at sample offset {offset} in partition {partition_id}'
+        for tag_index, tag in enumerate(chunk):
+            assert 'generation_idx' in tag, (
+                f'missing generation_idx at sample offset {offset + tag_index} in partition {partition_id}')
+        group_ids = [tag.get('group_id') for tag in chunk]
+        generation_indices = [int(tag['generation_idx']) for tag in chunk]
+        assert all(item == group_id for item in group_ids), (
+            f'samples for one GRPO group must be contiguous in partition {partition_id}, '
+            f'offset={offset}, group_ids={group_ids}')
+        assert generation_indices == list(range(expected_num_generations)), (
+            f'group {group_id} generation_idx must be 0..{expected_num_generations - 1} in order, '
+            f'got {generation_indices}')
+
+
+def _assert_train_logprobs_schema(
+    *,
+    inputs: list[dict[str, Any]],
+    logprobs: list[list[float]],
+    sample_tags: list[dict[str, Any]],
+    context_key: str,
+    partition_id: str,
+) -> None:
+    assert len(inputs) == len(logprobs), (
+        f'train input/logprobs size mismatch for context {context_key}, partition {partition_id}: '
+        f'{len(inputs)} != {len(logprobs)}')
+    assert len(inputs) == len(sample_tags), (
+        f'train input/sample tag size mismatch for context {context_key}, partition {partition_id}: '
+        f'{len(inputs)} != {len(sample_tags)}')
+    for sample_index, (model_input, sample_logprobs, tag) in enumerate(zip(inputs, logprobs, sample_tags)):
+        sample_id = tag.get('sample_id') or f'offset={sample_index}'
+        assert isinstance(sample_logprobs, list), (
+            f'train sample {sample_id!r} logprobs must be list[float], got {type(sample_logprobs)!r}')
+        for logprob_index, value in enumerate(sample_logprobs):
+            assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+                f'train sample {sample_id!r} logprobs[{logprob_index}] must be float, got {type(value)!r}')
+
+        labels = model_input.get('labels')
+        if labels is not None:
+            trainable_tokens = sum(1 for label in _flatten_values(labels) if label != -100)
+            assert len(sample_logprobs) == trainable_tokens, (
+                f'train sample {sample_id!r} logprobs length must match labels != -100 count: '
+                f'{len(sample_logprobs)} != {trainable_tokens}')
+        if tag.get('trainable_tokens') is not None:
+            assert len(sample_logprobs) == int(tag['trainable_tokens']), (
+                f'train sample {sample_id!r} logprobs length must match tag trainable_tokens: '
+                f'{len(sample_logprobs)} != {tag["trainable_tokens"]}')
+        if tag.get('logprobs_length') is not None:
+            assert len(sample_logprobs) == int(tag['logprobs_length']), (
+                f'train sample {sample_id!r} logprobs length must match tag logprobs_length: '
+                f'{len(sample_logprobs)} != {tag["logprobs_length"]}')
+
+
 def _short_math_reward_metrics(
     records: list[dict[str, Any]],
     *,
@@ -518,6 +620,7 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
     primary_context = contexts[0]
     rollout_cfg = cfg.pipeline.rollout
     target_groups_by_context = rollout_batch_groups_by_context(cfg, contexts)
+    context_num_generations = num_generations_by_context(cfg, contexts)
     context_mini_batch_sizes = mini_batch_size_by_context(cfg, contexts)
     return BaseRLPipelineConfig(
         lora_contexts=contexts,
@@ -531,6 +634,8 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         max_staleness=int(cfg.pipeline.max_staleness),
         default_rollout_batch_size=int(cfg.pipeline.default_rollout_batch_size),
         target_groups_by_context=target_groups_by_context,
+        default_num_generations=int(cfg.pipeline.rollout.get('num_generations', 1)),
+        num_generations_by_context=context_num_generations,
         max_concurrency=int(rollout_cfg.get('max_concurrency', 16)),
         default_mini_batch_size=int(cfg.pipeline.default_mini_batch_size),
         mini_batch_size_by_context=context_mini_batch_sizes,
@@ -658,18 +763,21 @@ class DAPOMathReward:
 class ServerSingleTurnRollout:
     """One prompt-group rollout adapter for local/server vLLMSampler."""
 
-    def __init__(self, sampler: Any, *, sampling_params: Any, num_generations: int):
+    def __init__(self, sampler: Any, *, sampling_params: Any, default_num_generations: int | None = None):
         self.sampler = sampler
         self.sampling_params = sampling_params
-        self.num_generations = num_generations
+        self.default_num_generations = default_num_generations
 
     def __call__(self, trajectories: list[Trajectory], **kwargs) -> list[RolloutOutput]:
         adapter_path = kwargs.get('adapter_path')
         adapter_name = kwargs.get('adapter_name', '')
+        raw_num_generations = kwargs['num_generations'] if 'num_generations' in kwargs else self.default_num_generations
+        num_generations = int(raw_num_generations or 0)
+        assert num_generations > 0, f'num_generations must be passed to rollout, got {num_generations}'
         expanded = []
         for prompt_idx, trajectory in enumerate(trajectories):
             group_id = trajectory.get('group_id') or trajectory.get('sample_id') or f'prompt_{prompt_idx}'
-            for generation_idx in range(self.num_generations):
+            for generation_idx in range(num_generations):
                 item = dict(trajectory)
                 item['group_id'] = group_id
                 item['generation_idx'] = generation_idx
@@ -832,7 +940,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         return ServerSingleTurnRollout(
             sampler,
             sampling_params=sampling_params,
-            num_generations=int(self.cfg.pipeline.rollout.num_generations),
+            default_num_generations=int(self.cfg.pipeline.rollout.get('num_generations', 1)),
         )
 
     def build_data_plane(self):
@@ -932,8 +1040,24 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         context_cfg = lora_context_config_for_context(self.cfg, context)
         mini_batch_groups = mini_batch_size_for_context(self.cfg, context_cfg) or int(
             self.cfg.pipeline.default_mini_batch_size)
-        num_generations = int(self.cfg.pipeline.rollout.num_generations)
+        num_generations = num_generations_for_context(self.cfg, context_cfg)
         mini_batch_size = mini_batch_groups * num_generations
+        sample_tags_all = list(getattr(batch, 'tags', []) or [])
+        assert train_batch.sample_count == len(batch.keys), (
+            f'train batch sample_count/key size mismatch for context {context.key}, partition {partition_id}: '
+            f'{train_batch.sample_count} != {len(batch.keys)}')
+        assert train_batch.sample_count == len(sample_tags_all), (
+            f'train batch sample_count/tag size mismatch for context {context.key}, partition {partition_id}: '
+            f'{train_batch.sample_count} != {len(sample_tags_all)}')
+        assert train_batch.sample_count % mini_batch_size == 0, (
+            f'train batch sample_count must be divisible by mini_batch_size for context {context.key}, '
+            f'partition {partition_id}: {train_batch.sample_count} % {mini_batch_size} != 0')
+        _assert_generation_tag_schema(
+            sample_tags_all,
+            expected_num_generations=num_generations,
+            context_key=context.key,
+            partition_id=partition_id,
+        )
         context_model_cfg = lora_model_config_for_context(self.cfg, context)
         max_length = int(context_model_cfg.template.max_length)
         last_metrics: dict[str, Any] = {}
@@ -950,7 +1074,20 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             logprobs = train_batch.logprobs[mb_start:mb_end]
             advantages = train_batch.advantages[mb_start:mb_end]
             rewards = train_batch.rewards[mb_start:mb_end]
-            sample_tags = list(getattr(batch, 'tags', []) or [])[mb_start:mb_end]
+            sample_tags = sample_tags_all[mb_start:mb_end]
+            _assert_generation_tag_schema(
+                sample_tags,
+                expected_num_generations=num_generations,
+                context_key=context.key,
+                partition_id=partition_id,
+            )
+            _assert_train_logprobs_schema(
+                inputs=inputs,
+                logprobs=logprobs,
+                sample_tags=sample_tags,
+                context_key=context.key,
+                partition_id=partition_id,
+            )
             batch_diagnostics = _async_train_batch_data_diagnostics(
                 inputs=inputs,
                 rewards=rewards,
@@ -1049,6 +1186,29 @@ def grpo_advantage_fn(batch: GRPOAdvantageBatch, context) -> tuple[list[float], 
     rewards = list(batch.rewards)
     if not rewards:
         return [], []
-    num_generations = max(1, max(batch.generation_indices) + 1)
-    advantages = GRPOAdvantage()(rewards, num_generations=num_generations, scale='group').tolist()
+    assert batch.num_generations > 0, (
+        f'num_generations must be positive for context {context.key}, got {batch.num_generations}')
+    sample_count = len(rewards)
+    assert sample_count == len(batch.sample_keys), (
+        f'advantage rewards/sample_keys size mismatch for context {context.key}: '
+        f'{sample_count} != {len(batch.sample_keys)}')
+    assert sample_count == len(batch.group_ids), (
+        f'advantage rewards/group_ids size mismatch for context {context.key}: '
+        f'{sample_count} != {len(batch.group_ids)}')
+    assert sample_count == len(batch.generation_indices), (
+        f'advantage rewards/generation_indices size mismatch for context {context.key}: '
+        f'{sample_count} != {len(batch.generation_indices)}')
+    assert sample_count % batch.num_generations == 0, (
+        f'advantage sample_count must be divisible by num_generations for context {context.key}: '
+        f'{sample_count} % {batch.num_generations} != 0')
+    for offset in range(0, sample_count, batch.num_generations):
+        group_ids = batch.group_ids[offset:offset + batch.num_generations]
+        generation_indices = batch.generation_indices[offset:offset + batch.num_generations]
+        assert len(set(group_ids)) == 1, (
+            f'advantage samples for one group must be contiguous for context {context.key}, '
+            f'offset={offset}, group_ids={group_ids}')
+        assert generation_indices == list(range(batch.num_generations)), (
+            f'advantage generation_idx must be 0..{batch.num_generations - 1} for context {context.key}, '
+            f'offset={offset}, got {generation_indices}')
+    advantages = GRPOAdvantage()(rewards, num_generations=batch.num_generations, scale='group').tolist()
     return advantages, rewards

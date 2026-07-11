@@ -39,6 +39,8 @@ class BaseRLPipelineConfig:
     max_concurrency: int = 16
     default_rollout_batch_size: int = 1
     target_groups_by_context: dict[str, int] = field(default_factory=dict)
+    default_num_generations: int = 1
+    num_generations_by_context: dict[str, int] = field(default_factory=dict)
     default_mini_batch_size: int = 1
     mini_batch_size_by_context: dict[str, int] = field(default_factory=dict)
     max_train_steps: int | None = None
@@ -258,6 +260,8 @@ class BaseRLPipeline(ABC):
             max_concurrency=config.max_concurrency,
             target_groups_per_partition=config.default_rollout_batch_size,
             target_groups_by_context=config.target_groups_by_context,
+            num_generations=config.default_num_generations,
+            num_generations_by_context=config.num_generations_by_context,
             metrics_recorder=self.metrics_recorder,
         )
 
@@ -272,6 +276,8 @@ class BaseRLPipeline(ABC):
             lora_runtime_registry=self.lora_runtime_registry,
             batch_size=self.config.default_mini_batch_size,
             batch_size_by_context=self.config.mini_batch_size_by_context,
+            num_generations=self.config.default_num_generations,
+            num_generations_by_context=self.config.num_generations_by_context,
             advantage_fn=advantage_fn,
             metrics_recorder=self.metrics_recorder,
         )

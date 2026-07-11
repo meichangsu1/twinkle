@@ -172,7 +172,9 @@ class TransformersTrainBatch:
 class GRPOAdvantageBatch:
     rewards: list[float]
     sample_keys: list[str]
+    group_ids: list[str]
     generation_indices: list[int]
+    num_generations: int
 
     @property
     def sample_count(self) -> int:

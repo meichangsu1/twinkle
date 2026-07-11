@@ -43,6 +43,7 @@ from twinkle_agentic.async_rl.grpo_pipeline import (
     lora_model_config,
     lora_model_config_for_context,
     mini_batch_size_for_context,
+    num_generations_for_context,
     primary_lora_context,
     rollout_batch_groups_for_context,
     validate_training_input_length,
@@ -241,7 +242,7 @@ def build_rollout(cfg, sampler_mesh) -> ServerSingleTurnRollout:
     return ServerSingleTurnRollout(
         sampler,
         sampling_params=sampling_params,
-        num_generations=int(cfg.pipeline.rollout.num_generations),
+        default_num_generations=int(cfg.pipeline.rollout.get('num_generations', 1)),
     )
 
 
@@ -361,6 +362,7 @@ class SyncBarrierMultiLoraGRPORunner:
             if reset_prefix_cache is not None:
                 reset_prefix_cache()
             start = time.perf_counter()
+            num_generations = num_generations_for_context(self.cfg, context_cfg)
             self.metrics_recorder.log_event(
                 event='rollout_started',
                 phase='rollout',
@@ -378,9 +380,13 @@ class SyncBarrierMultiLoraGRPORunner:
                     adapter_name=context.adapter_name,
                     adapter_path=adapter_path,
                     policy_version=rollout_policy_version,
+                    num_generations=num_generations,
                 ))
+            assert len(rows) == len(prompts) * num_generations, (
+                f'sync rollout sample count mismatch for context {context.key}, partition {partition_id}: '
+                f'{len(rows)} != {len(prompts)} * {num_generations}')
             rewards = self._compute_rewards(context, rows)
-            advantages = self._compute_advantages(rewards)
+            advantages = self._compute_advantages(context, rewards)
             self.metrics_recorder.log_event(
                 event='rollout_done',
                 phase='rollout',
@@ -391,6 +397,7 @@ class SyncBarrierMultiLoraGRPORunner:
                     'round_idx': round_idx,
                     'prompt_groups': len(prompts),
                     'sample_count': len(rows),
+                    'num_generations': num_generations,
                     'rollout_latency_s': time.perf_counter() - start,
                     'rollout_policy_version': rollout_policy_version,
                     'policy_version_gap': 0,
@@ -454,7 +461,7 @@ class SyncBarrierMultiLoraGRPORunner:
         context_cfg = lora_context_config_for_context(self.cfg, context)
         mini_batch_groups = mini_batch_size_for_context(self.cfg, context_cfg) or int(
             self.cfg.pipeline.default_mini_batch_size)
-        num_generations = int(self.cfg.pipeline.rollout.num_generations)
+        num_generations = num_generations_for_context(self.cfg, context_cfg)
         mini_batch_size = mini_batch_groups * num_generations
         context_model_cfg = lora_model_config_for_context(self.cfg, context)
         max_length = int(context_model_cfg.template.max_length)
@@ -534,14 +541,16 @@ class SyncBarrierMultiLoraGRPORunner:
             raise ValueError(f'reward length mismatch for {context.key}: {len(rewards)} != {len(rows)}')
         return [float(reward) for reward in rewards]
 
-    def _compute_advantages(self, rewards: list[float]) -> list[float]:
+    def _compute_advantages(self, context: LoraContext, rewards: list[float]) -> list[float]:
         from twinkle.advantage import GRPOAdvantage
 
         if not rewards:
             return []
-        num_generations = int(self.cfg.pipeline.rollout.num_generations)
-        if len(rewards) % num_generations != 0:
-            raise ValueError(f'reward count must be divisible by num_generations={num_generations}, got {len(rewards)}')
+        context_cfg = lora_context_config_for_context(self.cfg, context)
+        num_generations = num_generations_for_context(self.cfg, context_cfg)
+        assert len(rewards) % num_generations == 0, (
+            f'reward count must be divisible by num_generations={num_generations} for context {context.key}, '
+            f'got {len(rewards)}')
         return GRPOAdvantage()(rewards, num_generations=num_generations, scale='group').tolist()
 
     def _ensure_adapter_path(self, context: LoraContext, *, partition_id: str) -> str | None:
