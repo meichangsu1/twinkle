@@ -214,7 +214,7 @@ class AIMEProcessor(Preprocessor):
       Solution: optional reference solution
       Answer: final answer
     """
-    answer_format = "\nThe answer format must be: \\boxed{'The final answer goes here.'}"
+    answer_format = "\nThe answer format must be: \\boxed{{'The final answer goes here.'}}"
     prompt_template = '{problem}' + answer_format
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
