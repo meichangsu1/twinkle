@@ -214,11 +214,8 @@ class AIMEProcessor(Preprocessor):
       Solution: optional reference solution
       Answer: final answer
     """
-    prompt_template = (
-        'Solve the following math problem step by step. The last line of your response should be of the form '
-        'Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n'
-        '{problem}\n\n'
-        'Remember to put your answer on its own line after "Answer:".')
+    answer_format = "\nThe answer format must be: \\boxed{'The final answer goes here.'}"
+    prompt_template = '{problem}' + answer_format
 
     def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         rows = self.map_col_to_row(rows)
