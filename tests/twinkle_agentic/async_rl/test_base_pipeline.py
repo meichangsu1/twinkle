@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from twinkle_agentic.async_rl import (
     BaseRLPipeline,
     BaseRLPipelineConfig,
@@ -248,7 +250,7 @@ def test_base_pipeline_feeds_prompts_from_prompt_loaders():
     assert all(loader.exhausted for loader in pipeline.prompt_loaders)
 
 
-def test_algorithm_pipeline_can_define_roles_directly():
+def test_component_only_pipeline_is_not_supported_by_orchestrated_runner():
 
     class DummyComponent:
 
@@ -298,8 +300,8 @@ def test_algorithm_pipeline_can_define_roles_directly():
         component=component,
     )
 
-    history = pipeline.run_until_idle(max_steps=1)
+    with pytest.raises(NotImplementedError):
+        pipeline.run_until_idle(max_steps=1)
 
-    assert component.calls == 1
-    assert history
+    assert component.calls == 0
     assert not hasattr(pipeline, 'rollouter')

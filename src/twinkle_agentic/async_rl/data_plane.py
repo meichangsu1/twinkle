@@ -539,6 +539,8 @@ class TransferQueueDataPlane:
         partition_id: str | None = None,
         metrics: dict[str, Any] | None = None,
     ) -> None:
+        if not self.metrics_recorder.should_record_event(op):
+            return
         payload = {f'{op}_latency_ms': (time.perf_counter() - start) * 1000.0}
         if metrics:
             payload.update(metrics)

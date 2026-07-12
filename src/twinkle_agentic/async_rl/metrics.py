@@ -21,6 +21,8 @@ class AsyncRLMetricsConfig:
     output_dir: str = 'outputs/async_rl_experiments'
     enable_jsonl: bool = True
     enable_swanlab: bool = False
+    record_tq_events: bool = False
+    record_pipeline_steps: bool = False
     swanlab_project: str = 'twinkle'
     swanlab_experiment_name: str | None = None
     swanlab_mode: str = 'local'
@@ -30,6 +32,9 @@ class AsyncRLMetricsConfig:
 
 class AsyncRLMetricsRecorder:
     """Event recorder interface for async RL experiments."""
+
+    def should_record_event(self, event: str) -> bool:
+        return True
 
     def log_event(
         self,
@@ -48,7 +53,9 @@ class AsyncRLMetricsRecorder:
 
 
 class NoopMetricsRecorder(AsyncRLMetricsRecorder):
-    pass
+
+    def should_record_event(self, event: str) -> bool:
+        return False
 
 
 class JSONLMetricsRecorder(AsyncRLMetricsRecorder):
@@ -63,6 +70,9 @@ class JSONLMetricsRecorder(AsyncRLMetricsRecorder):
         if config.metadata:
             self.log_event(event='run_metadata', phase='run', metrics=config.metadata)
 
+    def should_record_event(self, event: str) -> bool:
+        return _should_record_event(self.config, event)
+
     def log_event(
         self,
         *,
@@ -73,6 +83,8 @@ class JSONLMetricsRecorder(AsyncRLMetricsRecorder):
         policy_version: int | None = None,
         metrics: dict[str, Any] | None = None,
     ) -> None:
+        if not self.should_record_event(event):
+            return
         payload = event_payload(
             config=self.config,
             start_time=self.start_time,
@@ -112,6 +124,9 @@ class SwanLabMetricsRecorder(AsyncRLMetricsRecorder):
             init_kwargs['logdir'] = config.swanlab_logdir
         self._swanlab.init(**init_kwargs)
 
+    def should_record_event(self, event: str) -> bool:
+        return self._swanlab is not None and _should_record_event(self.config, event)
+
     def log_event(
         self,
         *,
@@ -122,7 +137,7 @@ class SwanLabMetricsRecorder(AsyncRLMetricsRecorder):
         policy_version: int | None = None,
         metrics: dict[str, Any] | None = None,
     ) -> None:
-        if self._swanlab is None:
+        if not self.should_record_event(event):
             return
         payload = event_payload(
             config=self.config,
@@ -146,6 +161,9 @@ class CompositeMetricsRecorder(AsyncRLMetricsRecorder):
 
     def __init__(self, recorders: list[AsyncRLMetricsRecorder]):
         self.recorders = recorders
+
+    def should_record_event(self, event: str) -> bool:
+        return any(recorder.should_record_event(event) for recorder in self.recorders)
 
     def log_event(
         self,
@@ -185,6 +203,23 @@ def build_metrics_recorder(config: AsyncRLMetricsConfig | None) -> AsyncRLMetric
     if len(recorders) == 1:
         return recorders[0]
     return CompositeMetricsRecorder(recorders)
+
+
+_TQ_EVENTS = frozenset({
+    'kv_put',
+    'kv_batch_put',
+    'kv_batch_get',
+    'kv_clear',
+    'kv_list',
+})
+
+
+def _should_record_event(config: AsyncRLMetricsConfig, event: str) -> bool:
+    if event in _TQ_EVENTS and not config.record_tq_events:
+        return False
+    if event == 'pipeline_step' and not config.record_pipeline_steps:
+        return False
+    return True
 
 
 def event_payload(

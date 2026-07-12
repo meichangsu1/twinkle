@@ -260,6 +260,50 @@ class ComponentResult:
     count: int = 0
 
 
+@dataclass(frozen=True)
+class TrainStageResult:
+    train_batches: int = 0
+    trained_partitions: int = 0
+    metadata: PartitionMeta | None = None
+
+    @property
+    def had_work(self) -> bool:
+        return self.train_batches > 0 or self.trained_partitions > 0
+
+
+@dataclass(frozen=True)
+class PipelineStepResult:
+    rollout: PartitionMeta | None = None
+    advantage: PartitionMeta | None = None
+    train: PartitionMeta | None = None
+    prompt_groups: int = 0
+    rollout_events: int = 0
+    advantage_groups: int = 0
+    train_batches: int = 0
+    trained_partitions: int = 0
+
+    @property
+    def had_work(self) -> bool:
+        return any((
+            self.prompt_groups,
+            self.rollout_events,
+            self.advantage_groups,
+            self.train_batches,
+            self.trained_partitions,
+        ))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in {'rollout', 'advantage', 'train'}:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def values(self) -> tuple[PartitionMeta | None, PartitionMeta | None, PartitionMeta | None]:
+        return self.rollout, self.advantage, self.train
+
+
 class RolloutCallable(Protocol):
     """Callable contract used by AsyncRollouter.
 

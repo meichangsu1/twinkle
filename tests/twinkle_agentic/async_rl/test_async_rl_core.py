@@ -83,7 +83,12 @@ def make_rollout_sample_writer(data_plane):
 
 
 def write_rollout_samples(data_plane, group_ref, samples, *, rewards=None):
-    return make_rollout_sample_writer(data_plane)._write_rollout_samples(group_ref, samples, rewards=rewards)
+    return make_rollout_sample_writer(data_plane)._write_rollout_samples(
+        group_ref,
+        samples,
+        rewards=rewards,
+        expected_num_generations=len(samples),
+    )
 
 
 def batch_group_ids(batch):
@@ -179,6 +184,39 @@ def test_jsonl_metrics_recorder_writes_event_sidecar(tmp_path):
     assert events[1]['partition_id'] == context.partition_id(0)
     assert events[1]['policy_version'] == 1
     assert events[1]['metrics']['reward_mean'] == 0.5
+
+
+def test_jsonl_metrics_recorder_filters_high_frequency_control_events_by_default(tmp_path):
+    config = AsyncRLMetricsConfig(
+        run_id='run',
+        output_dir=str(tmp_path),
+    )
+    recorder = JSONLMetricsRecorder(config)
+    recorder.log_event(event='kv_list', phase='tq', metrics={'keys': 9})
+    recorder.log_event(event='pipeline_step', phase='pipeline', metrics={'pipeline_had_work': False})
+    recorder.log_event(event='rollout_done', phase='rollout', metrics={'sample_count': 8})
+    recorder.close()
+
+    path = tmp_path / 'run' / 'metrics.jsonl'
+    events = [json.loads(line)['event'] for line in path.read_text(encoding='utf-8').splitlines()]
+    assert events == ['rollout_done']
+
+
+def test_jsonl_metrics_recorder_can_record_control_events_when_enabled(tmp_path):
+    config = AsyncRLMetricsConfig(
+        run_id='run',
+        output_dir=str(tmp_path),
+        record_tq_events=True,
+        record_pipeline_steps=True,
+    )
+    recorder = JSONLMetricsRecorder(config)
+    recorder.log_event(event='kv_list', phase='tq', metrics={'keys': 9})
+    recorder.log_event(event='pipeline_step', phase='pipeline', metrics={'pipeline_had_work': False})
+    recorder.close()
+
+    path = tmp_path / 'run' / 'metrics.jsonl'
+    events = [json.loads(line)['event'] for line in path.read_text(encoding='utf-8').splitlines()]
+    assert events == ['kv_list', 'pipeline_step']
 
 
 def test_swanlab_flatten_uses_stable_metric_namespaces():
@@ -944,6 +982,58 @@ def test_trainer_trains_group_batches_and_syncs_only_when_partition_done():
     assert received[0].adapter_path == '/tmp/lora-v1'
     assert train_batches == [expected_group_ids[:2], expected_group_ids[2:]]
     assert data_plane.list_partitions(context) == []
+
+
+def test_trainer_stage_drains_selected_context_until_blocked():
+    context_a = make_context('a')
+    context_b = make_context('b', run='run_b')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context_a)
+    registry.register(context_b)
+
+    partition_a = data_plane.create_rollout_partition(context_a, target_groups=2)
+    registry.on_partition_created(context_a, partition_a.partition_id)
+    complete_prompt_group(data_plane, context_a, partition_a, make_sample(0))
+    complete_prompt_group(data_plane, context_a, partition_a, make_sample(1))
+
+    partition_b = data_plane.create_rollout_partition(context_b, target_groups=1)
+    registry.on_partition_created(context_b, partition_b.partition_id)
+    complete_prompt_group(data_plane, context_b, partition_b, make_sample(2))
+
+    AdvantageWorker(
+        data_plane=data_plane,
+        contexts=[context_a, context_b],
+        lora_runtime_registry=registry,
+        batch_size=2,
+    ).process_available()
+
+    trained_contexts = []
+
+    def train_fn(ctx, batch):
+        trained_contexts.append(ctx.key)
+        assert trainer.read_train_batch(batch).sample_count == 1
+        return {'adapter_path': f'/tmp/{ctx.adapter_name}-v1'}
+
+    trainer = TrainerWorker(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        scheduler=TrainerScheduler(lora_runtime_registry=registry),
+        train_batch_fn=train_fn,
+        train_batch_groups=1,
+    )
+
+    result = trainer.train_until_blocked()
+
+    assert result.train_batches == 2
+    assert result.trained_partitions == 1
+    assert trained_contexts == [context_a.key, context_a.key]
+    assert data_plane.list_partitions(context_a) == []
+    assert data_plane.list_prompt_groups(
+        context_b,
+        partition_id=partition_b.partition_id,
+        statuses=[PromptGroupStatus.ADVANTAGE_DONE],
+    )
 
 
 def test_trainer_mini_batch_size_is_context_level():

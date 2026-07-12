@@ -181,6 +181,8 @@ def async_rl_metrics_config(cfg) -> AsyncRLMetricsConfig | None:
         output_dir=str(metrics_cfg.get('output_dir', 'outputs/async_rl_experiments')),
         enable_jsonl=bool(metrics_cfg.get('enable_jsonl', True)),
         enable_swanlab=bool(metrics_cfg.get('enable_swanlab', False)),
+        record_tq_events=bool(metrics_cfg.get('record_tq_events', False)),
+        record_pipeline_steps=bool(metrics_cfg.get('record_pipeline_steps', False)),
         swanlab_project=str(metrics_cfg.get('swanlab_project', 'twinkle')),
         swanlab_experiment_name=metrics_cfg.get('swanlab_experiment_name'),
         swanlab_mode=str(metrics_cfg.get('swanlab_mode', 'local')),

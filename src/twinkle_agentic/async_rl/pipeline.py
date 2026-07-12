@@ -12,7 +12,8 @@ from .metrics import AsyncRLMetricsConfig, AsyncRLMetricsRecorder, build_metrics
 from .prompt_loader import PromptLoader
 from .registry import LoraRuntimeRegistry
 from .staleness import StalenessManager
-from .types import GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus, PromptGroupStatus, RolloutCallable
+from .types import (GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus, PipelineStepResult,
+                    PromptGroupStatus, RolloutCallable)
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
                       ToolManagerFactory, TrainerScheduler, TrainerStepResult, TrainerWorker)
 
@@ -220,7 +221,7 @@ class BaseRLPipeline(ABC):
         self.create_grpo_roles()
 
     def create_grpo_roles(self) -> None:
-        """Create the default Multi-LoRA GRPO component graph."""
+        """Create the default Multi-LoRA GRPO stage roles."""
         if not self.reward_registry:
             self.reward_registry = self.build_reward_registry()
         self.advantage_fn = self.build_advantage_fn()
@@ -238,7 +239,7 @@ class BaseRLPipeline(ABC):
         self.trainer_scheduler = self.build_trainer_scheduler(train_policy=self.train_policy)
         self.trainer_worker = self.build_trainer_worker()
         self.prompt_loaders = self.build_prompt_loaders()
-        self.components = self.build_pipeline_components()
+        self.rollouter.attach_prompt_loaders(self.prompt_loaders)
 
     def build_rollouter(
         self,
@@ -332,21 +333,6 @@ class BaseRLPipeline(ABC):
             metrics_recorder=self.metrics_recorder,
         )
 
-    def build_pipeline_components(self) -> list[Any]:
-        """Return the component graph run by this pipeline.
-
-        Algorithm-specific pipelines should override this if their roles are
-        not the default GRPO chain. The default graph is:
-
-        PromptLoader -> AsyncRollouter(inline reward) -> AdvantageWorker -> TrainerWorker
-        """
-        return [
-            *self.prompt_loaders,
-            self.rollouter,
-            self.advantage_worker,
-            self.trainer_worker,
-        ]
-
     @classmethod
     def build_multilora_model(
         cls,
@@ -391,19 +377,33 @@ class BaseRLPipeline(ABC):
         """
         self.rollouter.enqueue_prompt_groups(context or self.current_context(), prompt_groups)
 
-    async def step_async(self) -> dict[str, PartitionMeta | None]:
-        step_result = {'rollout': None, 'advantage': None, 'train': None}
-        self._last_step_had_work = False
-        for component in self.components:
-            result = component.step()
-            if asyncio.iscoroutine(result):
-                result = await result
-            if result is None:
-                continue
-            self._last_step_had_work = True
-            if result.kind in step_result:
-                step_result[result.kind] = result.metadata
-        if self.metrics_recorder is not None:
+    async def step_async(self, *, max_train_partitions: int | None = None) -> PipelineStepResult:
+        """Run one coarse orchestration cycle: rollout, advantage, then train.
+
+        This is intentionally not a component tick loop. Rollout owns prompt
+        loading/task completion/submission, advantage consumes TQ metadata, and
+        trainer synchronously drains one selected context until it is blocked.
+        """
+        self._require_orchestrated_roles()
+
+        rollout_result = self.rollouter.step()
+        if asyncio.iscoroutine(rollout_result):
+            rollout_result = await rollout_result
+
+        advantage_result = self.advantage_worker.process_available()
+        train_result = self.trainer_worker.train_until_blocked(max_partitions=max_train_partitions)
+
+        step_result = PipelineStepResult(
+            rollout=None if rollout_result is None else rollout_result.metadata,
+            advantage=None if advantage_result is None else advantage_result.metadata,
+            train=None if train_result is None else train_result.metadata,
+            rollout_events=0 if rollout_result is None else rollout_result.count,
+            advantage_groups=0 if advantage_result is None else advantage_result.count,
+            train_batches=0 if train_result is None else train_result.train_batches,
+            trained_partitions=0 if train_result is None else train_result.trained_partitions,
+        )
+        self._last_step_had_work = step_result.had_work
+        if self.metrics_recorder is not None and self.metrics_recorder.should_record_event('pipeline_step'):
             self.metrics_recorder.log_event(
                 event='pipeline_step',
                 phase='pipeline',
@@ -414,7 +414,7 @@ class BaseRLPipeline(ABC):
             )
         return step_result
 
-    def step(self) -> dict[str, PartitionMeta | None]:
+    def step(self) -> PipelineStepResult:
         if self._sync_step_loop is None or self._sync_step_loop.is_closed():
             self._sync_step_loop = asyncio.new_event_loop()
         return self._sync_step_loop.run_until_complete(self.step_async())
@@ -424,28 +424,26 @@ class BaseRLPipeline(ABC):
         prompt_groups: Iterable[Trajectory] | None = None,
         *,
         max_steps: int | None = None,
-    ) -> list[dict[str, PartitionMeta | None]]:
+    ) -> list[PipelineStepResult]:
         if prompt_groups is not None:
             self.submit_prompt_groups(prompt_groups)
         limit = max_steps if max_steps is not None else self.config.max_train_steps
-        history: list[dict[str, PartitionMeta | None]] = []
+        history: list[PipelineStepResult] = []
         trained = 0
-        idle_steps = 0
         while limit is None or trained < limit:
-            result = await self.step_async()
+            remaining = None if limit is None else max(0, limit - trained)
+            result = await self.step_async(max_train_partitions=remaining)
             history.append(result)
-            if result['train'] is not None:
-                trained += 1
-                idle_steps = 0
+            if result.trained_partitions:
+                trained += result.trained_partitions
                 if self.should_stop(trained):
                     break
-            elif self._last_step_had_work or any(value is not None for value in result.values()):
-                idle_steps = 0
-            else:
-                idle_steps += 1
-                if self._is_drained():
-                    break
-                await asyncio.sleep(0)
+                continue
+            if result.had_work:
+                continue
+            if self._is_drained():
+                break
+            await asyncio.sleep(0.05)
         return history
 
     def run(
@@ -453,7 +451,7 @@ class BaseRLPipeline(ABC):
         prompt_groups: Iterable[Trajectory] | None = None,
         *,
         max_steps: int | None = None,
-    ) -> list[dict[str, PartitionMeta | None]]:
+    ) -> list[PipelineStepResult]:
         """Drive the async RL loop.
 
         `prompt_groups` is an optional convenience feed for rollout prompts.
@@ -461,9 +459,18 @@ class BaseRLPipeline(ABC):
         """
         return asyncio.run(self.run_async(prompt_groups, max_steps=max_steps))
 
-    def run_until_idle(self, *, max_steps: int | None = None) -> list[dict[str, PartitionMeta | None]]:
+    def run_until_idle(self, *, max_steps: int | None = None) -> list[PipelineStepResult]:
         """Advance workers without adding new rollout prompts."""
         return self.run(max_steps=max_steps)
+
+    def _require_orchestrated_roles(self) -> None:
+        missing = [
+            name for name in ('rollouter', 'advantage_worker', 'trainer_worker')
+            if not hasattr(self, name)
+        ]
+        if missing:
+            raise NotImplementedError(
+                f'{self.__class__.__name__} does not provide orchestrated async RL roles: {missing}')
 
     def sync_and_clear_completed_partitions(self, metadata: PartitionMeta) -> None:
         """Hook for custom pipelines after a train_k is completed.
@@ -535,7 +542,14 @@ class BaseRLPipeline(ABC):
         return metrics
 
     def shutdown(self) -> None:
-        for component in getattr(self, 'components', []):
+        components = [
+            getattr(self, 'rollouter', None),
+            getattr(self, 'advantage_worker', None),
+            getattr(self, 'trainer_worker', None),
+        ]
+        for component in components:
+            if component is None:
+                continue
             shutdown = getattr(component, 'shutdown', None)
             if shutdown is not None:
                 shutdown()
@@ -553,7 +567,7 @@ class BaseRLPipeline(ABC):
 
         The default GRPO train path is implemented by
         `MultiLoraGRPOTrainerWorker`. New algorithms should prefer overriding
-        `build_trainer_worker()` or `build_pipeline_components()`.
+        `build_trainer_worker()`.
         """
         raise NotImplementedError('BaseRLPipeline.train_batch is not implemented. '
                                   'Use MultiLoraGRPOTrainerWorker or override build_trainer_worker().')
@@ -565,9 +579,10 @@ class BaseRLPipeline(ABC):
         return [self.current_context(context) for context in self.contexts]
 
     def _is_drained(self) -> bool:
-        if any(not component.is_idle() for component in self.components):
+        rollouter = getattr(self, 'rollouter', None)
+        if rollouter is not None and not rollouter.is_idle():
             return False
-        if not hasattr(self, 'rollouter'):
+        if rollouter is None:
             return True
         for context in self.current_contexts():
             if self.rollouter.pending_prompt_group_count(context) > 0:

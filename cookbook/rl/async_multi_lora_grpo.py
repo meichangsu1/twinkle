@@ -366,7 +366,10 @@ def main() -> None:
         logger.info('Starting server-side async multi-LoRA GRPO')
         logger.info(get_device_placement())
         history = pipeline.run_until_idle(max_steps=optional_step_limit(cfg.pipeline.get('max_steps')))
-        trained = sum(1 for item in history if item.get('train') is not None)
+        trained = sum(
+            getattr(item, 'trained_partitions', 1 if item.get('train') is not None else 0)
+            for item in history
+        )
         logger.info('async_multi_lora_grpo progress: trained_partitions=%s', trained)
 
         final_adapter_paths: dict[str, str] = {}

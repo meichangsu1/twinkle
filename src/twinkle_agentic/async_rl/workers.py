@@ -18,7 +18,7 @@ from .staleness import StalenessManager
 from .tq_utils import ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields, read_train_batch, rows_to_tq_fields
 from .types import (ComponentResult, GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus, PromptGroupRef,
                     PromptGroupStatus, RolloutCallable, RolloutOutput, RolloutScheduleCandidate, TrainBatchCandidate,
-                    TransformersTrainBatch)
+                    TrainStageResult, TransformersTrainBatch)
 
 
 class ToolManagerFactory:
@@ -221,9 +221,13 @@ class AsyncRollouter:
         self.metrics_recorder = metrics_recorder or NoopMetricsRecorder()
         self.pending_prompt_groups_by_context: dict[str, Deque[tuple[LoraContext, Trajectory]]] = defaultdict(deque)
         self.active_tasks: set[asyncio.Task] = set()
+        self.prompt_loaders: list[Any] = []
         self._last_rollout_submit_time: dict[str, float] = defaultdict(float)
         self._submitted_prompt_groups: dict[str, int] = defaultdict(int)
         self._next_train_id_by_context: dict[str, int] = {}
+
+    def attach_prompt_loaders(self, prompt_loaders: Iterable[Any]) -> None:
+        self.prompt_loaders = list(prompt_loaders)
 
     def enqueue_prompt_groups(self, context: LoraContext, prompt_groups: Iterable[Trajectory]) -> None:
         """Append rollout inputs for a context.
@@ -627,19 +631,40 @@ class AsyncRollouter:
         if self._free_group_slots(partition) == 0:
             self.data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
 
+    def _load_prompt_stage(self) -> int:
+        loaded = 0
+        for loader in self.prompt_loaders:
+            result = loader.step()
+            if result is not None:
+                loaded += result.count
+        return loaded
+
     async def step(self) -> ComponentResult | None:
+        loaded_prompt_groups = self._load_prompt_stage()
         completed = await self._collect_finished_tasks()
         submitted_groups = self._submit_prompt_group_tasks()
-        if completed or submitted_groups:
-            return ComponentResult(component='rollouter', kind='rollout', count=completed + submitted_groups)
+        if loaded_prompt_groups or completed or submitted_groups:
+            return ComponentResult(
+                component='rollouter',
+                kind='rollout',
+                count=loaded_prompt_groups + completed + submitted_groups,
+            )
         return None
 
     def is_idle(self) -> bool:
-        return not any(self.pending_prompt_groups_by_context.values()) and not self.active_tasks
+        return (
+            all(loader.is_idle() for loader in self.prompt_loaders)
+            and not any(self.pending_prompt_groups_by_context.values())
+            and not self.active_tasks
+        )
 
     def shutdown(self) -> None:
         for task in list(self.active_tasks):
             task.cancel()
+        for loader in self.prompt_loaders:
+            shutdown = getattr(loader, 'shutdown', None)
+            if shutdown is not None:
+                shutdown()
 
 
 class AdvantageWorker:
@@ -767,23 +792,30 @@ class AdvantageWorker:
         )
         return batch
 
-    def step(self) -> ComponentResult | None:
+    def process_available(self) -> ComponentResult | None:
         if self.lora_runtime_registry is None:
             return None
         count = 0
         last_meta = None
         for context in self.contexts:
             max_groups = self.batch_size_for_context(context)
-            partition_ids = sorted(self.lora_runtime_registry.get(context).live_partitions)
+            try:
+                partition_ids = sorted(self.lora_runtime_registry.get(context).live_partitions)
+            except KeyError:
+                continue
             for partition_id in partition_ids:
-                groups = self._select_advantage_groups(context, partition_id=partition_id, max_groups=max_groups)
-                if not groups:
-                    continue
-                last_meta = self.process_advantage_batch(context, partition_id=partition_id, groups=groups)
-                count += len(groups)
+                while True:
+                    groups = self._select_advantage_groups(context, partition_id=partition_id, max_groups=max_groups)
+                    if not groups:
+                        break
+                    last_meta = self.process_advantage_batch(context, partition_id=partition_id, groups=groups)
+                    count += len(groups)
         if last_meta is None:
             return None
         return ComponentResult(component='advantage_worker', kind='advantage', metadata=last_meta, count=count)
+
+    def step(self) -> ComponentResult | None:
+        return self.process_available()
 
     def batch_size_for_context(self, context: LoraContext) -> int:
         return int(self.batch_size_by_context.get(context.key, self.batch_size))
@@ -892,6 +924,44 @@ class TrainerWorker:
         )
         if candidate is None:
             return None
+        return self._train_candidate(candidate)
+
+    def train_until_blocked(self, *, max_partitions: int | None = None) -> TrainStageResult | None:
+        candidate = self.scheduler.next_batch(
+            self.list_train_batch_candidates(),
+            self.current_context,
+        )
+        if candidate is None:
+            return None
+
+        selected_context = candidate.context
+        train_batches = 0
+        trained_partitions = 0
+        last_meta: PartitionMeta | None = None
+        while candidate is not None:
+            result = self._train_candidate(candidate)
+            train_batches += 1
+            last_meta = result.metadata
+            if result.kind == 'train':
+                trained_partitions += 1
+                if max_partitions is not None and trained_partitions >= max_partitions:
+                    break
+            candidate = self._next_candidate_for_context(selected_context)
+
+        return TrainStageResult(
+            train_batches=train_batches,
+            trained_partitions=trained_partitions,
+            metadata=last_meta,
+        )
+
+    def _next_candidate_for_context(self, context: LoraContext) -> TrainBatchCandidate | None:
+        candidates = [
+            candidate for candidate in self.list_train_batch_candidates()
+            if candidate.context.key == context.key
+        ]
+        return self.scheduler.next_batch(candidates, context)
+
+    def _train_candidate(self, candidate: TrainBatchCandidate) -> ComponentResult:
         partition = candidate.partition
         context = partition.context
         self.current_context = context

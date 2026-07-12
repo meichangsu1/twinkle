@@ -12,8 +12,9 @@ from .scheduling import (PreferCurrentTrainPolicy, WeightedFairRolloutPolicy, We
                          WorkConservingRolloutPolicy)
 from .staleness import StalenessManager
 from .types import (ComponentResult, GRPOAdvantageBatch, LoraAdapterState, LoraContext, LoraRuntimeState, PartitionMeta,
-                    PartitionStatus, PromptGroupMeta, PromptGroupRef, PromptGroupStatus, RolloutOutput,
-                    RolloutScheduleCandidate, TrainBatchCandidate, TransformersTrainBatch)
+                    PartitionStatus, PipelineStepResult, PromptGroupMeta, PromptGroupRef, PromptGroupStatus,
+                    RolloutOutput, RolloutScheduleCandidate, TrainBatchCandidate, TrainStageResult,
+                    TransformersTrainBatch)
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
                       ToolManagerFactory, TrainerScheduler, TrainerWorker)
 
@@ -42,6 +43,7 @@ __all__ = [
     'MultiLoraGRPOTrainConfig',
     'MultiLoraGRPOTrainerWorker',
     'PartitionMeta',
+    'PipelineStepResult',
     'RolloutOutput',
     'PartitionStatus',
     'PreferCurrentTrainPolicy',
@@ -49,6 +51,7 @@ __all__ = [
     'PromptGroupRef',
     'RolloutScheduleCandidate',
     'TrainBatchCandidate',
+    'TrainStageResult',
     'StalenessManager',
     'ToolManagerFactory',
     'TrainerScheduler',
