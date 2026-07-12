@@ -704,7 +704,7 @@ class GSM8KReward:
     def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[float]:
         accuracy = self.accuracy(trajectories)
         brevity = self.brevity(trajectories)
-        total = [a + b for a, b in zip(accuracy, brevity)]
+        total = [float(a) for a in accuracy]
         for trajectory, total_reward, accuracy_reward, brevity_reward in zip(trajectories, total, accuracy, brevity):
             metadata = dict(trajectory.get('metadata') or {})
             metadata.update({
