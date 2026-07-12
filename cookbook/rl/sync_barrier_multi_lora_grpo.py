@@ -248,9 +248,10 @@ def build_rollout(cfg, sampler_mesh) -> ServerSingleTurnRollout:
 
 def build_reward_registry(cfg) -> dict[str, Any]:
     registry = {}
-    for context_cfg in lora_context_configs(cfg):
+    for context_cfg, context in zip(lora_context_configs(cfg), build_lora_contexts(cfg)):
         if context_cfg.reward_type == 'gsm8k':
-            registry[context_cfg.reward_type] = GSM8KReward()
+            reward_cfg = context_cfg.get('reward') or {}
+            registry[context.key] = GSM8KReward(brevity_weight=float(reward_cfg.get('brevity_weight', 0.0)))
         else:
             raise ValueError(f'unsupported reward_type for sync barrier GRPO: {context_cfg.reward_type}')
     return registry
@@ -533,7 +534,7 @@ class SyncBarrierMultiLoraGRPORunner:
             )
 
     def _compute_rewards(self, context: LoraContext, rows: list[dict[str, Any]]) -> list[float]:
-        reward_fn = self.reward_registry.get(context.reward_type)
+        reward_fn = self.reward_registry.get(context.key) or self.reward_registry.get(context.reward_type)
         if reward_fn is None:
             raise ValueError(f'no reward function registered for context={context.key}, reward_type={context.reward_type}')
         rewards = list(reward_fn(rows))

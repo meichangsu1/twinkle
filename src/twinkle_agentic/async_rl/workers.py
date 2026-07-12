@@ -468,7 +468,7 @@ class AsyncRollouter:
         return await asyncio.to_thread(self.rollout, trajectories, **rollout_kwargs)
 
     def _compute_rewards(self, context: LoraContext, rollout_rows: list[RolloutOutput]) -> list[float] | None:
-        reward_fn = self.reward_registry.get(context.reward_type)
+        reward_fn = self.reward_registry.get(context.key) or self.reward_registry.get(context.reward_type)
         if reward_fn is None:
             return None
         return list(reward_fn(rollout_rows, context=context))
@@ -479,7 +479,7 @@ class AsyncRollouter:
         rollout_rows: list[RolloutOutput],
         rewards: list[float] | None,
     ) -> dict[str, Any]:
-        reward_fn = self.reward_registry.get(context.reward_type)
+        reward_fn = self.reward_registry.get(context.key) or self.reward_registry.get(context.reward_type)
         metric_payload = getattr(reward_fn, 'metric_payload', None)
         if metric_payload is None:
             return {}

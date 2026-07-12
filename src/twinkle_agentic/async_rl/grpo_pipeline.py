@@ -695,22 +695,24 @@ class GSM8KBrevityReward:
 
 class GSM8KReward:
 
-    def __init__(self):
+    def __init__(self, *, brevity_weight: float = 0.0):
         from twinkle.reward import GSM8KAccuracyReward
 
         self.accuracy = GSM8KAccuracyReward()
         self.brevity = GSM8KBrevityReward()
+        self.brevity_weight = float(brevity_weight)
 
     def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[float]:
         accuracy = self.accuracy(trajectories)
         brevity = self.brevity(trajectories)
-        total = [float(a) for a in accuracy]
+        total = [float(a) + self.brevity_weight * float(b) for a, b in zip(accuracy, brevity)]
         for trajectory, total_reward, accuracy_reward, brevity_reward in zip(trajectories, total, accuracy, brevity):
             metadata = dict(trajectory.get('metadata') or {})
             metadata.update({
                 'total_reward': float(total_reward),
                 'accuracy_reward': float(accuracy_reward),
                 'brevity_reward': float(brevity_reward),
+                'brevity_weight': self.brevity_weight,
             })
             completion_length = _as_float(trajectory.get('completion_length'))
             if completion_length is not None:
@@ -1000,11 +1002,12 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
 
     def build_reward_registry(self):
         registry = {}
-        for context_cfg in lora_context_configs(self.cfg):
+        for context_cfg, context in zip(lora_context_configs(self.cfg), build_lora_contexts(self.cfg)):
             if context_cfg.reward_type == 'gsm8k':
-                registry[context_cfg.reward_type] = GSM8KReward()
+                reward_cfg = context_cfg.get('reward') or {}
+                registry[context.key] = GSM8KReward(brevity_weight=float(reward_cfg.get('brevity_weight', 0.0)))
             elif context_cfg.reward_type == 'dapo_math':
-                registry[context_cfg.reward_type] = DAPOMathReward()
+                registry[context.key] = DAPOMathReward()
             else:
                 raise ValueError(f'unsupported reward_type for AsyncMultiLoraGRPOPipeline: {context_cfg.reward_type}')
         return registry
