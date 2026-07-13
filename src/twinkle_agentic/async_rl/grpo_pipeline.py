@@ -631,6 +631,7 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
     _validate_train_batch_config(cfg)
     contexts = build_lora_contexts(cfg)
     primary_context = contexts[0]
+    rollout_cfg = cfg.pipeline.rollout
     target_groups_by_context = rollout_batch_groups_by_context(cfg, contexts)
     context_num_generations = num_generations_by_context(cfg, contexts)
     context_mini_batch_sizes = mini_batch_size_by_context(cfg, contexts)
