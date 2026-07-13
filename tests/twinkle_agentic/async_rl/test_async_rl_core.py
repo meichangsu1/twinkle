@@ -654,6 +654,32 @@ def test_mark_groups_writes_group_tags_in_one_batch():
     ]
 
 
+def test_data_plane_lists_prompt_group_raw_tags_for_diagnostics():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    partition = data_plane.create_rollout_partition(context, target_groups=1)
+    group_ref = data_plane.create_prompt_group(context, partition, runtime_state=make_runtime_state(context))
+    data_plane.update_prompt_group_status(
+        group_ref,
+        PromptGroupStatus.FAILED,
+        extra_tag={
+            'submission_id': 'sub-1',
+            'error': 'sample failed',
+        },
+    )
+
+    tags = data_plane.list_prompt_group_tags(
+        context,
+        partition_id=partition.partition_id,
+        statuses=[PromptGroupStatus.FAILED],
+    )
+
+    assert len(tags) == 1
+    assert tags[0]['group_id'] == group_ref.group_id
+    assert tags[0]['submission_id'] == 'sub-1'
+    assert tags[0]['error'] == 'sample failed'
+
+
 def test_data_plane_builds_transformers_train_batch_without_sample_rows():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
@@ -1152,6 +1178,37 @@ def test_trainer_drops_closed_tail_partition_below_mini_batch_size():
         scheduler=TrainerScheduler(lora_runtime_registry=registry),
         train_batch_fn=lambda ctx, batch: trained.append(batch),
         train_batch_groups=2,
+    )
+
+    result = trainer.train_one_partition()
+
+    assert result is None
+    assert trained == []
+    assert data_plane.list_partitions(context) == []
+    assert registry.get(context).live_partitions == set()
+
+
+def test_trainer_clears_closed_partition_when_all_groups_failed():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+
+    partition = data_plane.create_rollout_partition(context, target_groups=2)
+    registry.on_partition_created(context, partition.partition_id)
+    group_0 = data_plane.create_prompt_group(context, partition, runtime_state=registry.get(context))
+    group_1 = data_plane.create_prompt_group(context, partition, runtime_state=registry.get(context))
+    data_plane.update_prompt_group_status(group_0, PromptGroupStatus.FAILED)
+    data_plane.update_prompt_group_status(group_1, PromptGroupStatus.FAILED)
+    data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
+
+    trained = []
+    trainer = TrainerWorker(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        scheduler=TrainerScheduler(lora_runtime_registry=registry),
+        train_batch_fn=lambda ctx, batch: trained.append(batch),
+        train_batch_groups=1,
     )
 
     result = trainer.train_one_partition()

@@ -380,6 +380,30 @@ class TransferQueueDataPlane:
         tags_by_key = self._list_partition_tags(partition_id, context=context)
         return self._filter_prompt_groups({partition_id: tags_by_key}, context=context, statuses=statuses)
 
+    def list_prompt_group_tags(
+        self,
+        context: LoraContext | None = None,
+        *,
+        partition_id: str,
+        statuses: Iterable[PromptGroupStatus] | None = None,
+    ) -> list[dict[str, Any]]:
+        if partition_id is None:
+            raise ValueError('partition_id is required')
+        status_set = set(statuses) if statuses is not None else None
+        tags = []
+        for tag in self._list_partition_tags(partition_id, context=context).values():
+            if tag.get('record_type') != 'group':
+                continue
+            group = self._prompt_group_from_tag(tag)
+            if group is None:
+                continue
+            if context is not None and group.context.key != context.key:
+                continue
+            if status_set is not None and group.status not in status_set:
+                continue
+            tags.append(dict(tag))
+        return sorted(tags, key=lambda tag: (float(tag.get('created_at') or 0.0), str(tag.get('group_id') or '')))
+
     def list_all_prompt_groups(
         self,
         context: LoraContext | None = None,

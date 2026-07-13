@@ -874,8 +874,6 @@ class TrainerWorker:
             if any(group.status in blocking_statuses for group in groups):
                 continue
             ready_groups = [group for group in groups if group.status == PromptGroupStatus.ADVANTAGE_DONE]
-            if not ready_groups:
-                continue
             required_groups = self.train_batch_groups_for_context(partition.context)
             if len(ready_groups) >= required_groups:
                 continue
@@ -883,16 +881,20 @@ class TrainerWorker:
                    for group in groups):
                 continue
             trained_group_count = len([group for group in groups if group.status == PromptGroupStatus.TRAIN_DONE])
+            failed_group_count = len([group for group in groups if group.status == PromptGroupStatus.FAILED])
+            already_dropped_group_count = len([group for group in groups if group.status == PromptGroupStatus.DROPPED])
+            drop_reason = 'partial_tail_below_mini_batch' if ready_groups else 'closed_terminal_partition'
             if trained_group_count > 0:
                 start = time.perf_counter()
                 sync_result = self.save_adapter_fn(partition.context,
                                                    partition.partition_id) if self.save_adapter_fn else None
                 adapter_path = self._adapter_path_from_result(sync_result)
-                self.data_plane.mark_prompt_groups(
-                    ready_groups,
-                    PromptGroupStatus.DROPPED,
-                    extra_tag={'drop_reason': 'partial_tail_below_mini_batch'},
-                )
+                if ready_groups:
+                    self.data_plane.mark_prompt_groups(
+                        ready_groups,
+                        PromptGroupStatus.DROPPED,
+                        extra_tag={'drop_reason': drop_reason},
+                    )
                 self.data_plane.update_partition_status(partition.partition_id, PartitionStatus.TRAIN_DONE)
                 self.lora_runtime_registry.on_weight_sync_started(partition.context)
                 runtime_state = self.lora_runtime_registry.on_weight_sync_finished(
@@ -910,6 +912,8 @@ class TrainerWorker:
                     metrics={
                         'group_count': trained_group_count,
                         'dropped_tail_groups': len(ready_groups),
+                        'failed_groups': failed_group_count,
+                        'already_dropped_groups': already_dropped_group_count,
                         'adapter_path': adapter_path,
                     },
                 )
@@ -924,16 +928,19 @@ class TrainerWorker:
                     metrics={
                         'group_count': trained_group_count,
                         'dropped_tail_groups': len(ready_groups),
+                        'failed_groups': failed_group_count,
+                        'already_dropped_groups': already_dropped_group_count,
                         'partition_train_latency_s': time.perf_counter() - start,
                     },
                 )
                 dropped += 1
                 continue
-            self.data_plane.mark_prompt_groups(
-                ready_groups,
-                PromptGroupStatus.DROPPED,
-                extra_tag={'drop_reason': 'partial_tail_below_mini_batch'},
-            )
+            if ready_groups:
+                self.data_plane.mark_prompt_groups(
+                    ready_groups,
+                    PromptGroupStatus.DROPPED,
+                    extra_tag={'drop_reason': drop_reason},
+                )
             self.data_plane.clear_partition(partition.context, partition.partition_id)
             self.lora_runtime_registry.on_partition_cleared(partition.context, partition.partition_id)
             self.metrics_recorder.log_event(
@@ -944,7 +951,9 @@ class TrainerWorker:
                 metrics={
                     'group_count': len(ready_groups),
                     'required_groups': required_groups,
-                    'drop_reason': 'partial_tail_below_mini_batch',
+                    'failed_groups': failed_group_count,
+                    'already_dropped_groups': already_dropped_group_count,
+                    'drop_reason': drop_reason,
                 },
             )
             dropped += 1

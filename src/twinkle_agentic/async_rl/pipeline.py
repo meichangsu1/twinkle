@@ -714,12 +714,27 @@ class BaseRLPipeline(ABC):
                 group_counts: dict[str, int] = {}
                 for group in groups:
                     group_counts[group.status.value] = group_counts.get(group.status.value, 0) + 1
-                context_payload['partitions'].append({
+                failed_tags = self.data_plane.list_prompt_group_tags(
+                    context,
+                    partition_id=partition.partition_id,
+                    statuses=[PromptGroupStatus.FAILED],
+                )
+                failed_examples = []
+                for tag in failed_tags[:3]:
+                    failed_examples.append({
+                        'group_id': tag.get('group_id'),
+                        'submission_id': tag.get('submission_id'),
+                        'error': tag.get('error'),
+                    })
+                partition_payload = {
                     'partition_id': partition.partition_id,
                     'status': partition.status.value,
                     'target_groups': partition.target_groups,
                     'group_counts': group_counts,
-                })
+                }
+                if failed_examples:
+                    partition_payload['failed_examples'] = failed_examples
+                context_payload['partitions'].append(partition_payload)
             snapshot['contexts'][context.key] = context_payload
         return snapshot
 
