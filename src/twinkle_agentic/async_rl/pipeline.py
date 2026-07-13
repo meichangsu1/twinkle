@@ -482,6 +482,8 @@ class BaseRLPipeline(ABC):
         history: list[PipelineStepResult] = []
         trained = 0
         progress = _TrainProgressReporter(total=limit)
+        last_wait_log_time = time.time()
+        last_work_time = last_wait_log_time
         try:
             while limit is None or trained < limit:
                 remaining = None if limit is None else max(0, limit - trained)
@@ -489,14 +491,25 @@ class BaseRLPipeline(ABC):
                 history.append(result)
                 if result.trained_partitions:
                     trained += result.trained_partitions
+                    last_work_time = time.time()
                     progress.update(result.trained_partitions)
                     if self.should_stop(trained):
                         break
                     continue
                 if result.had_work:
+                    last_work_time = time.time()
                     continue
                 if self._is_drained():
                     break
+                now = time.time()
+                if now - last_wait_log_time >= 60:
+                    logger.warning(
+                        'async RL waiting for drain: trained_partitions=%s idle_s=%.1f snapshot=%s',
+                        trained,
+                        now - last_work_time,
+                        self._drain_debug_snapshot(),
+                    )
+                    last_wait_log_time = now
                 await asyncio.sleep(0.05)
         finally:
             progress.close()
@@ -663,6 +676,52 @@ class BaseRLPipeline(ABC):
                     continue
                 return False
         return True
+
+    def _drain_debug_snapshot(self) -> dict[str, Any]:
+        rollouter = getattr(self, 'rollouter', None)
+        snapshot: dict[str, Any] = {
+            'rollouter_active_tasks': 0 if rollouter is None else len(getattr(rollouter, 'active_tasks', ())),
+            'contexts': {},
+        }
+        loaders_by_context = {}
+        if rollouter is not None:
+            for loader in getattr(rollouter, 'prompt_loaders', ()) or ():
+                context = getattr(loader, 'context', None)
+                if context is not None:
+                    loaders_by_context[context.key] = loader
+        for context in self.current_contexts():
+            loader = loaders_by_context.get(context.key)
+            try:
+                runtime_state = self.lora_runtime_registry.get(context)
+                runtime_payload = {
+                    'in_flight_groups': runtime_state.in_flight_groups,
+                    'live_partitions': sorted(runtime_state.live_partitions),
+                    'training_partition': runtime_state.training_partition,
+                    'sync_in_progress': runtime_state.sync_in_progress,
+                    'policy_version': runtime_state.policy_version,
+                }
+            except KeyError:
+                runtime_payload = {}
+            context_payload: dict[str, Any] = {
+                'pending_prompt_groups': 0 if rollouter is None else rollouter.pending_prompt_group_count(context),
+                'loader_exhausted': None if loader is None else bool(getattr(loader, 'exhausted', False)),
+                'loader_prefetch_pending': None if loader is None else getattr(loader, '_prefetch', None) is not None,
+                'runtime': runtime_payload,
+                'partitions': [],
+            }
+            for partition in self._runtime_live_partitions(context):
+                groups = self.data_plane.list_prompt_groups(context, partition_id=partition.partition_id)
+                group_counts: dict[str, int] = {}
+                for group in groups:
+                    group_counts[group.status.value] = group_counts.get(group.status.value, 0) + 1
+                context_payload['partitions'].append({
+                    'partition_id': partition.partition_id,
+                    'status': partition.status.value,
+                    'target_groups': partition.target_groups,
+                    'group_counts': group_counts,
+                })
+            snapshot['contexts'][context.key] = context_payload
+        return snapshot
 
     def _runtime_live_partitions(self, context: LoraContext | None = None) -> list[PartitionMeta]:
         partition_ids = []
