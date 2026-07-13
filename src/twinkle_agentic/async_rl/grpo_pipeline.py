@@ -172,6 +172,7 @@ def async_rl_metrics_config(cfg) -> AsyncRLMetricsConfig | None:
         'default_mini_batch_size': int(cfg.pipeline.default_mini_batch_size),
         'rollout_policy': str(cfg.pipeline.get('rollout_policy', 'work_conserving')),
         'train_policy': str(cfg.pipeline.get('train_policy', 'prefer_current')),
+        'tq_sampler': True,
         'num_loras': len(lora_context_configs(cfg)),
     }
     return AsyncRLMetricsConfig(
@@ -188,6 +189,16 @@ def async_rl_metrics_config(cfg) -> AsyncRLMetricsConfig | None:
         swanlab_mode=str(metrics_cfg.get('swanlab_mode', 'local')),
         swanlab_logdir=metrics_cfg.get('swanlab_logdir'),
         metadata=metadata,
+    )
+
+
+def transfer_queue_runtime_config(cfg) -> TransferQueueRuntimeConfig:
+    tq_cfg = cfg.transfer_queue
+    return TransferQueueRuntimeConfig(
+        init=bool(tq_cfg.get('init', True)),
+        total_storage_size=tq_cfg.get('total_storage_size'),
+        num_data_storage_units=int(tq_cfg.get('num_data_storage_units', 4)),
+        storage_backend=tq_cfg.get('storage_backend', 'SimpleStorage'),
     )
 
 
@@ -620,7 +631,6 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
     _validate_train_batch_config(cfg)
     contexts = build_lora_contexts(cfg)
     primary_context = contexts[0]
-    rollout_cfg = cfg.pipeline.rollout
     target_groups_by_context = rollout_batch_groups_by_context(cfg, contexts)
     context_num_generations = num_generations_by_context(cfg, contexts)
     context_mini_batch_sizes = mini_batch_size_by_context(cfg, contexts)
@@ -793,23 +803,32 @@ class ServerSingleTurnRollout:
             adapter_name=adapter_name,
             adapter_path=adapter_path,
         )
+        return self._sample_responses_to_rollout_rows(expanded, responses, policy_version=kwargs.get('policy_version'))
+
+    @staticmethod
+    def _sample_responses_to_rollout_rows(
+        sources: list[Trajectory],
+        responses: list[Any],
+        *,
+        policy_version: int | None,
+    ) -> list[RolloutOutput]:
         rows: list[RolloutOutput] = []
-        for source, response in zip(expanded, responses):
+        for source, response in zip(sources, responses):
             for sequence in response.sequences:
                 row = dict(source)
                 row.update(sequence.new_input_feature or {})
                 row.setdefault('group_id', source['group_id'])
                 row.setdefault('generation_idx', source['generation_idx'])
-                row['logprobs'] = self._extract_logps(sequence.logprobs)
+                row['logprobs'] = ServerSingleTurnRollout._extract_sampled_token_logps(sequence.logprobs)
                 row['stop_reason'] = sequence.stop_reason
                 row['completion_length'] = len(sequence.tokens)
-                row['rollout_policy_version'] = kwargs.get('policy_version')
+                row['rollout_policy_version'] = policy_version
                 rows.append(row)
         return rows
 
     @staticmethod
-    def _extract_logps(logprobs) -> list[float]:
-        values = []
+    def _extract_sampled_token_logps(logprobs: Any) -> list[float]:
+        values: list[float] = []
         for item in logprobs or []:
             if not item:
                 values.append(0.0)
@@ -920,18 +939,24 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         from omegaconf import OmegaConf
 
         from twinkle.data_format import SamplingParams
-        from twinkle.sampler import vLLMSampler
+        from twinkle_agentic.async_rl.vllm_sampler_tq import TQSamplerRollout, VLLMSamplerTQ
 
         primary_context = primary_lora_context(self.cfg)
         engine_args = OmegaConf.to_container(self.cfg.sampler.engine_args, resolve=True)
         engine_args.setdefault('tensor_parallel_size', int(self.cfg.runtime.sampler_tp))
-        sampler = vLLMSampler(
+        sampler_dp = int(getattr(self.sampler_mesh, 'data_world_size', 1) or 1)
+        if sampler_dp != 1:
+            raise ValueError('async RL requires VLLMSamplerTQ with sampler DP size 1. '
+                             f'Got sampler data_world_size={sampler_dp}. Increase sampler_tp instead.')
+        sampler = VLLMSamplerTQ(
             model_id=primary_context.base_model_id,
             engine_args=engine_args,
             device_mesh=self.sampler_mesh,
             **({
                 'remote_group': 'sampler'
             } if self.cfg.runtime.mode == 'ray' else {}),
+            tq_config=transfer_queue_runtime_config(self.cfg),
+            reward_registry=self.build_reward_registry(),
         )
         sampler_template_kwargs = {k: v for k, v in self.cfg.sampler.template.items() if k != 'cls'}
         sampler.set_template(
@@ -941,21 +966,14 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         )
         sampling_params = SamplingParams.from_dict(
             OmegaConf.to_container(self.cfg.sampler.sampling_params, resolve=True))
-        return ServerSingleTurnRollout(
+        return TQSamplerRollout(
             sampler,
             sampling_params=sampling_params,
             default_num_generations=int(self.cfg.pipeline.rollout.get('num_generations', 1)),
         )
 
     def build_data_plane(self):
-        tq_cfg = self.cfg.transfer_queue
-        return TransferQueueDataPlane(
-            tq_config=TransferQueueRuntimeConfig(
-                init=bool(tq_cfg.get('init', True)),
-                total_storage_size=tq_cfg.get('total_storage_size'),
-                num_data_storage_units=int(tq_cfg.get('num_data_storage_units', 4)),
-                storage_backend=tq_cfg.get('storage_backend', 'SimpleStorage'),
-            ))
+        return TransferQueueDataPlane(tq_config=transfer_queue_runtime_config(self.cfg))
 
     def build_prompt_loaders(self):
         from omegaconf import OmegaConf

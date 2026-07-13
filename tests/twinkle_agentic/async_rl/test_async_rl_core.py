@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 from omegaconf import OmegaConf
 
+from twinkle.data_format import SamplingParams
 from twinkle_agentic.async_rl import (
     LoraRuntimeRegistry,
     LoraRuntimeState,
@@ -12,6 +13,7 @@ from twinkle_agentic.async_rl import (
     AsyncRollouter,
     WeightedFairRolloutPolicy,
     PromptGroupStatus,
+    PromptGroupMeta,
     PromptGroupRef,
     PartitionStatus,
     PromptLoader,
@@ -33,6 +35,7 @@ from twinkle_agentic.async_rl.grpo_pipeline import (
 )
 from twinkle_agentic.async_rl.metrics import AsyncRLMetricsConfig, JSONLMetricsRecorder, flatten_for_swanlab
 from twinkle_agentic.async_rl.tq_utils import columns_to_tq_fields, rows_to_tq_fields
+from twinkle_agentic.async_rl.vllm_sampler_tq import TQSamplerRollout
 
 from .fakes import FakeTransferQueueClient
 
@@ -73,22 +76,54 @@ def make_runtime_state(context, *, policy_version=0, adapter_path=None):
     )
 
 
-def make_rollout_sample_writer(data_plane):
-    return AsyncRollouter(
-        data_plane=data_plane,
-        lora_runtime_registry=LoraRuntimeRegistry(),
-        staleness_manager=StalenessManager(),
-        rollout=lambda trajectories, **_: trajectories,
-    )
-
-
 def write_rollout_samples(data_plane, group_ref, samples, *, rewards=None):
-    return make_rollout_sample_writer(data_plane)._write_rollout_samples(
-        group_ref,
-        samples,
-        rewards=rewards,
-        expected_num_generations=len(samples),
+    group = data_plane.get_prompt_group(group_ref)
+    partition = data_plane.get_rollout_partition(group_ref.partition_id)
+    sample_keys = []
+    sample_fields = []
+    sample_tags = []
+    for sample_index, raw_sample in enumerate(samples):
+        sample = dict(raw_sample)
+        if rewards is not None:
+            sample['rewards'] = float(rewards[sample_index])
+        generation_idx = int(sample.get('generation_idx', sample_index))
+        sample_key = f'samples/{group_ref.group_id}/{generation_idx}'
+        sample_keys.append(sample_key)
+        sample_fields.append({
+            field_name: sample[field_name]
+            for field_name in (
+                'input_ids',
+                'labels',
+                'attention_mask',
+                'logprobs',
+                'rewards',
+                'advantages',
+                'returns',
+            )
+            if field_name in sample
+        })
+        tag = group.context.metadata()
+        tag.update(dict(sample.get('metadata') or {}))
+        for state_field in ('partition_id', 'partition_status', 'group_status', 'num_samples', 'sample_keys'):
+            tag.pop(state_field, None)
+        tag.update({
+            'record_type': 'sample',
+            'sample_status': 'success',
+            'sample_id': sample.get('sample_id', sample_key),
+            'group_id': group.group_id,
+            'generation_idx': generation_idx,
+            'rollout_policy_version': group.rollout_policy_version,
+            'rollout_adapter_path': group.rollout_adapter_path,
+            'logprobs_length': len(sample.get('logprobs') or []),
+        })
+        sample_tags.append(tag)
+    data_plane.write_sample_batch(
+        partition_id=group_ref.partition_id,
+        keys=sample_keys,
+        fields=rows_to_tq_fields(sample_fields),
+        tags=sample_tags,
     )
+    return partition, sample_keys
 
 
 def batch_group_ids(batch):
@@ -868,12 +903,19 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
 
     class EchoRollout:
         def __call__(self, trajectories, **kwargs):
-            out = []
-            for traj in trajectories:
-                copied = dict(traj)
-                copied['messages'] = list(copied.get('messages', [])) + [{'role': 'assistant', 'content': 'ok'}]
-                out.append(copied)
-            return out
+            group_refs = list(kwargs['group_refs'])
+            for group_ref, trajectory in zip(group_refs, trajectories):
+                _, sample_keys = write_rollout_samples(data_plane, group_ref, [dict(trajectory)], rewards=[1.0])
+                data_plane.update_prompt_group_status(
+                    group_ref,
+                    PromptGroupStatus.ROLLOUT_DONE,
+                    sample_keys=sample_keys,
+                )
+            return {
+                'submission_id': 'sub-1',
+                'submitted_prompt_groups': len(trajectories),
+                'submitted_samples': len(trajectories),
+            }
 
     rollouter = AsyncRollouter(
         data_plane=data_plane,
@@ -1094,15 +1136,19 @@ def test_async_rollouter_accumulates_prompt_groups_into_one_rollout_partition():
     registry = LoraRuntimeRegistry()
     registry.register(context)
 
-    class EchoRollout:
+    class SubmitOnlyTQRollout:
         def __init__(self):
             self.batch_sizes = []
 
         def __call__(self, trajectories, **kwargs):
             self.batch_sizes.append(len(trajectories))
-            return [dict(trajectory) for trajectory in trajectories]
+            return {
+                'submission_id': f'sub-{len(self.batch_sizes)}',
+                'submitted_prompt_groups': len(trajectories),
+                'submitted_samples': len(trajectories) * int(kwargs['num_generations']),
+            }
 
-    rollout = EchoRollout()
+    rollout = SubmitOnlyTQRollout()
     rollouter = AsyncRollouter(
         data_plane=data_plane,
         lora_runtime_registry=registry,
@@ -1118,74 +1164,191 @@ def test_async_rollouter_accumulates_prompt_groups_into_one_rollout_partition():
         assert submit_result is not None
         assert submit_result.kind == 'rollout'
         assert submit_result.count == 2
-        results = []
         for _ in range(10):
-            result = await rollouter.step()
-            if len(data_plane.list_all_prompt_groups(context, statuses=[PromptGroupStatus.ROLLOUT_DONE])) == 2:
-                return [result]
+            await rollouter.step()
+            if not rollouter.active_tasks:
+                return
             await asyncio.sleep(0)
-        raise AssertionError('rollout task did not complete')
+        raise AssertionError('rollout submission task did not complete')
 
-    results = asyncio.run(drive_rollout())
+    asyncio.run(drive_rollout())
     meta = data_plane.list_partitions(context)[0]
 
-    assert results
     assert rollout.batch_sizes == [1, 1]
     assert meta.partition_id == context.partition_id(0)
     assert meta.status == PartitionStatus.CLOSED
+    groups = data_plane.list_prompt_groups(context, partition_id=meta.partition_id)
+    assert [group.status for group in groups] == [PromptGroupStatus.RUNNING, PromptGroupStatus.RUNNING]
     tags = data_plane.tq.kv_list(partition_id=meta.partition_id)[meta.partition_id]
-    assert len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 2
+    assert len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 0
 
 
-def test_async_rollouter_writes_fast_task_before_slow_tail():
+def test_async_rollouter_batches_prompt_groups_for_one_sampler_call():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     registry = LoraRuntimeRegistry()
     registry.register(context)
 
-    class VariableSpeedRollout:
+    class SubmitOnlyTQRollout:
+        def __init__(self):
+            self.batch_sizes = []
 
-        async def __call__(self, trajectories, **kwargs):
-            delay = float(trajectories[0].get('delay', 0.0))
-            await asyncio.sleep(delay)
-            return [dict(trajectory) for trajectory in trajectories]
+        def __call__(self, trajectories, **kwargs):
+            self.batch_sizes.append(len(trajectories))
+            return {
+                'submission_id': f'sub-{len(self.batch_sizes)}',
+                'submitted_prompt_groups': len(trajectories),
+                'submitted_samples': len(trajectories) * int(kwargs['num_generations']),
+            }
 
-    fast = make_sample(0)
-    fast['delay'] = 0.0
-    slow = make_sample(1)
-    slow['delay'] = 0.05
+    rollout = SubmitOnlyTQRollout()
     rollouter = AsyncRollouter(
         data_plane=data_plane,
         lora_runtime_registry=registry,
-        staleness_manager=StalenessManager(max_staleness=1, target_groups_per_partition=2),
-        rollout=VariableSpeedRollout(),
-        max_concurrency=2,
+        staleness_manager=StalenessManager(max_staleness=0, target_groups_per_partition=2),
+        rollout=rollout,
+        max_concurrency=1,
         target_groups_per_partition=2,
     )
-    rollouter.enqueue_prompt_groups(context, [slow, fast])
+    rollouter.enqueue_prompt_groups(context, [make_sample(0), make_sample(1)])
 
-    async def drive_until_first_rollout():
+    async def drive_rollout():
         submit_result = await rollouter.step()
+        assert submit_result is not None
         assert submit_result.kind == 'rollout'
         assert submit_result.count == 2
-        for _ in range(20):
+        for _ in range(10):
             result = await rollouter.step()
-            partition_id = data_plane.list_partitions(context)[0].partition_id
-            tags = data_plane.tq.kv_list(partition_id=partition_id)[partition_id]
-            if len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 1:
+            if not rollouter.active_tasks:
                 return result
-            await asyncio.sleep(0.005)
-        raise AssertionError('fast rollout task did not complete first')
+            await asyncio.sleep(0)
+        raise AssertionError('rollout submission task did not complete')
 
-    result = asyncio.run(drive_until_first_rollout())
+    result = asyncio.run(drive_rollout())
+    meta = data_plane.list_partitions(context)[0]
+    tags = data_plane.tq.kv_list(partition_id=meta.partition_id)[meta.partition_id]
 
     assert result.kind == 'rollout'
     assert result.count == 1
-    partition_id = data_plane.list_partitions(context)[0].partition_id
-    tags = data_plane.tq.kv_list(partition_id=partition_id)[partition_id]
-    assert len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 1
-    assert not rollouter.is_idle()
+    assert rollout.batch_sizes == [2]
+    assert meta.status == PartitionStatus.CLOSED
+    groups = data_plane.list_prompt_groups(context, partition_id=meta.partition_id)
+    assert [group.status for group in groups] == [PromptGroupStatus.RUNNING, PromptGroupStatus.RUNNING]
+    assert len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 0
 
+
+def test_tq_sampler_rollout_builds_async_rl_request():
+    context = make_context('lora')
+    group_ref = PromptGroupRef(partition_id=context.partition_id(0), group_id='group-1')
+    group = PromptGroupMeta(
+        context=context,
+        partition_id=group_ref.partition_id,
+        group_id=group_ref.group_id,
+        rollout_policy_version=3,
+        rollout_adapter_path='adapter-path',
+        status=PromptGroupStatus.RUNNING,
+    )
+
+    class FakeSampler:
+
+        def __init__(self):
+            self.request = None
+
+        def sample(self, request):
+            self.request = request
+            return {
+                'submission_id': 'sub-1',
+                'submitted_prompt_groups': len(request['group_refs']),
+                'submitted_samples': len(request['group_refs']) * request['num_generations'],
+            }
+
+    sampler = FakeSampler()
+    rollout = TQSamplerRollout(
+        sampler,
+        sampling_params=SamplingParams(max_tokens=16, num_samples=1, logprobs=1),
+        default_num_generations=8,
+    )
+
+    result = rollout(
+        [{'messages': [{'role': 'user', 'content': 'q'}], 'group_id': group_ref.group_id}],
+        context=context,
+        partition_id=group_ref.partition_id,
+        group_refs=[group_ref],
+        groups=[group],
+        policy_version=3,
+        adapter_name=context.adapter_name,
+        adapter_path='adapter-path',
+    )
+
+    assert result['submitted_prompt_groups'] == 1
+    assert result['submitted_samples'] == 8
+    assert sampler.request['context'] == context
+    assert sampler.request['partition_id'] == group_ref.partition_id
+    assert sampler.request['group_refs'] == [group_ref]
+    assert sampler.request['groups'] == [group]
+    assert sampler.request['num_generations'] == 8
+    assert sampler.request['rollout_policy_version'] == 3
+    assert sampler.request['adapter_path'] == 'adapter-path'
+    assert sampler.request['sampling_params'].num_samples == 1
+
+
+def test_async_rollouter_tq_mode_submits_without_writing_samples():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+
+    class SubmitOnlyTQRollout:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, trajectories, **kwargs):
+            self.calls.append((list(trajectories), dict(kwargs)))
+            return {
+                'submission_id': 'sub-1',
+                'submitted_prompt_groups': len(trajectories),
+                'submitted_samples': len(trajectories) * int(kwargs['num_generations']),
+            }
+
+    rollout = SubmitOnlyTQRollout()
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=0, target_groups_per_partition=2),
+        rollout=rollout,
+        max_concurrency=1,
+        target_groups_per_partition=2,
+        num_generations=8,
+    )
+    rollouter.enqueue_prompt_groups(context, [make_sample(0), make_sample(1)])
+
+    async def drive_submission():
+        submit_result = await rollouter.step()
+        assert submit_result is not None
+        assert submit_result.count == 2
+        for _ in range(10):
+            await rollouter.step()
+            if not rollouter.active_tasks:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError('TQ rollout submission task did not finish')
+
+    asyncio.run(drive_submission())
+
+    assert len(rollout.calls) == 1
+    trajectories, kwargs = rollout.calls[0]
+    assert len(trajectories) == 2
+    assert kwargs['context'] == context
+    assert kwargs['partition_id'] == context.partition_id(0)
+    assert len(kwargs['group_refs']) == 2
+    assert len(kwargs['groups']) == 2
+    assert kwargs['num_generations'] == 8
+
+    partition = data_plane.list_partitions(context)[0]
+    groups = data_plane.list_prompt_groups(context, partition_id=partition.partition_id)
+    assert [group.status for group in groups] == [PromptGroupStatus.RUNNING, PromptGroupStatus.RUNNING]
+    tags = data_plane.tq.kv_list(partition_id=partition.partition_id)[partition.partition_id]
+    assert len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 0
 
 def test_prompt_loader_is_pipeline_source_component():
     context = make_context('lora')

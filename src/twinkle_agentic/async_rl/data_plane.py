@@ -195,6 +195,30 @@ class TransferQueueDataPlane:
             metrics={'write_samples': len(keys)},
         )
 
+    async def async_write_sample_batch(
+        self,
+        *,
+        partition_id: str,
+        keys: list[str],
+        fields: Any,
+        tags: list[dict[str, Any]],
+    ) -> None:
+        if not keys:
+            return
+        start = time.perf_counter()
+        await self.tq.async_kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=fields,
+            tags=tags,
+        )
+        self._record_tq_event(
+            'kv_batch_put',
+            start,
+            partition_id=partition_id,
+            metrics={'write_samples': len(keys)},
+        )
+
     def list_partitions(
         self,
         context: LoraContext | None = None,
@@ -311,6 +335,21 @@ class TransferQueueDataPlane:
             group.status = status
             group.touch()
         self._put_group_tags(groups, extra_tag=extra_tag)
+
+    async def async_mark_prompt_group(
+        self,
+        group: PromptGroupMeta,
+        status: PromptGroupStatus,
+        *,
+        sample_keys: list[str] | None = None,
+        extra_tag: dict[str, Any] | None = None,
+    ) -> None:
+        if sample_keys is not None:
+            group.sample_keys = list(sample_keys)
+            group.num_samples = len(sample_keys)
+        group.status = status
+        group.touch()
+        await self._async_put_group_tags([group], extra_tag=extra_tag)
 
     def clear_partition(self, context: LoraContext, partition_id: str) -> None:
         tags_by_key = self._list_partition_tags(partition_id, context=context)
@@ -436,6 +475,37 @@ class TransferQueueDataPlane:
             tags.append(tag)
         start = time.perf_counter()
         self.tq.kv_batch_put(keys=keys, partition_id=partition_id, tags=tags)
+        self._record_tq_event(
+            'kv_batch_put',
+            start,
+            context=groups[0].context,
+            partition_id=partition_id,
+            metrics={'write_group_tags': len(keys)},
+        )
+
+    async def _async_put_group_tags(
+        self,
+        groups: Iterable[PromptGroupMeta],
+        *,
+        extra_tag: dict[str, Any] | None = None,
+    ) -> None:
+        groups = list(groups)
+        if not groups:
+            return
+        partition_ids = {group.partition_id for group in groups}
+        if len(partition_ids) != 1:
+            raise ValueError(f'group batch must belong to one partition, got {sorted(partition_ids)}')
+        partition_id = groups[0].partition_id
+        keys = []
+        tags = []
+        for group in groups:
+            tag = dict(group.tag())
+            if extra_tag:
+                tag.update(extra_tag)
+            keys.append(group.key)
+            tags.append(tag)
+        start = time.perf_counter()
+        await self.tq.async_kv_batch_put(keys=keys, partition_id=partition_id, tags=tags)
         self._record_tq_event(
             'kv_batch_put',
             start,

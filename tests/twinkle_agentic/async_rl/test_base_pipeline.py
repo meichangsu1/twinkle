@@ -7,10 +7,12 @@ from twinkle_agentic.async_rl import (
     BaseRLPipelineConfig,
     ComponentResult,
     PartitionStatus,
+    PromptGroupStatus,
     PromptLoader,
     LoraContext,
     TransferQueueDataPlane,
 )
+from twinkle_agentic.async_rl.tq_utils import rows_to_tq_fields
 
 from .fakes import FakeTransferQueueClient
 
@@ -30,17 +32,67 @@ def make_sample(i=0):
 
 class EchoRollout:
 
-    def __init__(self):
+    def __init__(self, data_plane=None):
+        self.data_plane = data_plane
         self.calls = []
 
     def __call__(self, trajectories, **kwargs):
         self.calls.append(kwargs)
-        out = []
+        if self.data_plane is None:
+            raise ValueError('EchoRollout requires a data_plane')
+        group_refs = list(kwargs['group_refs'])
+        groups = list(kwargs['groups'])
+        num_generations = int(kwargs['num_generations'])
+        sample_keys_by_group = {group_ref.group_id: [] for group_ref in group_refs}
+        rows = []
+        tags = []
+        keys = []
+        for group_ref, group, trajectory in zip(group_refs, groups, trajectories):
+            for generation_idx in range(num_generations):
+                sample_key = f'samples/{group_ref.group_id}/{generation_idx}'
+                sample_keys_by_group[group_ref.group_id].append(sample_key)
+                keys.append(sample_key)
+                row = dict(trajectory)
+                row['generation_idx'] = generation_idx
+                row['rewards'] = 1.0
+                rows.append({
+                    field_name: row[field_name]
+                    for field_name in ('input_ids', 'labels', 'attention_mask', 'logprobs', 'rewards')
+                    if field_name in row
+                })
+                tag = group.context.metadata()
+                tag.update({
+                    'record_type': 'sample',
+                    'sample_status': 'success',
+                    'sample_id': sample_key,
+                    'group_id': group_ref.group_id,
+                    'generation_idx': generation_idx,
+                    'rollout_policy_version': group.rollout_policy_version,
+                    'rollout_adapter_path': group.rollout_adapter_path,
+                    'logprobs_length': len(row.get('logprobs') or []),
+                })
+                tags.append(tag)
+        if keys:
+            self.data_plane.write_sample_batch(
+                partition_id=group_refs[0].partition_id,
+                keys=keys,
+                fields=rows_to_tq_fields(rows),
+                tags=tags,
+            )
+        for group_ref in group_refs:
+            self.data_plane.update_prompt_group_status(
+                group_ref,
+                PromptGroupStatus.ROLLOUT_DONE,
+                sample_keys=sample_keys_by_group[group_ref.group_id],
+            )
         for trajectory in trajectories:
             copied = dict(trajectory)
             copied['messages'] = list(copied.get('messages', [])) + [{'role': 'assistant', 'content': 'ok'}]
-            out.append(copied)
-        return out
+        return {
+            'submission_id': f'sub-{len(self.calls)}',
+            'submitted_prompt_groups': len(trajectories),
+            'submitted_samples': len(trajectories) * num_generations,
+        }
 
 
 class FakeMultiLoraModel:
@@ -98,7 +150,8 @@ class FakeGRPOPipeline(BaseRLPipeline):
 
 def test_base_pipeline_runs_one_multilora_grpo_partition():
     model = FakeMultiLoraModel()
-    rollout = EchoRollout()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    rollout = EchoRollout(data_plane)
     received = []
     pipeline = FakeGRPOPipeline(
         config=BaseRLPipelineConfig(
@@ -112,7 +165,7 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
         model=model,
         rollout=rollout,
         reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
-        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
+        data_plane=data_plane,
         receive_weights_fn=lambda context: received.append(context),
     )
 
@@ -132,7 +185,8 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
 
 def test_base_pipeline_uses_latest_adapter_path_for_next_rollout():
     model = FakeMultiLoraModel()
-    rollout = EchoRollout()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    rollout = EchoRollout(data_plane)
     pipeline = FakeGRPOPipeline(
         config=BaseRLPipelineConfig(
             tenant_id='tenant',
@@ -145,7 +199,7 @@ def test_base_pipeline_uses_latest_adapter_path_for_next_rollout():
         model=model,
         rollout=rollout,
         reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
-        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
+        data_plane=data_plane,
     )
 
     pipeline.run([make_sample(0)], max_steps=1)
@@ -172,7 +226,8 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
         reward_type='constant',
     )
     model = FakeMultiLoraModel()
-    rollout = EchoRollout()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    rollout = EchoRollout(data_plane)
     received = []
     pipeline = FakeGRPOPipeline(
         config=BaseRLPipelineConfig(
@@ -184,7 +239,7 @@ def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
         model=model,
         rollout=rollout,
         reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
-        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
+        data_plane=data_plane,
         receive_weights_fn=lambda context: received.append(context),
     )
 
@@ -218,8 +273,8 @@ def test_base_pipeline_feeds_prompts_from_prompt_loaders():
         reward_type='constant',
     )
     model = FakeMultiLoraModel()
-    rollout = EchoRollout()
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    rollout = EchoRollout(data_plane)
 
     class FeederPipeline(FakeGRPOPipeline):
 

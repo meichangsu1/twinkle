@@ -15,10 +15,10 @@ from .metrics import AsyncRLMetricsRecorder, NoopMetricsRecorder, prefixed_summa
 from .registry import LoraRuntimeRegistry
 from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
 from .staleness import StalenessManager
-from .tq_utils import ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields, read_train_batch, rows_to_tq_fields
+from .tq_utils import columns_to_tq_fields, read_train_batch
 from .types import (ComponentResult, GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionStatus, PromptGroupRef,
-                    PromptGroupStatus, RolloutCallable, RolloutOutput, RolloutScheduleCandidate, TrainBatchCandidate,
-                    TrainStageResult, TransformersTrainBatch)
+                    PromptGroupStatus, RolloutCallable, RolloutScheduleCandidate, TrainBatchCandidate, TrainStageResult,
+                    TransformersTrainBatch)
 
 
 class ToolManagerFactory:
@@ -46,86 +46,6 @@ TERMINAL_PARTITION_STATUSES = {
     PartitionStatus.CLEARED,
     PartitionStatus.FAILED,
 }
-
-
-def _require_rollout_logprobs(sample: dict[str, Any], *, sample_key: str) -> list[float]:
-    logprobs = sample.get('logprobs')
-    if not isinstance(logprobs, list):
-        raise TypeError(f'rollout sample {sample_key!r} logprobs must be list[float], got {type(logprobs)!r}')
-
-    values: list[float] = []
-    for index, value in enumerate(logprobs):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError(f'rollout sample {sample_key!r} logprobs[{index}] must be a float, got {type(value)!r}')
-        values.append(float(value))
-
-    labels = sample.get('labels')
-    if labels is not None:
-        trainable_tokens = sum(1 for label in labels if label != -100)
-        if len(values) != trainable_tokens:
-            raise ValueError(f'rollout sample {sample_key!r} logprobs length must match trainable labels: '
-                             f'{len(values)} != {trainable_tokens}')
-    return values
-
-
-def _rollout_sample_fields(sample: dict[str, Any]) -> dict[str, Any]:
-    return {field_name: sample[field_name] for field_name in ROLLOUT_TRAIN_FIELDS if field_name in sample}
-
-
-def _sample_tag(
-    *,
-    context: LoraContext,
-    group: Any,
-    sample: dict[str, Any],
-    sample_key: str,
-    generation_idx: int,
-    logprobs: list[float],
-) -> dict[str, Any]:
-    tag = context.metadata()
-    tag.update(dict(sample.get('metadata') or {}))
-    context.validate_metadata(tag)
-    for state_field in ('partition_id', 'partition_status', 'group_status', 'num_samples', 'sample_keys'):
-        tag.pop(state_field, None)
-    tag.update({
-        'record_type': 'sample',
-        'sample_status': 'success',
-        'sample_id': sample.get('sample_id', sample_key),
-        'group_id': group.group_id,
-        'generation_idx': generation_idx,
-        'rollout_policy_version': group.rollout_policy_version,
-        'rollout_adapter_path': group.rollout_adapter_path,
-        'logprobs_length': len(logprobs),
-    })
-    trainable_tokens = _trainable_token_count(sample.get('labels'))
-    if trainable_tokens is not None:
-        tag['trainable_tokens'] = trainable_tokens
-    for sample_field, tag_field in (
-        ('input_ids', 'input_length'),
-        ('labels', 'label_length'),
-        ('attention_mask', 'attention_length'),
-    ):
-        length = _safe_len(sample.get(sample_field))
-        if length is not None:
-            tag[tag_field] = length
-    for field_name in ('stop_reason', 'truncated', 'turns'):
-        if field_name in sample:
-            tag[field_name] = sample[field_name]
-    return tag
-
-
-def _trainable_token_count(labels: Any) -> int | None:
-    if labels is None:
-        return None
-    return sum(1 for label in labels if label != -100)
-
-
-def _safe_len(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return len(value)
-    except TypeError:
-        return None
 
 
 def _metrics_from_result(result: Any) -> dict[str, Any]:
@@ -198,7 +118,6 @@ class AsyncRollouter:
         rollout: RolloutCallable,
         tool_manager_factory: ToolManagerFactory | None = None,
         rollout_policy: Any | None = None,
-        reward_registry: dict[str, Callable[..., list[float]]] | None = None,
         max_concurrency: int = 16,
         target_groups_per_partition: int = 1,
         target_groups_by_context: dict[str, int] | None = None,
@@ -212,7 +131,6 @@ class AsyncRollouter:
         self.rollout: RolloutCallable = rollout
         self.tool_manager_factory = tool_manager_factory or ToolManagerFactory()
         self.rollout_policy = rollout_policy or WorkConservingRolloutPolicy()
-        self.reward_registry = dict(reward_registry or {})
         self.max_concurrency = max_concurrency
         self.target_groups_per_partition = target_groups_per_partition
         self.target_groups_by_context = dict(target_groups_by_context or {})
@@ -286,7 +204,7 @@ class AsyncRollouter:
         )
 
     def _pick_next_rollout_candidate(self) -> LoraContext | None:
-        """Choose the next context that is allowed to submit one prompt group."""
+        """Choose the next context that is allowed to submit one rollout batch."""
         candidates: list[RolloutScheduleCandidate] = []
         if self._remaining_task_capacity() <= 0:
             return None
@@ -352,204 +270,117 @@ class AsyncRollouter:
         prompt_group: Trajectory,
     ) -> PartitionMeta:
         """Run rollout for one prompt group and append its generated samples to train_k."""
-        group = self.data_plane.get_prompt_group(group_ref)
-        context = group.context
-        tool_manager = self.tool_manager_factory.create(prompt_group, context)
-        trajectory = prompt_group
-        self.data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.RUNNING)
-        self.lora_runtime_registry.on_rollout_started(context)
+        return await self._run_prompt_group_rollout_batch([(group_ref, prompt_group)])
+
+    async def _run_prompt_group_rollout_batch(
+        self,
+        items: list[tuple[PromptGroupRef, Trajectory]],
+    ) -> PartitionMeta:
+        """Run one sampler-facing rollout batch and write each prompt group independently."""
+        assert items, 'rollout batch must not be empty'
+        group_refs = [group_ref for group_ref, _ in items]
+        prompt_groups = [prompt_group for _, prompt_group in items]
+        groups = [self.data_plane.get_prompt_group(group_ref) for group_ref in group_refs]
+        context = groups[0].context
+        partition_id = group_refs[0].partition_id
+        assert all(group.context.key == context.key for group in groups), 'rollout batch must use one context'
+        assert all(group_ref.partition_id == partition_id for group_ref in group_refs), (
+            'rollout batch must use one partition')
+        policy_version = groups[0].rollout_policy_version
+        adapter_path = groups[0].rollout_adapter_path
+        assert all(group.rollout_policy_version == policy_version for group in groups), (
+            'rollout batch must use one policy version')
+        assert all(group.rollout_adapter_path == adapter_path for group in groups), (
+            'rollout batch must use one adapter path')
+
+        for group_ref in group_refs:
+            self.data_plane.update_prompt_group_status(group_ref, PromptGroupStatus.RUNNING)
+            self.lora_runtime_registry.on_rollout_started(context)
         start = time.perf_counter()
-        self.metrics_recorder.log_event(
-            event='rollout_started',
-            phase='rollout',
-            context=context,
-            partition_id=group_ref.partition_id,
-            policy_version=group.rollout_policy_version,
-            metrics={
-                'group_id': group_ref.group_id,
-                'inflight_rollout_groups': self.lora_runtime_registry.get(context).in_flight_groups,
-                'num_generations': self._num_generations_for_context(context),
-            },
-        )
+        num_generations = self._num_generations_for_context(context)
+        for group_ref in group_refs:
+            self.metrics_recorder.log_event(
+                event='rollout_started',
+                phase='rollout',
+                context=context,
+                partition_id=partition_id,
+                policy_version=policy_version,
+                metrics={
+                    'group_id': group_ref.group_id,
+                    'submit_batch_group_count': len(group_refs),
+                    'inflight_rollout_groups': self.lora_runtime_registry.get(context).in_flight_groups,
+                    'num_generations': num_generations,
+                },
+            )
         try:
-            num_generations = self._num_generations_for_context(context)
+            tool_managers = [
+                self.tool_manager_factory.create(prompt_group, context) for prompt_group in prompt_groups
+            ]
+            rollout_inputs = []
+            for group_ref, prompt_group in items:
+                trajectory = dict(prompt_group)
+                trajectory['group_id'] = group_ref.group_id
+                rollout_inputs.append(trajectory)
             rollout_kwargs = {
-                'tool_manager': tool_manager,
+                'tool_manager': tool_managers[0] if len(tool_managers) == 1 else tool_managers,
+                'context': context,
+                'partition_id': partition_id,
+                'group_refs': group_refs,
+                'groups': groups,
                 'adapter_name': context.adapter_name,
-                'policy_version': group.rollout_policy_version,
+                'policy_version': policy_version,
                 'num_generations': num_generations,
             }
-            if group.rollout_adapter_path is not None:
-                rollout_kwargs['adapter_path'] = group.rollout_adapter_path
-            rollout_rows = list(await self._invoke_rollout([trajectory], rollout_kwargs))
-            rewards = self._compute_rewards(context, rollout_rows)
-            reward_metrics = self._compute_reward_metrics(context, rollout_rows, rewards)
-            current_policy_version = self.lora_runtime_registry.get(context).policy_version
-            if self.staleness_manager.is_group_too_stale(
-                    rollout_policy_version=group.rollout_policy_version,
-                    current_policy_version=current_policy_version,
-            ):
+            if adapter_path is not None:
+                rollout_kwargs['adapter_path'] = adapter_path
+            submission = await self._invoke_rollout(rollout_inputs, rollout_kwargs)
+            if not isinstance(submission, dict):
+                raise TypeError(f'TQ rollout must return submission metadata, got {type(submission)!r}')
+            submitted_groups = int(submission.get('submitted_prompt_groups', 0))
+            assert submitted_groups == len(group_refs), (
+                f'TQ rollout submitted {submitted_groups} groups, expected {len(group_refs)}')
+            last_meta = self.data_plane.get_rollout_partition(partition_id)
+            self._last_rollout_submit_time[context.key] = time.time()
+            self._submitted_prompt_groups[context.key] += len(group_refs)
+            return last_meta
+        except Exception as exc:
+            for group_ref, group in zip(group_refs, groups):
+                current = self.data_plane.get_prompt_group(group_ref)
+                if current.status in {PromptGroupStatus.ROLLOUT_DONE, PromptGroupStatus.DROPPED}:
+                    continue
                 self.data_plane.update_prompt_group_status(
                     group_ref,
-                    PromptGroupStatus.DROPPED,
-                    extra_tag={'drop_reason': 'stale_after_rollout'},
+                    PromptGroupStatus.FAILED,
+                    extra_tag={'error': str(exc)},
                 )
                 self.metrics_recorder.log_event(
-                    event='stale_dropped',
+                    event='rollout_failed',
                     phase='rollout',
                     context=context,
-                    partition_id=group_ref.partition_id,
-                    policy_version=current_policy_version,
+                    partition_id=partition_id,
+                    policy_version=group.rollout_policy_version,
                     metrics={
                         'group_id': group_ref.group_id,
-                        'rollout_policy_version': group.rollout_policy_version,
-                        'policy_version_gap': current_policy_version - group.rollout_policy_version,
+                        'submit_batch_group_count': len(group_refs),
                         'rollout_latency_s': time.perf_counter() - start,
+                        'error': str(exc),
                     },
                 )
-                return self.data_plane.get_rollout_partition(group_ref.partition_id)
-            meta, sample_keys = self._write_rollout_samples(
-                group_ref,
-                rollout_rows,
-                rewards=rewards,
-                expected_num_generations=num_generations,
-            )
-            self.data_plane.update_prompt_group_status(
-                group_ref,
-                PromptGroupStatus.ROLLOUT_DONE,
-                sample_keys=sample_keys,
-            )
-            self._last_rollout_submit_time[context.key] = time.time()
-            self._submitted_prompt_groups[context.key] += 1
-            self.metrics_recorder.log_event(
-                event='rollout_done',
-                phase='rollout',
-                context=context,
-                partition_id=group_ref.partition_id,
-                policy_version=current_policy_version,
-                metrics={
-                    'group_id': group_ref.group_id,
-                    'sample_count': len(sample_keys),
-                    'rollout_latency_s': time.perf_counter() - start,
-                    'rollout_policy_version': group.rollout_policy_version,
-                    'policy_version_gap': current_policy_version - group.rollout_policy_version,
-                    'num_generations': num_generations,
-                    **reward_metrics,
-                },
-            )
-            return meta
-        except Exception as exc:
-            self.data_plane.update_prompt_group_status(
-                group_ref,
-                PromptGroupStatus.FAILED,
-                extra_tag={'error': str(exc)},
-            )
-            self.metrics_recorder.log_event(
-                event='rollout_failed',
-                phase='rollout',
-                context=context,
-                partition_id=group_ref.partition_id,
-                policy_version=group.rollout_policy_version,
-                metrics={
-                    'group_id': group_ref.group_id,
-                    'rollout_latency_s': time.perf_counter() - start,
-                    'error': str(exc),
-                },
-            )
             raise
         finally:
-            self.lora_runtime_registry.on_rollout_finished(context)
+            for _ in group_refs:
+                self.lora_runtime_registry.on_rollout_finished(context)
 
     async def _invoke_rollout(
         self,
         trajectories: list[Trajectory],
         rollout_kwargs: dict[str, Any],
-    ) -> Iterable[RolloutOutput]:
+    ) -> dict[str, Any]:
         """Call sync rollout implementations without blocking the event loop."""
         call = getattr(self.rollout, '__call__', None)
         if inspect.iscoroutinefunction(self.rollout) or inspect.iscoroutinefunction(call):
             return await self.rollout(trajectories, **rollout_kwargs)
         return await asyncio.to_thread(self.rollout, trajectories, **rollout_kwargs)
-
-    def _compute_rewards(self, context: LoraContext, rollout_rows: list[RolloutOutput]) -> list[float] | None:
-        reward_fn = self.reward_registry.get(context.key) or self.reward_registry.get(context.reward_type)
-        if reward_fn is None:
-            return None
-        return list(reward_fn(rollout_rows, context=context))
-
-    def _compute_reward_metrics(
-        self,
-        context: LoraContext,
-        rollout_rows: list[RolloutOutput],
-        rewards: list[float] | None,
-    ) -> dict[str, Any]:
-        reward_fn = self.reward_registry.get(context.key) or self.reward_registry.get(context.reward_type)
-        metric_payload = getattr(reward_fn, 'metric_payload', None)
-        if metric_payload is None:
-            return {}
-        return dict(metric_payload(rollout_rows, rewards=rewards, context=context))
-
-    def _write_rollout_samples(
-        self,
-        group_ref: PromptGroupRef,
-        samples: Iterable[RolloutOutput],
-        *,
-        rewards: list[float] | None = None,
-        expected_num_generations: int,
-    ) -> tuple[PartitionMeta, list[str]]:
-        group_samples = [dict(sample) for sample in samples]
-        assert expected_num_generations > 0, f'expected_num_generations must be positive, got {expected_num_generations}'
-        assert len(group_samples) == expected_num_generations, (
-            f'group {group_ref.group_id} expected {expected_num_generations} rollout samples, '
-            f'got {len(group_samples)}')
-        if rewards is not None:
-            assert len(rewards) == len(group_samples), (
-                f'reward count {len(rewards)} does not match sample count {len(group_samples)}')
-        group = self.data_plane.get_prompt_group(group_ref)
-        if group.status not in {PromptGroupStatus.PENDING, PromptGroupStatus.RUNNING}:
-            raise ValueError(f'group {group.group_id} is not pending/running: {group.status}')
-        partition = self.data_plane.get_rollout_partition(group_ref.partition_id)
-
-        sample_keys: list[str] = []
-        sample_fields: list[dict[str, Any]] = []
-        sample_tags: list[dict[str, Any]] = []
-        generation_indices: list[int] = []
-        reward_iter = iter(rewards or [])
-        for sample_index, trajectory in enumerate(group_samples):
-            sample = dict(trajectory)
-            if rewards is not None:
-                sample['rewards'] = next(reward_iter)
-            generation_idx = int(sample.get('generation_idx', sample_index))
-            key = f'samples/{group_ref.group_id}/{generation_idx}'
-            if key in sample_keys:
-                raise ValueError(f'duplicate rollout sample key {key!r}')
-            generation_indices.append(generation_idx)
-            logprobs = _require_rollout_logprobs(sample, sample_key=key)
-            sample['logprobs'] = logprobs
-            fields = _rollout_sample_fields(sample)
-            tag = _sample_tag(
-                context=group.context,
-                group=group,
-                sample=sample,
-                sample_key=key,
-                generation_idx=generation_idx,
-                logprobs=logprobs,
-            )
-            sample_keys.append(key)
-            sample_fields.append(fields)
-            sample_tags.append(tag)
-
-        assert generation_indices == list(range(expected_num_generations)), (
-            f'group {group.group_id} generation_idx must be 0..{expected_num_generations - 1} in order, '
-            f'got {generation_indices}')
-
-        self.data_plane.write_sample_batch(
-            partition_id=group_ref.partition_id,
-            keys=sample_keys,
-            fields=rows_to_tq_fields(sample_fields),
-            tags=sample_tags,
-        )
-        return partition, sample_keys
 
     def _submit_prompt_group_tasks(self) -> int:
         submitted_groups = 0
@@ -561,19 +392,31 @@ class AsyncRollouter:
             if partition is None:
                 continue
             runtime_state = self.lora_runtime_registry.get(context)
-            try:
-                group_ref = self.data_plane.create_prompt_group(
-                    context,
-                    partition,
-                    runtime_state=runtime_state,
-                )
-            except LookupError:
+            free_slots = self._free_group_slots(partition)
+            batch_group_count = min(
+                self.pending_prompt_group_count(context),
+                free_slots,
+            )
+            if batch_group_count <= 0:
                 continue
-            prompt_group = self._pop_prompt_group(context)
-            task = asyncio.create_task(self._run_prompt_group_rollout(group_ref, prompt_group))
+            batch_items: list[tuple[PromptGroupRef, Trajectory]] = []
+            for _ in range(batch_group_count):
+                try:
+                    group_ref = self.data_plane.create_prompt_group(
+                        context,
+                        partition,
+                        runtime_state=runtime_state,
+                    )
+                except LookupError:
+                    break
+                prompt_group = self._pop_prompt_group(context)
+                batch_items.append((group_ref, prompt_group))
+            if not batch_items:
+                continue
+            task = asyncio.create_task(self._run_prompt_group_rollout_batch(batch_items))
             self.active_tasks.add(task)
             self._close_partition_if_full(partition)
-            submitted_groups += 1
+            submitted_groups += len(batch_items)
             self.metrics_recorder.log_event(
                 event='rollout_submitted',
                 phase='rollout',
@@ -582,6 +425,7 @@ class AsyncRollouter:
                 policy_version=runtime_state.policy_version,
                 metrics={
                     'submitted_groups': submitted_groups,
+                    'submit_batch_group_count': len(batch_items),
                     'active_tasks': len(self.active_tasks),
                     'pending_prompt_groups': self.pending_prompt_group_count(context),
                     'rollout_capacity': self._free_group_slots(partition),
@@ -599,7 +443,7 @@ class AsyncRollouter:
             try:
                 await task
             except Exception as exc:
-                # Group-level failure is already persisted by _run_prompt_group_rollout.
+                # Batch/group-level failure is already persisted by the rollout task.
                 # The exception is consumed here so asyncio does not leak it.
                 _ = exc
         return len(done)

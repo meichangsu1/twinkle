@@ -15,6 +15,7 @@ from .types import (ComponentResult, GRPOAdvantageBatch, LoraAdapterState, LoraC
                     PartitionStatus, PipelineStepResult, PromptGroupMeta, PromptGroupRef, PromptGroupStatus,
                     RolloutOutput, RolloutScheduleCandidate, TrainBatchCandidate, TrainStageResult,
                     TransformersTrainBatch)
+from .vllm_sampler_tq import TQSamplerRollout, VLLMSamplerTQ
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
                       ToolManagerFactory, TrainerScheduler, TrainerWorker)
 
@@ -59,5 +60,7 @@ __all__ = [
     'LoraContext',
     'TransferQueueDataPlane',
     'TransferQueueRuntimeConfig',
+    'TQSamplerRollout',
+    'VLLMSamplerTQ',
     'WorkConservingRolloutPolicy',
 ]

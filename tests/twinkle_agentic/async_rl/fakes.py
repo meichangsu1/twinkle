@@ -34,6 +34,9 @@ class FakeTransferQueueClient:
         for key, row_fields, tag in zip(keys, fields, tags):
             self.kv_put(key=key, partition_id=partition_id, fields=row_fields, tag=tag)
 
+    async def async_kv_batch_put(self, keys, partition_id: str, fields=None, tags=None, data_parser=None):
+        self.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
+
     def kv_batch_get(self, keys, partition_id: str, select_fields=None):
         if isinstance(keys, str):
             keys = [keys]

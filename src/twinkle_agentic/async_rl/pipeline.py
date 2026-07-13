@@ -257,7 +257,6 @@ class BaseRLPipeline(ABC):
             rollout=self.rollout,
             tool_manager_factory=tool_manager_factory,
             rollout_policy=rollout_policy,
-            reward_registry=self.reward_registry,
             max_concurrency=config.max_concurrency,
             target_groups_per_partition=config.default_rollout_batch_size,
             target_groups_by_context=config.target_groups_by_context,
