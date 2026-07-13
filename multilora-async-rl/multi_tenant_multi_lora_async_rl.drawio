@@ -1,0 +1,130 @@
+<mxfile host="app.diagrams.net" modified="2026-06-24T00:00:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="multi-tenant-multi-lora-async-rl" name="Multi-tenant Multi-LoRA Async RL">
+    <mxGraphModel dx="1500" dy="980" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1320" pageHeight="980" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="Multi-tenant Multi-LoRA Async RL Architecture" style="text;html=1;strokeColor=none;fillColor=none;fontSize=20;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="390" y="10" width="540" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="client" value="Client&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;submit TrainingJobConfig&lt;br&gt;tenant_id / adapter / tool_profile&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="65" width="250" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="pipeline" value="BaseRLPipeline / Controller&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;job admission / build LoraContext&lt;br&gt;init roles / sync train_k&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="460" y="65" width="390" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="dataplane" value="TransferQueueDataPlane&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;center of data access&lt;br&gt;namespace / metadata / put / claim / append / clear&lt;br&gt;check_capacity(context)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="440" y="355" width="440" height="125" as="geometry" />
+        </mxCell>
+        <mxCell id="tq" value="TransferQueue Backend&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;partition: tenant/run/adapter/train_k&lt;br&gt;rows: trajectory samples&lt;br&gt;metadata: policy_version / adapter / reward / loss / progress&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="440" y="520" width="440" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="adapter_registry" value="AdapterRegistry&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;one training_run -&gt; one LoRA&lt;br&gt;state / policy_version&lt;br&gt;live_partitions / in_flight_rollouts&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="205" width="270" height="115" as="geometry" />
+        </mxCell>
+        <mxCell id="staleness" value="StalenessManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;per-adapter max_staleness&lt;br&gt;rollout capacity&lt;br&gt;throttle / sleep hint&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="365" width="270" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="rollouter" value="AsyncRollouter&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;pending_by_context / active_tasks&lt;br&gt;pick_next_rollout_context()&lt;br&gt;homogeneous rollout batch&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="535" width="270" height="125" as="geometry" />
+        </mxCell>
+        <mxCell id="rollout_impl" value="MultiTurnRollout&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;multi-turn loop&lt;br&gt;ToolManager integration&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="700" width="270" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="toolmanager" value="ToolManagerFactory / ToolManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;first version: native tool / remote tool API&lt;br&gt;no server import of user Env code&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="70" y="820" width="270" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="sampler" value="vLLMSampler&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;multi-LoRA request routing&lt;br&gt;adapter_name / policy_version&lt;br&gt;receive_weights()&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="805" width="300" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="reward" value="RewardWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;claim rollout-ready rows&lt;br&gt;append reward fields&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="990" y="195" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="advantage" value="AdvantageWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;claim reward-ready rows&lt;br&gt;append advantages / returns&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="990" y="330" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="trainer_scheduler" value="TrainerScheduler&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;choose TRAIN_READY train_k&lt;br&gt;no mixed adapter in one train partition&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="990" y="465" width="260" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="trainer" value="TrainerWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;switch LoRA at train_k boundary&lt;br&gt;forward_backward / optimizer.step&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="990" y="605" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="streaming" value="StreamingDataset / StreamingDataLoader&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;TQ-backed train batch iterator&lt;br&gt;read train_k rows&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="990" y="755" width="260" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="ckpt" value="CheckpointEngineManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;export adapter weights&lt;br&gt;once per trained train_k&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="520" y="665" width="280" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="note" value="First-version boundaries&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;Tenant hard quota is checked at job admission.&lt;br&gt;Runtime speed is controlled by AdapterRegistry + StalenessManager + TransferQueueDataPlane capacity + AsyncRollouter local concurrency.&lt;br&gt;Each rollout submit batch and each train_k are context-homogeneous.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="900" y="65" width="350" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="e01" value="1 submit_training_job(config)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="client" target="pipeline">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e02" value="2 register_adapter(context)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="pipeline" target="adapter_registry">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e03" value="3 init_namespace(context)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="pipeline" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e04" value="4 get_metadata()" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="dataplane" target="staleness">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e05" value="5 capacity / throttle hint" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="staleness" target="rollouter">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e06" value="6 can_accept_rollout(context)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="adapter_registry" target="rollouter">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e07" value="7 check_capacity(context)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rollouter" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e08" value="8 run_rollout(context)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rollouter" target="rollout_impl">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e09" value="9 call native / remote tool" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rollout_impl" target="toolmanager">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" value="10 sample(adapter_name, policy_version)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rollout_impl" target="sampler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" value="11 put_rollout_batch(context, train_k)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="rollouter" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="12 native TQ ops" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="dataplane" target="tq">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" value="13 claim / append reward" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="reward" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" value="14 claim / append advantage" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="advantage" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" value="15 list_train_ready_partitions()" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="trainer_scheduler" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" value="16 next_partition(train_k)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="trainer_scheduler" target="trainer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" value="17 iter(train_k)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="trainer" target="streaming">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e18" value="18 read / ack rows" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="streaming" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e19" value="19 train_k done" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="trainer" target="pipeline">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e20" value="20 sync_weights(adapter)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="pipeline" target="ckpt">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e21" value="21 receive_weights(adapter, version)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;" edge="1" parent="1" source="ckpt" target="sampler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e22" value="22 clear_partition(train_k)" style="endArrow=block;html=1;rounded=0;strokeColor=#666666;dashed=1;" edge="1" parent="1" source="pipeline" target="dataplane">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

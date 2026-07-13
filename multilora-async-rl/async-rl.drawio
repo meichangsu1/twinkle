@@ -1,0 +1,112 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="UCP Service Architecture" id="iJZil1vqY6oMf72WaPmZ">
+    <mxGraphModel dx="1437" dy="911" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" background="light-dark(#FFFFFF,#FFFFFF)" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-118" parent="1" style="text;html=1;strokeColor=none;fillColor=none;fontSize=20;fontStyle=1;align=center;verticalAlign=middle;" value="Agentic RL with TransferQueue" vertex="1">
+          <mxGeometry height="40" width="500" x="755" y="1000" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-119" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" value="BaseRLPipeline / Controller&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;init roles / run loop / sync train_k&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="360" x="825" y="1050" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-120" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" value="TransferQueueDataPlane&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;data-plane boundary for all TQ operations&lt;br&gt;get_metadata / put / claim / append / mark / clear&lt;/font&gt;" vertex="1">
+          <mxGeometry height="95" width="420" x="795" y="1300" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-121" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" value="TransferQueue&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;partition: train_k&lt;br&gt;rows / fields / metadata&lt;br&gt;ready / consumed / policy_version&lt;/font&gt;" vertex="1">
+          <mxGeometry height="105" width="280" x="865" y="1535" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-122" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" value="StalenessManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;max_staleness&lt;br&gt;live partition count&lt;br&gt;rollout capacity&lt;br&gt;throttle / sleep hint&lt;/font&gt;" vertex="1">
+          <mxGeometry height="115" width="250" x="400" y="1120" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-123" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" value="RolloutWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;AsyncRollouter&lt;br&gt;pending_queue / active_tasks&lt;br&gt;transfer_buffer / max_concurrency&lt;br&gt;decides submit / throttle / sleep&lt;/font&gt;" vertex="1">
+          <mxGeometry height="135" width="280" x="370" y="1290" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-124" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" value="MultiTurnRollout&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;multi-turn / tool loop&lt;br&gt;user env/tool hooks&lt;/font&gt;" vertex="1">
+          <mxGeometry height="85" width="250" x="435" y="1485" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-125" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" value="vLLMSampler&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;sample / astream_one&lt;br&gt;receive_weights&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="250" x="435" y="1660" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-126" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" value="RewardWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;claim_reward_batch&lt;br&gt;compute_rewards&lt;br&gt;append_rewards&lt;/font&gt;" vertex="1">
+          <mxGeometry height="110" width="250" x="1315" y="1195" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-127" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" value="AdvantageWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;claim_reward_ready_groups&lt;br&gt;compute_advantages&lt;br&gt;append_advantages&lt;/font&gt;" vertex="1">
+          <mxGeometry height="115" width="250" x="1315" y="1340" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-128" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" value="TrainerWorker&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;train loop&lt;br&gt;forward_backward&lt;br&gt;mark_trained(train_k)&lt;/font&gt;" vertex="1">
+          <mxGeometry height="125" width="250" x="1315" y="1510" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-129" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" value="StreamingDataset / StreamingDataLoader&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;TQ-backed train batch iterator&lt;br&gt;read samples from train_k&lt;/font&gt;" vertex="1">
+          <mxGeometry height="85" width="310" x="1285" y="1680" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-130" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" value="CheckpointEngineManager&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;sync weights once per train_k&lt;/font&gt;" vertex="1">
+          <mxGeometry height="75" width="280" x="865" y="1665" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-131" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" value="Key boundaries&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;StalenessManager computes capacity only&lt;br&gt;AsyncRollouter decides submit / throttle / sleep&lt;br&gt;Workers access TQ only through TransferQueueDataPlane&lt;/font&gt;" vertex="1">
+          <mxGeometry height="85" width="440" x="785" y="1780" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-132" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-119" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-120" value="1. init_data_plane()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-133" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-120" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-121" value="6/8/9/11/15. TQ read/write">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-134" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-120" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-122" value="2. get_metadata()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-135" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-122" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-123" value="3. get_rollout_capacity()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-136" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-123" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-120" value="6. put_rollout_batch(train_k)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-137" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-123" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-124" value="4. generate_group()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-138" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-124" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-125" value="5. sample()/astream_one()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-139" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-126" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-120" value="8. claim_reward_batch()/append_rewards()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-140" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-127" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-120" value="9. claim_reward_ready()/append_advantages()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-141" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-128" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-129" value="10. iter(train_k)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-142" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-129" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-120" value="11. read_train_batch()/ack()">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1180" y="1723" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-143" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-128" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-119" value="12. mark_trained(train_k)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1600" y="1573" />
+              <mxPoint x="1600" y="1090" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-144" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-119" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-130" value="13. sync_weights(train_k)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="320" y="1085" />
+              <mxPoint x="320" y="1760" />
+              <mxPoint x="1005" y="1760" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-145" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-130" style="orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;" target="Bi-D-ea7_x4SYnSUNBq9-125" value="14. receive_weights()">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Bi-D-ea7_x4SYnSUNBq9-146" edge="1" parent="1" source="Bi-D-ea7_x4SYnSUNBq9-119" style="edgeStyle=orthogonalEdgeStyle;orthogonalLoop=1;jettySize=auto;endArrow=block;html=1;rounded=0;strokeColor=#666666;dashed=1;" target="Bi-D-ea7_x4SYnSUNBq9-120" value="15. clear_partition(train_k)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

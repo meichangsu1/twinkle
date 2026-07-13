@@ -159,3 +159,87 @@ class GSM8KProcessor(Preprocessor):
             messages=messages,
             user_data=[('ground_truth', ground_truth)],
         )
+
+
+class DAPOMathProcessor(Preprocessor):
+    """Preprocessor for DAPO/verl math parquet rows.
+
+    Expected fields:
+      prompt: list[{role, content}]
+      reward_model: {ground_truth, style}
+      data_source / ability / extra_info: optional metadata
+    """
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        return self.map_row_to_col(rows)
+
+    def preprocess(self, row) -> Trajectory:
+        prompt = row.get('prompt') or []
+        if not isinstance(prompt, list):
+            raise TypeError(f'DAPOMathProcessor expected prompt list, got {type(prompt)!r}')
+        messages = []
+        for message in prompt:
+            if not isinstance(message, dict):
+                raise TypeError(f'DAPOMathProcessor expected prompt message dict, got {type(message)!r}')
+            role = message.get('role')
+            content = message.get('content')
+            if role is None or content is None:
+                raise ValueError(f'DAPOMathProcessor prompt message missing role/content: {message!r}')
+            messages.append(Message(role=role, content=content))
+
+        reward_model = row.get('reward_model') or {}
+        if not isinstance(reward_model, dict):
+            raise TypeError(f'DAPOMathProcessor expected reward_model dict, got {type(reward_model)!r}')
+        ground_truth = str(reward_model.get('ground_truth', '')).strip()
+        user_data = [
+            ('ground_truth', ground_truth),
+            ('reward_style', str(reward_model.get('style', ''))),
+            ('data_source', str(row.get('data_source', ''))),
+            ('ability', str(row.get('ability', ''))),
+        ]
+        extra_info = row.get('extra_info') or {}
+        if isinstance(extra_info, dict) and extra_info.get('index') is not None:
+            user_data.append(('index', str(extra_info['index'])))
+        return Trajectory(messages=messages, user_data=user_data)
+
+
+class AIMEProcessor(Preprocessor):
+    """Preprocessor for original AIME rows.
+
+    Expected fields:
+      ID: problem id
+      Problem: math problem text
+      Solution: optional reference solution
+      Answer: final answer
+    """
+    answer_format = "\nThe answer format must be: \\boxed{{'The final answer goes here.'}}"
+    prompt_template = '{problem}' + answer_format
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        return self.map_row_to_col(rows)
+
+    def preprocess(self, row) -> Trajectory:
+        missing = [field for field in ('ID', 'Problem', 'Answer') if row.get(field) is None]
+        if missing:
+            keys = sorted(str(key) for key in row.keys())
+            raise KeyError(f'AIMEProcessor expected ID/Problem/Answer fields, missing {missing}; got fields: {keys}')
+
+        problem = str(row['Problem']).strip()
+        ground_truth = str(row['Answer']).strip()
+        user_data = [
+            ('ground_truth', ground_truth),
+            ('data_source', 'aime'),
+            ('ability', 'MATH'),
+        ]
+        user_data.append(('id', str(row['ID'])))
+        if row.get('Solution') is not None:
+            user_data.append(('solution', str(row['Solution'])))
+
+        return Trajectory(
+            messages=[Message(role='user', content=self.prompt_template.format(problem=problem))],
+            user_data=user_data,
+        )

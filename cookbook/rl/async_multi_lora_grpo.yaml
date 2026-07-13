@@ -1,0 +1,238 @@
+runtime:
+  mode: ray
+  model_gpus: 2
+  sampler_gpus: 1
+  sampler_tp: 1
+  lazy_collect: false
+
+experiment:
+  run_id: async_multilora_strict_match_sync_seed42
+  mode: async_strict_match_sync
+  seed: 42
+  metrics:
+    output_dir: outputs/async_rl_experiments
+    enable_jsonl: true
+    enable_swanlab: false
+
+lora_context:
+  tenant_id: tenant_a
+  training_run_id: gsm8k_dapo_async_strict_gsm8k
+  base_model_id: ms://Qwen/Qwen3.5-0.8B
+  adapter_name: tenant_a_gsm8k_lora
+  reward_type: gsm8k
+  tool_profile: default
+  rollout:
+    batch_size: 4
+  train:
+    mini_batch_size: 1
+  dataset:
+    name: gsm8k
+    dataset_id: ms://modelscope/gsm8k
+    subset_name: main
+    split: train
+    data_num: 2000
+    max_length: 8192
+    processor:
+      cls: GSM8KProcessor
+      system: >-
+        You are a helpful math assistant. Solve the problem with minimal but
+        correct reasoning and put your final answer within \boxed{}.
+  eval_dataset:
+    name: gsm8k/test
+    dataset_id: ms://modelscope/gsm8k
+    subset_name: main
+    split: test
+    data_num: 128
+    max_length: 8192
+    processor:
+      cls: GSM8KProcessor
+      system: >-
+        You are a helpful math assistant. Solve the problem with minimal but
+        correct reasoning and put your final answer within \boxed{}.
+
+lora_contexts:
+  - tenant_id: tenant_a
+    training_run_id: gsm8k_dapo_async_strict_gsm8k
+    base_model_id: ms://Qwen/Qwen3.5-0.8B
+    adapter_name: tenant_a_gsm8k_lora
+    reward_type: gsm8k
+    tool_profile: default
+    rollout:
+      batch_size: 4
+    train:
+      mini_batch_size: 1
+    dataset:
+      name: gsm8k
+      dataset_id: ms://modelscope/gsm8k
+      subset_name: main
+      split: train
+      data_num: 2000
+      max_length: 8192
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
+    eval_dataset:
+      name: gsm8k/test
+      dataset_id: ms://modelscope/gsm8k
+      subset_name: main
+      split: test
+      data_num: 128
+      max_length: 8192
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
+
+  - tenant_id: tenant_b
+    training_run_id: gsm8k_dapo_async_strict_dapo_math
+    base_model_id: ms://Qwen/Qwen3.5-0.8B
+    adapter_name: tenant_b_dapo_math_lora
+    reward_type: dapo_math
+    tool_profile: default
+    rollout:
+      batch_size: 4
+    train:
+      mini_batch_size: 1
+    dataset:
+      name: byted_dapo_math_17k
+      dataset_id: hf://BytedTsinghua-SIA/DAPO-Math-17k
+      subset_name: default
+      split: train
+      data_num: 0
+      max_length: 8192
+      processor:
+        cls: DAPOMathProcessor
+    eval_dataset:
+      name: maxwell_aime2024
+      dataset_id: hf://Maxwell-Jia/AIME_2024
+      subset_name: default
+      split: train
+      data_num: 0
+      max_length: 8192
+      processor:
+        cls: AIMEProcessor
+
+model:
+  mesh:
+    dp_size: 2
+    tp_size: 1
+    ep_size: 1
+    pp_size: 1
+    sequence_parallel: false
+  mixed_precision: bf16
+  max_loras: 2
+  max_r: 16
+  lora:
+    target_modules: all-linear
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+  gradient_accumulation_steps: 1
+  loss:
+    cls: GRPOLoss
+    epsilon: 0.2
+  optimizer:
+    cls: AdamW
+    lr: 5.0e-5
+  lr_scheduler:
+    cls: CosineAnnealingLR
+    T_max: 100
+    eta_min: 0
+  processor:
+    cls: InputProcessor
+    padding_free: false
+  template:
+    cls: Qwen3_5Template
+    max_length: 8192
+    truncation_strategy: delete
+    enable_thinking: false
+  adapter_checkpoint_dir: output/async_multi_lora_grpo_strict_match_sync/lora_sync
+
+sampler:
+  engine_args:
+    gpu_memory_utilization: 0.8
+    max_model_len: 8192
+    max_loras: 2
+    max_lora_rank: 16
+    enable_lora: true
+    seed: 42
+  template:
+    cls: Qwen3_5Template
+    enable_thinking: false
+  sampling_params:
+    max_tokens: 1024
+    num_samples: 1
+    logprobs: 1
+    temperature: 1.0
+    top_p: 0.95
+
+pipeline:
+  # null means train until all configured training data is consumed and the
+  # rollout/advantage/train queues are drained.
+  max_steps: null
+  max_staleness: 0
+  default_rollout_batch_size: 4
+  # Measured in prompt groups. 1 prompt group * 8 generations = 8 train samples,
+  # matching sync MINI_BATCH_SIZE=8.
+  default_mini_batch_size: 1
+  rollout_policy: weighted_fair
+  train_policy: weighted_fair
+  rollout:
+    num_generations: 8
+    max_concurrency: 4
+  eval:
+    enabled: true
+    batch_size: 16
+    sampling_params:
+      max_tokens: 1024
+      num_samples: 1
+      temperature: 0.0
+      top_p: 1.0
+  save_name_prefix: async-multilora-strict-match-sync
+  keep_adapter_versions: 2
+  save_optimizer: false
+  is_sampler_checkpoint: false
+  max_grad_norm: 1.0
+  norm_type: 2
+
+transfer_queue:
+  init: true
+  total_storage_size: 200000
+  num_data_storage_units: 4
+  storage_backend: SimpleStorage
+
+# Matching sync baseline command:
+# RUN_ID=sync_multilora_match_async_seed42 \
+# MODE=sync_multilora_match_async \
+# TWINKLE_SEED=42 \
+# SAMPLER_SEED=42 \
+# MODEL_ID=ms://Qwen/Qwen3.5-0.8B \
+# MODEL_GPUS=2 \
+# SAMPLER_GPUS=1 \
+# SAMPLER_TP=1 \
+# NUM_GENERATIONS=8 \
+# MAX_NEW_TOKENS=1024 \
+# LR=5e-5 \
+# MAX_STEPS=0 \
+# LR_SCHEDULER_T_MAX=2000 \
+# BATCH_SIZE=4 \
+# MINI_BATCH_SIZE=8 \
+# GRADIENT_ACCUMULATION_STEPS=1 \
+# LORA_RANK=16 \
+# MODEL_MAX_R=16 \
+# MAX_LORAS=2 \
+# SAMPLER_MAX_LORA_RANK=16 \
+# EVAL_AT_END=1 \
+# EVAL_EVERY_PARTITIONS=0 \
+# EVAL_BATCH_SIZE=16 \
+# EVAL_MAX_NEW_TOKENS=1024 \
+# python cookbook/rl/short_math_grpo_multilora_jsonl.py \
+#   --config cookbook/rl/short_math_grpo_multilora_jsonl.yaml
+#
+# Async strict command:
+# TWINKLE_SEED=42 \
+# python cookbook/rl/async_multi_lora_grpo.py \
+#   --config cookbook/rl/async_multi_lora_grpo.yaml

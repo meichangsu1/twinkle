@@ -1,0 +1,89 @@
+client:
+  base_url: http://127.0.0.1:8000
+  api_key: EMPTY_TOKEN
+
+experiment:
+  run_id: client_async_relaxed_seed0
+  mode: async_relaxed
+  seed: 0
+  metrics:
+    output_dir: outputs/async_rl_experiments
+    enable_jsonl: true
+    enable_swanlab: true
+    swanlab_project: twinkle
+
+lora_contexts:
+  - tenant_id: tenant_a
+    training_run_id: gsm8k_grpo_run_001
+    base_model_id: ms://Qwen/Qwen3.5-4B
+    adapter_name: tenant_a_gsm8k_lora
+    reward_type: gsm8k
+    tool_profile: default
+  - tenant_id: tenant_b
+    training_run_id: gsm8k_grpo_run_002
+    base_model_id: ms://Qwen/Qwen3.5-4B
+    adapter_name: tenant_b_gsm8k_lora
+    reward_type: gsm8k
+    tool_profile: default
+
+model:
+  lora:
+    target_modules: all-linear
+    r: 8
+    lora_alpha: 32
+    lora_dropout: 0.05
+  gradient_accumulation_steps: 1
+  loss:
+    cls: GRPOLoss
+    epsilon: 0.2
+    beta: 0.0
+  optimizer:
+    cls: Adam
+    lr: 2.0e-5
+  processor:
+    cls: InputProcessor
+  template:
+    cls: Qwen3_5Template
+    max_length: 2048
+    truncation_strategy: delete
+    enable_thinking: false
+
+sampler:
+  template:
+    cls: Qwen3_5Template
+    enable_thinking: false
+  sampling_params:
+    max_tokens: 1024
+    temperature: 1.0
+    top_p: 0.95
+    logprobs: 1
+
+dataset:
+  dataset_id: ms://modelscope/gsm8k
+  subset_name: main
+  split: train
+  data_num: 2000
+  system_prompt: >-
+    You are a helpful math assistant. Solve the problem with minimal but
+    correct reasoning and put your final answer within \boxed{}.
+
+pipeline:
+  max_steps: 10
+  max_staleness: 1
+  default_rollout_batch_size: 1
+  default_mini_batch_size: 1
+  rollout_policy: weighted_fair
+  train_policy: weighted_fair
+  rollout:
+    num_generations: 4
+    max_concurrency: 16
+  save_name_prefix: async-grpo-sampler-weights
+  is_sampler_checkpoint: true
+  save_optimizer: false
+
+transfer_queue:
+  init_ray: true
+  ray_namespace: TransferQueueApp
+  total_storage_size: 200000
+  num_data_storage_units: 4
+  storage_backend: SimpleStorage

@@ -126,6 +126,13 @@ class MultiTurnRollout(Rollout):
 
         sampling_params = kwargs.get('sampling_params', self.sampling_params)
         tool_managers = self._resolve_tool_managers(kwargs.get('tool_manager', self.tool_manager), n)
+        sampler_extra_kwargs = {}
+        if 'adapter_name' in kwargs:
+            sampler_extra_kwargs['adapter_name'] = kwargs['adapter_name']
+        if 'adapter_path' in kwargs:
+            sampler_extra_kwargs['adapter_path'] = kwargs['adapter_path']
+        if 'use_base_model' in kwargs:
+            sampler_extra_kwargs['use_base_model'] = kwargs['use_base_model']
 
         # 1. Encode each trajectory once; ``pifs[i]`` is the live per-turn
         #    state for trajectory ``i``.
@@ -154,7 +161,11 @@ class MultiTurnRollout(Rollout):
             min_batch_size = (device_mesh.data_world_size if device_mesh is not None else 1)
             if actual < min_batch_size:
                 batch_pifs = batch_pifs + ([batch_pifs[-1]] * (min_batch_size - actual))
-            resps = self.sampler.sample(batch_pifs, sampling_params=sampling_params)
+            resps = self.sampler.sample(
+                batch_pifs,
+                sampling_params=sampling_params,
+                **sampler_extra_kwargs,
+            )
             resps = self._unwrap_response_list(resps, len(batch_pifs))[:actual]
 
             pending_bridges: List[tuple] = []  # (global_idx, tool_messages)
