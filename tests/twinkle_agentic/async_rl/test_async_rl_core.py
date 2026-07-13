@@ -1026,7 +1026,7 @@ def test_trainer_trains_group_batches_and_syncs_only_when_partition_done():
     assert data_plane.list_partitions(context) == []
 
 
-def test_trainer_stage_drains_selected_context_until_blocked():
+def test_trainer_stage_trains_selected_partition_until_done():
     context_a = make_context('a')
     context_b = make_context('b', run='run_b')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
@@ -1065,7 +1065,7 @@ def test_trainer_stage_drains_selected_context_until_blocked():
         train_batch_groups=1,
     )
 
-    result = trainer.train_until_blocked()
+    result = trainer.train_one_partition()
 
     assert result.train_batches == 2
     assert result.trained_partitions == 1
@@ -1074,6 +1074,55 @@ def test_trainer_stage_drains_selected_context_until_blocked():
     assert data_plane.list_prompt_groups(
         context_b,
         partition_id=partition_b.partition_id,
+        statuses=[PromptGroupStatus.ADVANTAGE_DONE],
+    )
+
+
+def test_trainer_stage_returns_after_one_partition_even_when_context_has_more_ready():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+
+    partition_0 = data_plane.create_rollout_partition(context, target_groups=1)
+    registry.on_partition_created(context, partition_0.partition_id)
+    complete_prompt_group(data_plane, context, partition_0, make_sample(0))
+
+    partition_1 = data_plane.create_rollout_partition(context, target_groups=1)
+    registry.on_partition_created(context, partition_1.partition_id)
+    complete_prompt_group(data_plane, context, partition_1, make_sample(1))
+
+    AdvantageWorker(
+        data_plane=data_plane,
+        contexts=[context],
+        lora_runtime_registry=registry,
+        batch_size=2,
+    ).process_available()
+
+    trained_partitions = []
+
+    def train_fn(ctx, batch):
+        trained_partitions.append(batch.partition_id)
+        assert trainer.read_train_batch(batch).sample_count == 1
+        return {'adapter_path': f'/tmp/{ctx.adapter_name}-v1'}
+
+    trainer = TrainerWorker(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        scheduler=TrainerScheduler(lora_runtime_registry=registry),
+        train_batch_fn=train_fn,
+        train_batch_groups=1,
+    )
+
+    result = trainer.train_one_partition()
+
+    assert result.train_batches == 1
+    assert result.trained_partitions == 1
+    assert trained_partitions == [partition_0.partition_id]
+    assert [partition.partition_id for partition in data_plane.list_partitions(context)] == [partition_1.partition_id]
+    assert data_plane.list_prompt_groups(
+        context,
+        partition_id=partition_1.partition_id,
         statuses=[PromptGroupStatus.ADVANTAGE_DONE],
     )
 

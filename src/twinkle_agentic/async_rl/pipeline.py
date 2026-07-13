@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
+from twinkle import get_logger
 from twinkle.data_format import Trajectory
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .metrics import AsyncRLMetricsConfig, AsyncRLMetricsRecorder, build_metrics_recorder
@@ -16,6 +19,55 @@ from .types import (GRPOAdvantageBatch, LoraContext, PartitionMeta, PartitionSta
                     PromptGroupStatus, RolloutCallable)
 from .workers import (AdvantageWorker, AsyncRollouter, MultiLoraGRPOTrainConfig, MultiLoraGRPOTrainerWorker,
                       ToolManagerFactory, TrainerScheduler, TrainerStepResult, TrainerWorker)
+
+logger = get_logger()
+
+
+class _TrainProgressReporter:
+    """Report coarse async RL progress by completed train partitions."""
+
+    def __init__(self, *, total: int | None):
+        self.total = total
+        self._trained = 0
+        self._bar = None
+        self._start_time = time.time()
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            tqdm = None
+
+        if tqdm is not None and sys.stderr.isatty():
+            self._bar = tqdm(total=total, desc='async RL train partitions', unit='partition')
+        else:
+            target = 'unbounded' if total is None else str(total)
+            logger.info('async RL train progress started: trained_partitions=0/%s', target)
+
+    def update(self, completed_partitions: int) -> None:
+        if completed_partitions <= 0:
+            return
+        self._trained += completed_partitions
+        if self._bar is not None:
+            self._bar.update(completed_partitions)
+            return
+        elapsed_s = max(time.time() - self._start_time, 1e-6)
+        rate = self._trained / elapsed_s
+        if self.total is None:
+            logger.info(
+                'async RL train progress: trained_partitions=%s rate=%.3f partitions/s',
+                self._trained,
+                rate,
+            )
+        else:
+            logger.info(
+                'async RL train progress: trained_partitions=%s/%s rate=%.3f partitions/s',
+                self._trained,
+                self.total,
+                rate,
+            )
+
+    def close(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
 
 
 @dataclass
@@ -390,7 +442,7 @@ class BaseRLPipeline(ABC):
             rollout_result = await rollout_result
 
         advantage_result = self.advantage_worker.process_available()
-        train_result = self.trainer_worker.train_until_blocked(max_partitions=max_train_partitions)
+        train_result = self.trainer_worker.train_one_partition(max_partitions=max_train_partitions)
 
         step_result = PipelineStepResult(
             rollout=None if rollout_result is None else rollout_result.metadata,
@@ -429,20 +481,25 @@ class BaseRLPipeline(ABC):
         limit = max_steps if max_steps is not None else self.config.max_train_steps
         history: list[PipelineStepResult] = []
         trained = 0
-        while limit is None or trained < limit:
-            remaining = None if limit is None else max(0, limit - trained)
-            result = await self.step_async(max_train_partitions=remaining)
-            history.append(result)
-            if result.trained_partitions:
-                trained += result.trained_partitions
-                if self.should_stop(trained):
+        progress = _TrainProgressReporter(total=limit)
+        try:
+            while limit is None or trained < limit:
+                remaining = None if limit is None else max(0, limit - trained)
+                result = await self.step_async(max_train_partitions=remaining)
+                history.append(result)
+                if result.trained_partitions:
+                    trained += result.trained_partitions
+                    progress.update(result.trained_partitions)
+                    if self.should_stop(trained):
+                        break
+                    continue
+                if result.had_work:
+                    continue
+                if self._is_drained():
                     break
-                continue
-            if result.had_work:
-                continue
-            if self._is_drained():
-                break
-            await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)
+        finally:
+            progress.close()
         return history
 
     def run(

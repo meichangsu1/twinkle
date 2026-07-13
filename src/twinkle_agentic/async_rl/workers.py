@@ -771,6 +771,11 @@ class TrainerWorker:
         return self._train_candidate(candidate)
 
     def train_until_blocked(self, *, max_partitions: int | None = None) -> TrainStageResult | None:
+        return self.train_one_partition(max_partitions=max_partitions)
+
+    def train_one_partition(self, *, max_partitions: int | None = None) -> TrainStageResult | None:
+        if max_partitions is not None and max_partitions <= 0:
+            return None
         candidate = self.scheduler.next_batch(
             self.list_train_batch_candidates(),
             self.current_context,
@@ -779,6 +784,7 @@ class TrainerWorker:
             return None
 
         selected_context = candidate.context
+        selected_partition_id = candidate.partition.partition_id
         train_batches = 0
         trained_partitions = 0
         last_meta: PartitionMeta | None = None
@@ -790,13 +796,21 @@ class TrainerWorker:
                 trained_partitions += 1
                 if max_partitions is not None and trained_partitions >= max_partitions:
                     break
-            candidate = self._next_candidate_for_context(selected_context)
+                break
+            candidate = self._next_candidate_for_partition(selected_context, selected_partition_id)
 
         return TrainStageResult(
             train_batches=train_batches,
             trained_partitions=trained_partitions,
             metadata=last_meta,
         )
+
+    def _next_candidate_for_partition(self, context: LoraContext, partition_id: str) -> TrainBatchCandidate | None:
+        candidates = [
+            candidate for candidate in self.list_train_batch_candidates()
+            if candidate.context.key == context.key and candidate.partition.partition_id == partition_id
+        ]
+        return self.scheduler.next_batch(candidates, context)
 
     def _next_candidate_for_context(self, context: LoraContext) -> TrainBatchCandidate | None:
         candidates = [
