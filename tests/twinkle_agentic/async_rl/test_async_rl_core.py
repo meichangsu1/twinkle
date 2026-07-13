@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -1127,6 +1128,94 @@ def test_trainer_stage_returns_after_one_partition_even_when_context_has_more_re
     )
 
 
+def test_trainer_drops_closed_tail_partition_below_mini_batch_size():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+
+    partition = data_plane.create_rollout_partition(context, target_groups=2)
+    registry.on_partition_created(context, partition.partition_id)
+    complete_prompt_group(data_plane, context, partition, make_sample(0))
+    data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
+    AdvantageWorker(
+        data_plane=data_plane,
+        contexts=[context],
+        lora_runtime_registry=registry,
+        batch_size=2,
+    ).process_available()
+
+    trained = []
+    trainer = TrainerWorker(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        scheduler=TrainerScheduler(lora_runtime_registry=registry),
+        train_batch_fn=lambda ctx, batch: trained.append(batch),
+        train_batch_groups=2,
+    )
+
+    result = trainer.train_one_partition()
+
+    assert result is None
+    assert trained == []
+    assert data_plane.list_partitions(context) == []
+    assert registry.get(context).live_partitions == set()
+
+
+def test_trainer_syncs_trained_partition_when_dropping_tail_below_mini_batch_size():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+
+    partition = data_plane.create_rollout_partition(context, target_groups=3)
+    registry.on_partition_created(context, partition.partition_id)
+    complete_prompt_group(data_plane, context, partition, make_sample(0))
+    complete_prompt_group(data_plane, context, partition, make_sample(1))
+    complete_prompt_group(data_plane, context, partition, make_sample(2))
+    AdvantageWorker(
+        data_plane=data_plane,
+        contexts=[context],
+        lora_runtime_registry=registry,
+        batch_size=3,
+    ).process_available()
+
+    train_batches = []
+    received = []
+    saved = []
+
+    def train_fn(ctx, batch):
+        train_batches.append(batch_group_ids(batch))
+        return None
+
+    def save_adapter(ctx, partition_id):
+        saved.append(partition_id)
+        return {'adapter_path': '/tmp/lora-tail-v1'}
+
+    trainer = TrainerWorker(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        scheduler=TrainerScheduler(lora_runtime_registry=registry),
+        train_batch_fn=train_fn,
+        save_adapter_fn=save_adapter,
+        receive_weights_fn=lambda state: received.append(state),
+        train_batch_groups=2,
+    )
+
+    first = trainer.train_one_partition()
+    second = trainer.train_one_partition()
+
+    assert first.train_batches == 1
+    assert first.trained_partitions == 0
+    assert second is None
+    assert len(train_batches) == 1
+    assert saved == [partition.partition_id]
+    assert received[0].policy_version == 1
+    assert received[0].adapter_path == '/tmp/lora-tail-v1'
+    assert data_plane.list_partitions(context) == []
+    assert registry.get(context).live_partitions == set()
+
+
 def test_trainer_mini_batch_size_is_context_level():
     context_a = make_context('a')
     context_b = make_context('b', run='run_b')
@@ -1398,6 +1487,34 @@ def test_async_rollouter_tq_mode_submits_without_writing_samples():
     assert [group.status for group in groups] == [PromptGroupStatus.RUNNING, PromptGroupStatus.RUNNING]
     tags = data_plane.tq.kv_list(partition_id=partition.partition_id)[partition.partition_id]
     assert len([tag for tag in tags.values() if tag.get('record_type') == 'sample']) == 0
+
+
+def test_async_rollouter_closes_partial_partition_when_prompt_source_exhausted():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context)
+    partition = data_plane.create_rollout_partition(context, target_groups=2)
+    registry.on_partition_created(context, partition.partition_id)
+    complete_prompt_group(data_plane, context, partition, make_sample(0))
+
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=2, target_groups_per_partition=2),
+        rollout=lambda trajectories, **kwargs: {
+            'submission_id': 'unused',
+            'submitted_prompt_groups': len(trajectories),
+            'submitted_samples': len(trajectories),
+        },
+        target_groups_per_partition=2,
+    )
+    rollouter.attach_prompt_loaders([SimpleNamespace(context=context, exhausted=True)])
+
+    assert data_plane.get_rollout_partition(partition.partition_id).status == PartitionStatus.ACTIVE
+    assert rollouter._close_exhausted_partial_partitions() == 1
+    assert data_plane.get_rollout_partition(partition.partition_id).status == PartitionStatus.CLOSED
+
 
 def test_prompt_loader_is_pipeline_source_component():
     context = make_context('lora')

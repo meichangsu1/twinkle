@@ -475,6 +475,46 @@ class AsyncRollouter:
         if self._free_group_slots(partition) == 0:
             self.data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
 
+    def _context_prompt_source_exhausted(self, context: LoraContext) -> bool:
+        loaders = [
+            loader for loader in self.prompt_loaders
+            if getattr(getattr(loader, 'context', None), 'key', None) == context.key
+        ]
+        if not loaders:
+            return True
+        return all(getattr(loader, 'exhausted', False) for loader in loaders)
+
+    def _close_exhausted_partial_partitions(self) -> int:
+        closed = 0
+        contexts = {
+            context
+            for queue in self.pending_prompt_groups_by_context.values()
+            for context, _ in queue
+        }
+        contexts.update(getattr(loader, 'context') for loader in self.prompt_loaders if getattr(loader, 'context', None))
+        for runtime_state in self.lora_runtime_registry.list_states():
+            for partition_id in runtime_state.live_partitions:
+                try:
+                    contexts.add(self.data_plane.get_rollout_partition(partition_id).context)
+                except KeyError:
+                    continue
+        for context in contexts:
+            if self.pending_prompt_group_count(context) > 0:
+                continue
+            if not self._context_prompt_source_exhausted(context):
+                continue
+            for partition in self._list_live_partitions(context):
+                if partition.status != PartitionStatus.ACTIVE:
+                    continue
+                if self._free_group_slots(partition) <= 0:
+                    continue
+                group_count = len(self.data_plane.list_prompt_groups(context, partition_id=partition.partition_id))
+                if group_count <= 0:
+                    continue
+                self.data_plane.update_partition_status(partition.partition_id, PartitionStatus.CLOSED)
+                closed += 1
+        return closed
+
     def _load_prompt_stage(self) -> int:
         loaded = 0
         for loader in self.prompt_loaders:
@@ -487,11 +527,12 @@ class AsyncRollouter:
         loaded_prompt_groups = self._load_prompt_stage()
         completed = await self._collect_finished_tasks()
         submitted_groups = self._submit_prompt_group_tasks()
-        if loaded_prompt_groups or completed or submitted_groups:
+        closed_partitions = self._close_exhausted_partial_partitions()
+        if loaded_prompt_groups or completed or submitted_groups or closed_partitions:
             return ComponentResult(
                 component='rollouter',
                 kind='rollout',
-                count=loaded_prompt_groups + completed + submitted_groups,
+                count=loaded_prompt_groups + completed + submitted_groups + closed_partitions,
             )
         return None
 
@@ -767,6 +808,7 @@ class TrainerWorker:
             self.current_context,
         )
         if candidate is None:
+            self._drop_untrainable_closed_tail_partitions()
             return None
         return self._train_candidate(candidate)
 
@@ -781,6 +823,7 @@ class TrainerWorker:
             self.current_context,
         )
         if candidate is None:
+            self._drop_untrainable_closed_tail_partitions()
             return None
 
         selected_context = candidate.context
@@ -811,6 +854,101 @@ class TrainerWorker:
             if candidate.context.key == context.key and candidate.partition.partition_id == partition_id
         ]
         return self.scheduler.next_batch(candidates, context)
+
+    def _drop_untrainable_closed_tail_partitions(self) -> int:
+        dropped = 0
+        terminal_statuses = {PromptGroupStatus.TRAIN_DONE, PromptGroupStatus.FAILED, PromptGroupStatus.DROPPED}
+        blocking_statuses = {
+            PromptGroupStatus.PENDING,
+            PromptGroupStatus.RUNNING,
+            PromptGroupStatus.ROLLOUT_DONE,
+            PromptGroupStatus.ADVANTAGING,
+            PromptGroupStatus.TRAINING,
+        }
+        for partition in self.list_live_partitions():
+            if partition.status != PartitionStatus.CLOSED:
+                continue
+            groups = self.data_plane.list_prompt_groups(partition.context, partition_id=partition.partition_id)
+            if not groups:
+                continue
+            if any(group.status in blocking_statuses for group in groups):
+                continue
+            ready_groups = [group for group in groups if group.status == PromptGroupStatus.ADVANTAGE_DONE]
+            if not ready_groups:
+                continue
+            required_groups = self.train_batch_groups_for_context(partition.context)
+            if len(ready_groups) >= required_groups:
+                continue
+            if any(group.status not in terminal_statuses and group.status != PromptGroupStatus.ADVANTAGE_DONE
+                   for group in groups):
+                continue
+            trained_group_count = len([group for group in groups if group.status == PromptGroupStatus.TRAIN_DONE])
+            if trained_group_count > 0:
+                start = time.perf_counter()
+                sync_result = self.save_adapter_fn(partition.context,
+                                                   partition.partition_id) if self.save_adapter_fn else None
+                adapter_path = self._adapter_path_from_result(sync_result)
+                self.data_plane.mark_prompt_groups(
+                    ready_groups,
+                    PromptGroupStatus.DROPPED,
+                    extra_tag={'drop_reason': 'partial_tail_below_mini_batch'},
+                )
+                self.data_plane.update_partition_status(partition.partition_id, PartitionStatus.TRAIN_DONE)
+                self.lora_runtime_registry.on_weight_sync_started(partition.context)
+                runtime_state = self.lora_runtime_registry.on_weight_sync_finished(
+                    partition.context,
+                    adapter_path=adapter_path,
+                )
+                if self.receive_weights_fn is not None:
+                    self.receive_weights_fn(runtime_state)
+                self.metrics_recorder.log_event(
+                    event='weight_sync_done',
+                    phase='train',
+                    context=partition.context,
+                    partition_id=partition.partition_id,
+                    policy_version=runtime_state.policy_version,
+                    metrics={
+                        'group_count': trained_group_count,
+                        'dropped_tail_groups': len(ready_groups),
+                        'adapter_path': adapter_path,
+                    },
+                )
+                self.data_plane.clear_partition(partition.context, partition.partition_id)
+                self.lora_runtime_registry.on_partition_cleared(partition.context, partition.partition_id)
+                self.metrics_recorder.log_event(
+                    event='partition_train_done',
+                    phase='train',
+                    context=partition.context,
+                    partition_id=partition.partition_id,
+                    policy_version=runtime_state.policy_version,
+                    metrics={
+                        'group_count': trained_group_count,
+                        'dropped_tail_groups': len(ready_groups),
+                        'partition_train_latency_s': time.perf_counter() - start,
+                    },
+                )
+                dropped += 1
+                continue
+            self.data_plane.mark_prompt_groups(
+                ready_groups,
+                PromptGroupStatus.DROPPED,
+                extra_tag={'drop_reason': 'partial_tail_below_mini_batch'},
+            )
+            self.data_plane.clear_partition(partition.context, partition.partition_id)
+            self.lora_runtime_registry.on_partition_cleared(partition.context, partition.partition_id)
+            self.metrics_recorder.log_event(
+                event='partition_dropped',
+                phase='train',
+                context=partition.context,
+                partition_id=partition.partition_id,
+                metrics={
+                    'group_count': len(ready_groups),
+                    'required_groups': required_groups,
+                    'drop_reason': 'partial_tail_below_mini_batch',
+                },
+            )
+            dropped += 1
+        return dropped
 
     def _next_candidate_for_context(self, context: LoraContext) -> TrainBatchCandidate | None:
         candidates = [
