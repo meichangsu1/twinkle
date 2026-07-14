@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from concurrent.futures import Future
 from copy import copy
@@ -17,6 +18,15 @@ from .tq_utils import ROLLOUT_TRAIN_FIELDS, rows_to_tq_fields
 from .types import LoraContext, PromptGroupMeta, PromptGroupRef, PromptGroupStatus, RolloutOutput
 
 logger = get_logger()
+
+
+def resolve_adapter_path(adapter_path: str) -> str:
+    path = os.path.expanduser(str(adapter_path))
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    if os.path.isabs(path):
+        raise FileNotFoundError(f'local LoRA adapter path does not exist: {path}')
+    return HubOperation.download_model(model_id_or_path=adapter_path)
 
 
 class TQSamplerRollout:
@@ -172,7 +182,7 @@ class VLLMSamplerTQ(vLLMSampler):
         try:
             if adapter_path is not None:
                 logger.info(f'Loading LoRA from {adapter_path}')
-                local_adapter_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
+                local_adapter_path = await asyncio.to_thread(resolve_adapter_path, adapter_path)
                 lora_request = await self.engine._get_or_load_lora(local_adapter_path)
                 if lora_request is None:
                     logger.warning(f'Failed to pre-load LoRA from {local_adapter_path}, sampling will proceed without LoRA')

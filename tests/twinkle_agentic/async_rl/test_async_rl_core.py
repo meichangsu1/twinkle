@@ -30,6 +30,7 @@ from twinkle_agentic.async_rl import (
     WorkConservingRolloutPolicy,
 )
 from twinkle_agentic.async_rl.grpo_pipeline import (
+    AsyncMultiLoraGRPOPipeline,
     _async_train_batch_data_diagnostics,
     _short_math_reward_metrics,
     lora_model_config,
@@ -680,6 +681,48 @@ def test_data_plane_lists_prompt_group_raw_tags_for_diagnostics():
     assert tags[0]['error'] == 'sample failed'
 
 
+def test_adapter_prune_protects_paths_referenced_by_live_prompt_groups(tmp_path):
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    partition = data_plane.create_rollout_partition(context, target_groups=1)
+    adapter_paths = []
+    for index in range(4):
+        path = tmp_path / f'adapter-v{index}'
+        path.mkdir()
+        adapter_paths.append(path)
+    data_plane.create_prompt_group(
+        context,
+        partition,
+        runtime_state=make_runtime_state(context, adapter_path=str(adapter_paths[0])),
+    )
+
+    class FakePruneExecutor:
+        def __init__(self):
+            self.submissions = []
+
+        def submit(self, *args):
+            self.submissions.append(args)
+
+    pipeline = object.__new__(AsyncMultiLoraGRPOPipeline)
+    pipeline.cfg = OmegaConf.create({'pipeline': {'keep_adapter_versions': 1, 'max_staleness': 0}})
+    pipeline.data_plane = data_plane
+    pipeline.lora_runtime_registry = LoraRuntimeRegistry()
+    pipeline._adapter_paths_by_context = {context.key: [adapter_paths[0], adapter_paths[1]]}
+    pipeline._adapter_prune_executor = FakePruneExecutor()
+
+    pipeline._record_and_prune_adapter_paths(context, str(adapter_paths[2]))
+
+    assert pipeline._adapter_prune_executor.submissions == []
+    assert adapter_paths[0] in pipeline._adapter_paths_by_context[context.key]
+
+    data_plane.clear_partition(context, partition.partition_id)
+    pipeline._record_and_prune_adapter_paths(context, str(adapter_paths[3]))
+
+    pruned_paths = [submission[2] for submission in pipeline._adapter_prune_executor.submissions]
+    assert adapter_paths[0] in pruned_paths
+    assert adapter_paths[1] in pruned_paths
+
+
 def test_data_plane_builds_transformers_train_batch_without_sample_rows():
     context = make_context('lora')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
@@ -1150,6 +1193,56 @@ def test_trainer_stage_returns_after_one_partition_even_when_context_has_more_re
     assert data_plane.list_prompt_groups(
         context,
         partition_id=partition_1.partition_id,
+        statuses=[PromptGroupStatus.ADVANTAGE_DONE],
+    )
+
+
+def test_trainer_context_block_filter_does_not_block_other_contexts():
+    context_a = make_context('a')
+    context_b = make_context('b', run='run_b')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = LoraRuntimeRegistry()
+    registry.register(context_a)
+    registry.register(context_b)
+
+    partition_a = data_plane.create_rollout_partition(context_a, target_groups=1)
+    registry.on_partition_created(context_a, partition_a.partition_id)
+    complete_prompt_group(data_plane, context_a, partition_a, make_sample(0))
+
+    partition_b = data_plane.create_rollout_partition(context_b, target_groups=1)
+    registry.on_partition_created(context_b, partition_b.partition_id)
+    complete_prompt_group(data_plane, context_b, partition_b, make_sample(1))
+
+    AdvantageWorker(
+        data_plane=data_plane,
+        contexts=[context_a, context_b],
+        lora_runtime_registry=registry,
+        batch_size=2,
+    ).process_available()
+
+    trained_contexts = []
+
+    def train_fn(ctx, batch):
+        trained_contexts.append(ctx.key)
+        return {'adapter_path': f'/tmp/{ctx.adapter_name}-v1'}
+
+    trainer = TrainerWorker(
+        data_plane=data_plane,
+        lora_runtime_registry=registry,
+        scheduler=TrainerScheduler(lora_runtime_registry=registry),
+        train_batch_fn=train_fn,
+        train_batch_groups=1,
+    )
+
+    result = trainer.train_one_partition(context_blocked_fn=lambda ctx: ctx.key == context_a.key)
+
+    assert result.train_batches == 1
+    assert result.trained_partitions == 1
+    assert trained_contexts == [context_b.key]
+    assert data_plane.list_partitions(context_b) == []
+    assert data_plane.list_prompt_groups(
+        context_a,
+        partition_id=partition_a.partition_id,
         statuses=[PromptGroupStatus.ADVANTAGE_DONE],
     )
 

@@ -986,6 +986,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             context_model_cfg = lora_model_config(self.cfg, context_cfg)
             prompt_batch_size = rollout_batch_groups_for_context(self.cfg, context_cfg)
             max_pending_groups = max_pending_prompt_groups_for_context(self.cfg, context_cfg)
+            prompt_prefetch_batch_size = max_pending_groups
             safe_context_key = re.sub(r'[^A-Za-z0-9_.-]+', '_', context.key)
             dataset_factory = partial(
                 build_prompt_dataset_from_config,
@@ -998,7 +999,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 dataloader_kwargs['instance_id'] = f'{os.getpid()}-{safe_context_key}-'
             dataloader = DataLoader(
                 dataset=dataset_factory,
-                batch_size=prompt_batch_size,
+                batch_size=prompt_prefetch_batch_size,
                 min_batch_size=prompt_batch_size,
                 device_mesh=self.model_mesh,
                 **dataloader_kwargs,
@@ -1168,24 +1169,52 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             is_sampler=bool(self.cfg.pipeline.is_sampler_checkpoint),
         )
         adapter_path = save_result if isinstance(save_result, str) else getattr(save_result, 'twinkle_path', None)
+        if adapter_path is not None and os.path.exists(adapter_path):
+            adapter_path = os.path.abspath(adapter_path)
         self._record_and_prune_adapter_paths(context, adapter_path)
         return TrainerStepResult(adapter_path=adapter_path)
 
     def _record_and_prune_adapter_paths(self, context, adapter_path: str | None) -> None:
-        keep_versions = int(self.cfg.pipeline.get('keep_adapter_versions', 0) or 0)
-        if keep_versions <= 0 or adapter_path is None:
+        configured_keep_versions = int(self.cfg.pipeline.get('keep_adapter_versions', 0) or 0)
+        if configured_keep_versions <= 0 or adapter_path is None:
             return
+        # Fire-and-forget rollout submissions can still load an older adapter after train has advanced.
+        # Keep an extra staleness window and never prune paths still referenced by live rollout groups.
+        keep_versions = configured_keep_versions + int(self.cfg.pipeline.max_staleness) + 1
         path = Path(adapter_path)
         if not path.exists():
             return
         paths = self._adapter_paths_by_context.setdefault(context.key, [])
         paths.append(path)
-        stale_paths = paths[:-keep_versions]
-        self._adapter_paths_by_context[context.key] = paths[-keep_versions:]
-        for stale_path in stale_paths:
-            if stale_path in self._adapter_paths_by_context[context.key]:
+        recent_paths = set(paths[-keep_versions:])
+        protected_path_keys = self._live_adapter_path_keys(context)
+        retained_paths: list[Path] = []
+        for stale_path in paths:
+            if stale_path in recent_paths or self._adapter_path_key(stale_path) in protected_path_keys:
+                retained_paths.append(stale_path)
                 continue
             self._adapter_prune_executor.submit(self._prune_adapter_path, context.key, stale_path)
+        self._adapter_paths_by_context[context.key] = retained_paths
+
+    @staticmethod
+    def _adapter_path_key(path: str | Path) -> Path:
+        value = Path(path).expanduser()
+        if not value.is_absolute():
+            value = Path.cwd() / value
+        return value.resolve(strict=False)
+
+    def _live_adapter_path_keys(self, context) -> set[Path]:
+        keys: set[Path] = set()
+        try:
+            runtime_state = self.lora_runtime_registry.get(context)
+            if runtime_state.adapter_path:
+                keys.add(self._adapter_path_key(runtime_state.adapter_path))
+        except KeyError:
+            pass
+        for group in self.data_plane.list_all_prompt_groups(context):
+            if group.rollout_adapter_path:
+                keys.add(self._adapter_path_key(group.rollout_adapter_path))
+        return keys
 
     @staticmethod
     def _prune_adapter_path(context_key: str, path: Path) -> None:

@@ -442,7 +442,10 @@ class BaseRLPipeline(ABC):
             rollout_result = await rollout_result
 
         advantage_result = self.advantage_worker.process_available()
-        train_result = self.trainer_worker.train_one_partition(max_partitions=max_train_partitions)
+        train_result = self.trainer_worker.train_one_partition(
+            max_partitions=max_train_partitions,
+            context_blocked_fn=self._should_delay_train_context_for_rollout_prefill,
+        )
 
         step_result = PipelineStepResult(
             rollout=None if rollout_result is None else rollout_result.metadata,
@@ -552,6 +555,37 @@ class BaseRLPipeline(ABC):
 
     def should_stop(self, trained_steps: int) -> bool:
         return self.config.max_train_steps is not None and trained_steps >= self.config.max_train_steps
+
+    def _should_delay_train_context_for_rollout_prefill(self, context: LoraContext) -> bool:
+        max_staleness = int(getattr(self.config, 'max_staleness', 0) or 0)
+        if max_staleness <= 0:
+            return False
+        live_window = max_staleness + 1
+        live_partitions = [
+            partition for partition in self._runtime_live_partitions(context)
+            if partition.status not in {
+                PartitionStatus.TRAIN_DONE,
+                PartitionStatus.CLEARED,
+                PartitionStatus.FAILED,
+            }
+        ]
+        if len(live_partitions) >= live_window:
+            return False
+        return self._context_has_rollout_source(context)
+
+    def _context_has_rollout_source(self, context: LoraContext) -> bool:
+        rollouter = getattr(self, 'rollouter', None)
+        if rollouter is None:
+            return False
+        if rollouter.pending_prompt_group_count(context) > 0:
+            return True
+        for loader in getattr(rollouter, 'prompt_loaders', []):
+            loader_context = getattr(loader, 'context', None)
+            if getattr(loader_context, 'key', None) != context.key:
+                continue
+            if not getattr(loader, 'exhausted', False):
+                return True
+        return False
 
     def _backlog_metrics(self) -> dict[str, Any]:
         metrics: dict[str, Any] = {

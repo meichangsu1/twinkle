@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -812,14 +813,30 @@ class TrainerWorker:
             return None
         return self._train_candidate(candidate)
 
-    def train_until_blocked(self, *, max_partitions: int | None = None) -> TrainStageResult | None:
-        return self.train_one_partition(max_partitions=max_partitions)
+    def train_until_blocked(
+        self,
+        *,
+        max_partitions: int | None = None,
+        context_blocked_fn: Callable[[LoraContext], bool] | None = None,
+    ) -> TrainStageResult | None:
+        return self.train_one_partition(max_partitions=max_partitions, context_blocked_fn=context_blocked_fn)
 
-    def train_one_partition(self, *, max_partitions: int | None = None) -> TrainStageResult | None:
+    def train_one_partition(
+        self,
+        *,
+        max_partitions: int | None = None,
+        context_blocked_fn: Callable[[LoraContext], bool] | None = None,
+    ) -> TrainStageResult | None:
         if max_partitions is not None and max_partitions <= 0:
             return None
+        candidates = self.list_train_batch_candidates()
+        if context_blocked_fn is not None:
+            candidates = [
+                candidate for candidate in candidates
+                if not context_blocked_fn(candidate.context)
+            ]
         candidate = self.scheduler.next_batch(
-            self.list_train_batch_candidates(),
+            candidates,
             self.current_context,
         )
         if candidate is None:
@@ -1244,4 +1261,6 @@ class MultiLoraGRPOTrainerWorker(TrainerWorker):
             adapter_path = save_result
         if adapter_path is None and isinstance(save_result, dict):
             adapter_path = save_result.get('twinkle_path') or save_result.get('path')
+        if adapter_path is not None and os.path.exists(adapter_path):
+            adapter_path = os.path.abspath(adapter_path)
         return TrainerStepResult(adapter_path=adapter_path)
