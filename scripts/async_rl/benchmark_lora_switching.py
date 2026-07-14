@@ -364,6 +364,9 @@ def main() -> None:
     events_path.unlink(missing_ok=True)
 
     prompt_groups = build_prompt_groups(args)
+    # build_sampler() is shared with benchmark_sampler_batching.py and uses
+    # args.adapter_path only to decide whether to enable vLLM LoRA support.
+    args.adapter_path = adapters[0]['adapter_path']
     sampler = build_sampler(args)
     sampling_params = make_sampling_params(args)
     reset_prefix_cache = not args.no_reset_prefix_cache
