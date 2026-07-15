@@ -817,24 +817,17 @@ class TrainerWorker:
         self,
         *,
         max_partitions: int | None = None,
-        context_blocked_fn: Callable[[LoraContext], bool] | None = None,
     ) -> TrainStageResult | None:
-        return self.train_one_partition(max_partitions=max_partitions, context_blocked_fn=context_blocked_fn)
+        return self.train_one_partition(max_partitions=max_partitions)
 
     def train_one_partition(
         self,
         *,
         max_partitions: int | None = None,
-        context_blocked_fn: Callable[[LoraContext], bool] | None = None,
     ) -> TrainStageResult | None:
         if max_partitions is not None and max_partitions <= 0:
             return None
         candidates = self.list_train_batch_candidates()
-        if context_blocked_fn is not None:
-            candidates = [
-                candidate for candidate in candidates
-                if not context_blocked_fn(candidate.context)
-            ]
         candidate = self.scheduler.next_batch(
             candidates,
             self.current_context,

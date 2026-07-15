@@ -1197,7 +1197,7 @@ def test_trainer_stage_returns_after_one_partition_even_when_context_has_more_re
     )
 
 
-def test_trainer_context_block_filter_does_not_block_other_contexts():
+def test_trainer_selects_ready_context_without_rollout_prefill_gate():
     context_a = make_context('a')
     context_b = make_context('b', run='run_b')
     data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
@@ -1234,15 +1234,15 @@ def test_trainer_context_block_filter_does_not_block_other_contexts():
         train_batch_groups=1,
     )
 
-    result = trainer.train_one_partition(context_blocked_fn=lambda ctx: ctx.key == context_a.key)
+    result = trainer.train_one_partition()
 
     assert result.train_batches == 1
     assert result.trained_partitions == 1
-    assert trained_contexts == [context_b.key]
-    assert data_plane.list_partitions(context_b) == []
+    assert trained_contexts == [context_a.key]
+    assert data_plane.list_partitions(context_a) == []
     assert data_plane.list_prompt_groups(
-        context_a,
-        partition_id=partition_a.partition_id,
+        context_b,
+        partition_id=partition_b.partition_id,
         statuses=[PromptGroupStatus.ADVANTAGE_DONE],
     )
 
