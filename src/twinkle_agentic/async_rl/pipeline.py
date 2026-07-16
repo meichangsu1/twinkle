@@ -384,7 +384,11 @@ def create_cpu_actor(cls: type, *args: Any, **kwargs: Any) -> Any:
     """Deploy a CPU service as one raw Ray actor; local tests use the class directly."""
 
     import ray
-    return ray.remote(num_cpus=1)(cls).remote(*args, **kwargs)
+    actor_class = ray.remote(
+        num_cpus=1,
+        runtime_env={'env_vars': {'TWINKLE_MODE': 'ray'}},
+    )(cls)
+    return actor_class.remote(*args, **kwargs)
 
 
 def _scheduler(config: dict[str, Any]) -> SchedulerConfig:

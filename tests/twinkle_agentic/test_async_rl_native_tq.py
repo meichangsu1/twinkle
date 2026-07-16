@@ -12,7 +12,8 @@ from twinkle_agentic.async_rl import (AsyncMultiLoraGRPOPipeline, ContextSchedul
 from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
-from twinkle_agentic.async_rl.pipeline import _sampler_data_parallel_size, _validate_context_batch_config
+from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _sampler_data_parallel_size,
+                                                _validate_context_batch_config)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
 from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
 from twinkle_agentic.async_rl.workers import RolloutWorker
@@ -31,6 +32,38 @@ class LocalActorHandle:
                 return await result if inspect.isawaitable(result) else result
 
         return RemoteMethod()
+
+
+def test_cpu_service_actor_uses_twinkle_ray_mode(monkeypatch):
+    import ray
+
+    captured = {}
+
+    class ActorClass:
+
+        @staticmethod
+        def remote(*args, **kwargs):
+            captured['actor_args'] = args
+            captured['actor_kwargs'] = kwargs
+            return 'actor'
+
+    def fake_remote(**options):
+        captured['options'] = options
+        return lambda cls: ActorClass
+
+    monkeypatch.setattr(ray, 'remote', fake_remote)
+
+    assert create_cpu_actor(object, 'value', enabled=True) == 'actor'
+    assert captured['options'] == {
+        'num_cpus': 1,
+        'runtime_env': {
+            'env_vars': {
+                'TWINKLE_MODE': 'ray'
+            }
+        },
+    }
+    assert captured['actor_args'] == ('value', )
+    assert captured['actor_kwargs'] == {'enabled': True}
 
 
 class PolicyProvider:
