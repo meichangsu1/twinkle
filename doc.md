@@ -1,323 +1,157 @@
-# Multi-LoRA Async RL 新架构草图
+# Async Multi-LoRA RL
 
-## 核心原则
-
-新架构不再使用 runner tick 组件，也不允许组件之间互相调用形成同步链。
-
-所有组件都是独立常驻 loop：
+## 架构
 
 ```text
-RolloutProducer   只读 dataloader，只向 DataPlane 写 rollout jobs
-SamplerWorker     只从 DataPlane claim rollout jobs，生成后写 samples
-AdvantageWorker   只从 DataPlane claim rollout_done groups，写 advantages
-TrainerWorker     只从 DataPlane claim advantage_done groups，训练并更新 policy version
-Supervisor        只负责启动、停止、健康检查、drain 判断
+AsyncMultiLoraGRPOPipeline (driver)
+  |- LoraContextManager       CPU Ray actor: policy / partition admission
+  |- RolloutWorker            CPU Ray actor: prompt batch -> sampler submission
+  |- VLLMSamplerTQ            GPU Ray actor: rollout fields -> TQ
+  |- AdvantageWorker          CPU Ray actor: rewards -> advantages / returns
+  |- TrainerWorker            CPU Ray actor: TQ batch -> shared MultiLoRA model
+  `- MultiLoraTransformersModel GPU Ray actor
 ```
-
-组件之间的唯一交互面：
-
-```text
-AsyncRLDataPlane
-```
-
-也就是说：
-
-- RolloutProducer 不直接调用 Sampler。
-- Sampler 不直接通知 AdvantageWorker。
-- AdvantageWorker 不直接通知 TrainerWorker。
-- TrainerWorker 不直接唤醒 RolloutProducer。
-- trainer 训练耗时只阻塞 trainer 自己，不阻塞 rollout / sampler / advantage。
-
-## 架构图
 
 ```mermaid
 flowchart LR
-    subgraph Supervisor["AsyncRLSupervisor"]
-        Life["start / stop / health / metrics"]
-    end
-
-    subgraph Components["Independent Long-running Components"]
-        Producer["RolloutProducer<br/>dataloader -> rollout jobs"]
-        Sampler["SamplerWorker<br/>claim jobs -> samples"]
-        Adv["AdvantageWorker<br/>claim rollout_done -> advantages"]
-        Trainer["TrainerWorker<br/>claim advantage_done -> train"]
-    end
-
-    subgraph DP["AsyncRLDataPlane"]
-        Runtime["Runtime Metadata<br/>policy_version / adapter_path / train_steps"]
-        Admission["Admission Gate<br/>max_staleness / capacity"]
-        Jobs["Rollout Jobs<br/>group tags: PENDING/RUNNING/ROLLOUT_DONE"]
-        Samples["Sample Fields<br/>input_ids / labels / logprobs / rewards"]
-        TrainFields["Train Fields<br/>advantages / returns"]
-        Claims["Claim APIs<br/>atomic status transitions"]
-    end
-
-    subgraph Compute["Compute Resources"]
-        VLLM["vLLM Engine"]
-        Model["MultiLoraTransformersModel"]
-    end
-
-    Supervisor --> Life
-    Life -. lifecycle only .-> Producer
-    Life -. lifecycle only .-> Sampler
-    Life -. lifecycle only .-> Adv
-    Life -. lifecycle only .-> Trainer
-
-    Producer <--> DP
-    Sampler <--> DP
-    Adv <--> DP
-    Trainer <--> DP
-
-    Sampler --> VLLM
-    Trainer --> Model
-
-    DP --> Runtime
-    DP --> Admission
-    DP --> Jobs
-    DP --> Samples
-    DP --> TrainFields
-    DP --> Claims
+    Driver[Pipeline Driver] --> Manager[LoraContextManager]
+    Driver --> Rollout[RolloutWorker]
+    Driver --> Advantage[AdvantageWorker]
+    Driver --> Trainer[TrainerWorker]
+    Rollout -->|PartitionAdmission| Sampler[VLLMSamplerTQ]
+    Rollout -->|prompt fields / BatchMeta| TQ[TransferQueue]
+    Sampler -->|complete trajectory / rewards| TQ
+    Advantage -->|claim rollout-ready| TQ
+    Advantage -->|advantages / returns| TQ
+    Trainer -->|claim train-ready| TQ
+    Trainer --> Model[MultiLoraTransformersModel]
+    Trainer -->|save / publish / clear| Manager
+    Trainer -->|clear partition| TQ
 ```
 
-## DataPlane API 边界
+`TQDataPlane` 是唯一操作原生 TransferQueue `BatchMeta`、`task_name`、
+`async_get_meta`、`async_get_data`、`async_put` 的边界。worker 只使用
+`PartitionAdmission`、`PreparedPartition`、`ClaimedBatch`，不查看 TQ 元数据细节，
+也不调用 `kv_list`。
 
-`AsyncRLDataPlane` 是唯一状态源，也是唯一跨组件通信面。
+## 分区窗口
 
-建议收敛为这些粗粒度 API：
+partition 只表示一批训练数据，不绑定 `RolloutPolicy`。每个 generation 在真正
+开始生成或重试时从 `LoraContextManager` 获取当前 policy；同一个 prompt group 和
+partition 都可以包含多个 policy version。准入统一使用：
 
 ```python
-admit_rollout_batch(context) -> bool
-create_rollout_job_batch(context, prompt_groups) -> RolloutJobBatch
-claim_rollout_jobs(context=None, limit=None) -> RolloutJobBatch | None
-finish_rollout_group(group_ref, sample_keys, sample_fields, sample_tags) -> None
-fail_rollout_group(group_ref, error) -> None
-
-claim_rollout_done_groups(context=None, limit=None) -> GroupBatch | None
-write_advantages(batch, advantages, returns) -> None
-
-claim_advantage_done_groups(context=None, limit=None) -> TrainBatch | None
-mark_train_done(batch) -> None
-update_policy_version(context, adapter_path) -> None
-clear_consumed(batch) -> None
+oldest_unreleased_step = min(live_steps) if live_steps else next_partition_step
+can_open = next_partition_step - oldest_unreleased_step <= max_staleness
 ```
 
-要求：
+因此 `max_staleness=0` 自然只允许一个 live partition；更大的值允许 rollout
+相对最早的未释放 partition 最多领先对应 step 数。只有完成
+`save adapter -> publish policy -> clear TQ -> on_partition_cleared` 后，容量才释放。
 
-- 所有 claim 都必须是原子状态迁移。
-- 所有组件只拿 batch descriptor，不直接扫描全局 TQ 细节。
-- `kv_list` 只允许 DataPlane 内部做，并且按 context / live status 限定范围。
-
-## Max Staleness：提交前控制
-
-`max_staleness` 由 DataPlane admission gate 在 rollout job 创建前判断。
-
-对某个 context：
-
-```text
-next_rollout_step = runtime.next_rollout_step
-oldest_live_step =
-  min(step of PENDING/RUNNING/ROLLOUT_DONE/ADVANTAGING/ADVANTAGE_DONE/TRAINING groups)
-
-step_span = next_rollout_step - oldest_live_step
-```
-
-允许创建新的 rollout jobs：
-
-```text
-no outstanding groups
-or (
-  step_span <= max_staleness
-  and live_rollout_partitions <= max_staleness + 1
-)
-```
-
-语义：
-
-```text
-max_staleness = 0
-  有任何未训练 rollout 数据时，不再创建新的 rollout jobs。
-
-max_staleness = 2
-  允许 TQ 中同时存在一个训练中的旧 partition 和最多 2 个提前生成的 partition。
-  一旦未清理 partition 窗口超过 2，Producer 停止创建新 jobs。
-```
-
-超过窗口的数据不应在正常路径中产生。只有恢复或异常状态下发现历史 stale 数据时，DataPlane 才标记为 `DROPPED` 并清理。
-
-## 组件时序图
+## 时序
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant P as RolloutProducer
-    participant S as SamplerWorker
+    participant R as RolloutWorker
+    participant M as LoraContextManager
+    participant S as VLLMSamplerTQ
+    participant TQ as TransferQueue
     participant A as AdvantageWorker
     participant T as TrainerWorker
-    participant DP as AsyncRLDataPlane
-    participant V as vLLM
-    participant M as MultiLoraModel
+    participant Model as MultiLoraModel
 
-    par rollout producer loop
-        loop alive
-            P->>DP: admit_rollout_batch(context)
-            alt admitted
-                P->>P: read one dataloader batch
-                P->>DP: create_rollout_job_batch(prompt_groups)
-            else blocked
-                P->>P: backoff
-            end
-        end
-    and sampler loop
-        loop alive
-            S->>DP: claim_rollout_jobs(limit)
-            alt jobs available
-                S->>V: generate
-                S->>DP: finish_rollout_group(samples)
-            else no jobs
-                S->>S: backoff
-            end
-        end
-    and advantage loop
-        loop alive
-            A->>DP: claim_rollout_done_groups(limit)
-            alt groups available
-                A->>DP: read rewards
-                A->>DP: write_advantages(advantages, returns)
-            else no groups
-                A->>A: backoff
-            end
-        end
-    and trainer loop
-        loop alive
-            T->>DP: claim_advantage_done_groups(limit)
-            alt batch available
-                T->>DP: read train fields
-                T->>M: forward_backward
-                T->>DP: mark_train_done(batch)
-                opt sync boundary
-                    T->>M: save adapter
-                    T->>DP: update_policy_version(context, adapter_path)
-                    T->>DP: clear_consumed(batch)
-                end
-            else no batch
-                T->>T: backoff
-            end
-        end
-    end
+    R->>M: request_rollout_partition()
+    M-->>R: PartitionAdmission(data batch only)
+    R->>TQ: prepare prompt fields
+    R->>S: sample(PreparedPartition groups)
+    S->>M: get_rollout_policy(generation attempt)
+    M-->>S: current policy version/path
+    S-->>S: prompt group 内等待 num_generations 完成
+    S->>TQ: complete_rollout_group(full trajectory, rewards)
+    A->>TQ: claim_advantage_batch(task_name)
+    A->>TQ: async_put(advantages, returns)
+    T->>TQ: claim_training_batch(task_name)
+    T->>Model: forward/backward/step(adapter)
+    T->>Model: save adapter
+    T->>M: on_partition_trained()
+    T->>TQ: clear_partition()
+    T->>M: on_partition_cleared()
 ```
 
-## 状态流转
+Rollout、advantage、train 三个 actor 都是独立长期运行的服务。driver 只调用一次
+`start()`，随后只检查 worker health、drain metrics 和停止服务；它不直接调用任何
+rollout、advantage 或 train 阶段循环。worker 之间不通过 callback 或内存 ready queue
+通信。某个 context 暂无完整 group 时，阶段 scheduler 立即尝试另一个 context。
 
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING: Producer creates rollout jobs
-    PENDING --> RUNNING: Sampler claims jobs
-    RUNNING --> ROLLOUT_DONE: Sampler writes samples
-    RUNNING --> FAILED: Sampler failure
-    ROLLOUT_DONE --> ADVANTAGING: Advantage claims groups
-    ADVANTAGING --> ADVANTAGE_DONE: Advantage writes returns
-    ADVANTAGE_DONE --> TRAINING: Trainer claims batch
-    TRAINING --> TRAIN_DONE: Trainer step done
-    TRAIN_DONE --> CLEARED: DataPlane clears consumed data
-    FAILED --> DROPPED: cleanup
-    DROPPED --> CLEARED: clear stale/failed data
+`allow_partial_rollout=false` 时，被中断的 generation 丢弃部分输出，并在重试时使用
+当前 policy 从原 prompt 重新生成；其他已经完成的 generation 保留。
+`allow_partial_rollout=true` 时保留中断前生成的 token，再使用当前 policy 继续生成。
+sample tag 记录实际的 initial/final policy version 和 version span。两种模式都只在
+`num_generations` 全部完成后将整个 prompt group 标记为 rollout-ready。
+
+partition 只描述正常数据生命周期：`ROLLOUT -> TRAINING -> PUBLISHED -> clear`，
+没有 `FAILED` 状态。当前版本不提供阶段级恢复或部分 partition 接管；prompt 加载、
+rollout、advantage、train 任一服务异常都会由 driver 提升为 `run_failed` 并终止运行。
+失败时保留 TQ 中的现场数据，不伪装成已经完成清理的 partition。
+
+## Context 调度
+
+每个 worker 自己持有 `ContextScheduler`，三个阶段独立调度：
+
+```yaml
+scheduler:
+  rollout: {policy: round_robin, max_consecutive_units: 1}
+  advantage: {policy: oldest_partition, max_consecutive_units: 1}
+  train: {policy: sticky, max_consecutive_units: null}
 ```
 
-## 和 verl 的对应关系
+`round_robin` 保证 rollout 公平；`sticky` 在当前 context 仍有完整 batch 时持续
+训练，避免无谓 adapter 切换；`oldest_partition` 优先最早创建的 live partition。
 
-| verl v1 | 新设计 |
-| --- | --- |
-| `_add_batch_to_generate()` | `RolloutProducer` 写 rollout jobs |
-| `AgentLoopManager.generate_sequences()` | `SamplerWorker` claim jobs 并生成 |
-| `ReplayBuffer.sample()` | `DataPlane claim_*` + ready selector |
-| `global_steps` | per-context `policy_version` |
-| off-policy threshold | DataPlane admission gate 的 `max_staleness` |
-| `tq.kv_clear(consumed)` | `DataPlane.clear_consumed()` |
+每个 context 独立配置各阶段 batch：
 
-区别：
-
-- verl 可以在 replay buffer 阶段处理 off-policy；我们为了避免 rollout 算力浪费，在创建 rollout jobs 前控制 staleness。
-- verl 主要是 global actor step；这里是 per-context multi-LoRA policy version。
-
-## 和 Relax 的对应关系
-
-Relax 的 `core/controller.py` 是服务编排器，不是训练 step runner。它做三件事：
-
-```text
-1. 初始化 TransferQueue 容量：
-   rollout_batch_size * (max_staleness + 1) * n_samples_per_prompt
-
-2. 部署 actor / rollout / advantage / reference 等长期服务。
-
-3. 并行启动所有 service.run()，然后等待这些长生命周期任务结束。
+```yaml
+rollout:
+  batch_size: 8          # 一个 partition 的 prompt group 数
+  num_generations: 4
+advantage:
+  groups_per_batch: 2   # 一次 advantage 消费的完整 group 数
+train:
+  groups_per_batch: 2   # 一个 optimizer step 的完整 group 数
+  micro_batch_size: 1   # 每个 model DP rank 的 forward/backward 粒度
 ```
 
-真正的异步关系在各 service 内部：
-
-```text
-Rollout service:
-  while step < num_rollout:
-    generate train_{step}
-    查询 TQ partition list
-    如果 current_step + 1 - oldest_live_partition > max_staleness:
-      等 actor clear 旧 partition
-    step += 1
-
-Actor service:
-  while step < num_rollout:
-    等 train_{step} 出现在 TQ
-    train train_{step}
-    clear train_{step}
-    step += 1
-
-Advantage service:
-  while step < num_rollout:
-    从 train_{step} 读取 rollout fields
-    写 advantages / returns
-```
-
-这个设计值得吸收的点：
-
-- controller 只管理服务生命周期，不在外层高频 tick 组件。
-- rollout、actor、advantage 都是长生命周期 loop，互不阻塞对方的主计算。
-- staleness 的控制基于 TQ 中未清理 partition 的窗口，而不是训练时发现 stale 再丢。
-- actor 训练完成后 clear partition，这个动作是释放 rollout capacity 的关键。
-
-不能直接照搬的点：
-
-- Relax 是单 actor 的 `train_i` 全局 step；twinkle 是 per-context multi-LoRA，需要每个 context 独立维护 `next_rollout_step`、`live_partitions`、`policy_version`。
-- Relax 在一个 rollout partition 生成完成后才等待下一步；twinkle 应该在创建 rollout job 前 admission，避免已经提交给 sampler 的任务后来变成无效计算。
-- Relax 的 actor 按 step 顺序消费 `train_i`；twinkle trainer 应按 context 选择 ready 数据，避免某个 LoRA 数据慢导致其他 LoRA 空转。
+一个 optimizer step 的全局 trajectory 数为
+`train.groups_per_batch * rollout.num_generations`。启动时校验 partition 可以被
+advantage/train group batch 完整消费，rollout group 数可以被 sampler DP 均匀分片，
+训练 trajectory 数可以被 model DP 均匀分片。
 
 ## 指标
 
-必须记录：
+worker 只缓冲业务事件，driver 定期 `drain_metrics()` 后通过
+`JSONLMetricsRecorder` 写入单一 JSONL。事件包括 `rollout_submitted`、
+`rollout_done/failed`、`advantage_done`、`train_step_done`、`partition_done`、
+`policy_published` 与 `run_completed`。不记录 TQ 操作事件和 `pipeline_step`。
 
-```text
-producer/admission_allowed
-producer/admission_blocked_by_staleness
-producer/admission_blocked_by_capacity
-producer/outstanding_groups
-producer/oldest_outstanding_gap
-sampler/claimed_jobs
-sampler/finished_groups
-advantage/claimed_groups
-trainer/claimed_groups
-trainer/train_steps_per_hour
-staleness/policy_version_gap_mean
+`rollout_done` 记录 group latency、output tokens/second、completion length、retry、
+abort 和 partial resume 数量。`train_step_done` 记录 sample 相对当前训练 policy 的
+version gap，以及 partial rollout 的 policy version span。
+
+JSONL 可以用 `scripts/async_rl/jsonl_to_swanlab.py` 重放到本地 SwanLab。
+
+## 本地回归
+
+安装真实 async RL 运行依赖：
+
+```bash
+pip install -e '.[async-rl]'
 ```
 
-`policy_version_gap_mean` 是训练时的校验指标，不是控制入口。如果 admission 正确，它应该始终满足：
-
-```text
-policy_version_gap_max <= max_staleness
+```bash
+PYTHONPATH=src python scripts/async_rl/native_tq_e2e.py \
+  --config cookbook/rl/async_native_multi_lora_grpo.yaml
 ```
 
-## 边界
-
-- 首版保留 TQ KV API。
-- 首版只支持 single-turn GRPO。
-- 每个组件是独立进程/actor/loop，互不等待。
-- 组件之间禁止直接方法调用，只通过 `AsyncRLDataPlane` 通信。
-- trainer 计算会占用 trainer 资源，但不阻塞 producer、sampler、advantage。
-- tail batch 不足一个完整 `rollout.batch_size` 时丢弃。
+fake 回归覆盖两个 context、group 对齐消费、advantage/train 链路、partition clear，
+以及非恒定 reward/loss 指标。

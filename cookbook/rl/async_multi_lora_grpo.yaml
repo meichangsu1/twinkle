@@ -1,0 +1,81 @@
+runtime:
+  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3.5-4B}
+  mode: ray
+  model_gpus: 2
+  sampler_gpus: 1
+  sampler_tp: 1
+  sampler_max_loras: 4
+  max_staleness: 1
+  max_steps: null
+  allow_partial_rollout: false
+  rollout_max_retries: 2
+  rollout_retry_delay_s: 0.5
+  keep_adapter_versions: 2
+  output_dir: output/async_multi_lora_grpo
+  metrics_path: outputs/async_rl/metrics.jsonl
+
+template:
+  cls: Qwen3_5Template
+  enable_thinking: false
+
+tq:
+  polling_mode: true
+  storage_units: 2
+
+scheduler:
+  rollout: {policy: round_robin, max_consecutive_units: 1}
+  advantage: {policy: oldest_partition, max_consecutive_units: 1}
+  train: {policy: sticky, max_consecutive_units: null}
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  learning_rate: 5.0e-5
+
+lora_contexts:
+  - tenant_id: tenant_a
+    training_run_id: gsm8k_async
+    adapter_name: tenant_a_gsm8k_lora
+    reward_type: gsm8k_accuracy
+    dataset:
+      dataset_id: ${oc.env:DATASET_ID,ms://modelscope/gsm8k}
+      subset_name: main
+      split: train
+      data_num: 128
+      max_length: 8192
+      processor: GSM8KProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 4
+      max_tokens: 4096
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      groups_per_batch: 1
+      micro_batch_size: 1
+
+  - tenant_id: tenant_b
+    training_run_id: gsm8k_async
+    adapter_name: tenant_b_gsm8k_lora
+    reward_type: gsm8k_accuracy
+    dataset:
+      dataset_id: ${oc.env:DATASET_ID,ms://modelscope/gsm8k}
+      subset_name: main
+      split: train
+      data_num: 128
+      max_length: 8192
+      processor: GSM8KProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 4
+      max_tokens: 4096
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      groups_per_batch: 1
+      micro_batch_size: 1

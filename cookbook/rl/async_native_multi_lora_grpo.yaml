@@ -1,0 +1,45 @@
+# Native-TQ async RL smoke configuration.
+# This file is also the shape used by the real Ray launcher.  The local
+# smoke runner uses the prompt_count fields and does not load a model.
+
+runtime:
+  mode: fake
+  model_id: mock-model
+  max_staleness: 1
+  max_steps: null
+  output_dir: outputs/async_rl_native_tq_smoke
+
+tq:
+  controller_polling_mode: true
+  sampler: GRPOGroupNSampler
+
+contexts:
+  - tenant_id: tenant_a
+    training_run_id: native_tq_smoke_a
+    adapter_name: tenant_a_lora
+    reward_type: constant
+    rollout:
+      batch_size: 2
+      num_generations: 2
+    advantage:
+      groups_per_batch: 1
+    train:
+      groups_per_batch: 1
+      micro_batch_size: 1
+    dataset:
+      prompt_count: 4
+
+  - tenant_id: tenant_b
+    training_run_id: native_tq_smoke_b
+    adapter_name: tenant_b_lora
+    reward_type: constant
+    rollout:
+      batch_size: 2
+      num_generations: 2
+    advantage:
+      groups_per_batch: 1
+    train:
+      groups_per_batch: 1
+      micro_batch_size: 1
+    dataset:
+      prompt_count: 4
