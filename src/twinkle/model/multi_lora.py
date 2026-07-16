@@ -202,9 +202,14 @@ class MultiLora:
         # self.deactivate_adapter()
 
     def check_length(self, inputs: InputFeature):
-        total_length = sum(len(_input['input_ids']) for _input in inputs)
-        if total_length > self.max_length:
-            raise ValueError(f'Max length exceeds {self.max_length}')
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        for index, item in enumerate(inputs):
+            if 'input_ids' not in item:
+                continue
+            length = len(item['input_ids'])
+            if length > self.max_length:
+                raise ValueError(f'Input length {length} exceeds max_length {self.max_length} at sample {index}')
 
     def acquire_lora(self, tenant_adapter_name: str, config: LoraConfig) -> str:
         if self.has_lora(tenant_adapter_name):

@@ -267,7 +267,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         adapter_state = self.multi_adapter.get_state_dict(adapter_name)
         return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
 
-    @remote_function(collect='first')
+    @remote_function(collect='first', lazy_collect=False)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):
