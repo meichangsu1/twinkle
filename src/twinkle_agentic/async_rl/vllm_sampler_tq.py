@@ -129,7 +129,6 @@ class VLLMSamplerTQ(vLLMSampler):
             raise ValueError(f'rollout_retry_delay_s must be non-negative, got {self.rollout_retry_delay_s}')
         self._background_submissions: dict[str, Future] = {}
         self._metrics_events: SimpleQueue[MetricEvent] = SimpleQueue()
-        self._lora_requests: dict[str, Any] = {}
         self._failure: str | None = None
 
     async def _emit(self, event: str, context: LoraContext, partition_id: str, metrics: dict[str, Any]) -> None:
@@ -301,13 +300,9 @@ class VLLMSamplerTQ(vLLMSampler):
         if policy.adapter_path is None:
             return None
         local_path = os.path.abspath(await asyncio.to_thread(resolve_adapter_path, policy.adapter_path))
-        if local_path in self._lora_requests:
-            return self._lora_requests[local_path]
-        logger.info('Loading LoRA from %s', policy.adapter_path)
         lora_request = await self.engine._get_or_load_lora(local_path)
         if lora_request is None:
             raise RuntimeError(f'failed to load LoRA adapter from {local_path}')
-        self._lora_requests[local_path] = lora_request
         return lora_request
 
     async def _generate_group_samples(
@@ -416,7 +411,10 @@ class VLLMSamplerTQ(vLLMSampler):
             if attempt < self.rollout_max_retries:
                 await asyncio.sleep(self.rollout_retry_delay_s)
 
-        raise RuntimeError(f'generation failed after {self.rollout_max_retries + 1} attempts') from last_error
+        error_detail = f'{type(last_error).__name__}: {last_error}'
+        error = RuntimeError(
+            f'generation failed after {self.rollout_max_retries + 1} attempts; last error: {error_detail}')
+        raise error from last_error
 
     def _merge_partial_responses(
         self,
