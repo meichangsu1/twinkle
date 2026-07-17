@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from concurrent.futures import Future
 from copy import copy
@@ -90,6 +91,13 @@ class _GeneratedSample:
         return self.attempts - 1
 
 
+@dataclass(frozen=True)
+class _PromptGroupRolloutStats:
+    completion_lengths: tuple[int, ...]
+    stop_reasons: tuple[str | None, ...]
+    policy_versions: tuple[int, ...]
+
+
 def resolve_adapter_path(adapter_path: str) -> str:
     path = os.path.abspath(os.path.expanduser(str(adapter_path)))
     if not os.path.exists(path):
@@ -160,12 +168,14 @@ class VLLMSamplerTQ(vLLMSampler):
     ) -> dict[str, Any]:
         """Schedule this DP worker's complete prompt groups and return immediately."""
         submission_id = str(uuid.uuid4())
+        submitted_at = time.perf_counter()
         future = self._submit_in_loop(
             self._sample_prompt_groups(
                 submission_id,
                 groups,
                 sampling_params,
                 bool(allow_partial_rollout),
+                submitted_at,
             ))
         self._background_submissions[submission_id] = future
         future.add_done_callback(self._on_submission_done(submission_id))
@@ -196,6 +206,7 @@ class VLLMSamplerTQ(vLLMSampler):
         groups: list[PromptGroup],
         sampling_params: SamplingParams,
         allow_partial_rollout: bool,
+        submitted_at: float,
     ) -> None:
         results = await asyncio.gather(
             *(self._run_prompt_group(
@@ -220,6 +231,35 @@ class VLLMSamplerTQ(vLLMSampler):
             )
             raise RuntimeError(f'rollout failed for {group.group_id}: {error}') from error
 
+        rollout_stats = [result for result in results if isinstance(result, _PromptGroupRolloutStats)]
+        metric_rows = [
+            {
+                'completion_length': completion_length,
+                'stop_reason': stop_reason,
+            }
+            for stats in rollout_stats
+            for completion_length, stop_reason in zip(stats.completion_lengths, stats.stop_reasons)
+        ]
+        policy_versions = [version for stats in rollout_stats for version in stats.policy_versions]
+        first_group = groups[0]
+        dp_size = self.device_mesh.dp_world_size or 1
+        await self._emit(
+            'rollout_partition_done' if dp_size == 1 else 'rollout_shard_done',
+            first_group.context,
+            first_group.partition_id,
+            {
+                'prompt_group_count': len(groups),
+                **rollout_performance_metrics(
+                    metric_rows,
+                    rollout_latency_s=time.perf_counter() - submitted_at,
+                ),
+                'policy_version': max(policy_versions),
+                'policy_version_min': min(policy_versions),
+                'policy_version_max': max(policy_versions),
+                'sampler_dp_size': dp_size,
+            },
+        )
+
     async def _run_prompt_group(
         self,
         *,
@@ -227,7 +267,7 @@ class VLLMSamplerTQ(vLLMSampler):
         group: PromptGroup,
         sampling_params: SamplingParams,
         allow_partial_rollout: bool,
-    ) -> None:
+    ) -> _PromptGroupRolloutStats:
         """Sample all generations for one group, then write that group once."""
         started = asyncio.get_running_loop().time()
         num_generations = group.num_samples
@@ -292,6 +332,11 @@ class VLLMSamplerTQ(vLLMSampler):
                 'policy_version_max':
                 max(policy_versions),
             },
+        )
+        return _PromptGroupRolloutStats(
+            completion_lengths=tuple(int(row['completion_length']) for row in rows),
+            stop_reasons=tuple(row.get('stop_reason') for row in rows),
+            policy_versions=tuple(policy_versions),
         )
 
     async def _load_lora_for_policy(self, policy: RolloutPolicy) -> Any:

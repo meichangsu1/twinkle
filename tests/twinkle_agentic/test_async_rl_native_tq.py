@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 
 import pytest
 
@@ -18,7 +19,7 @@ from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _sampler_data_p
                                                 _sequence_parallel_size,
                                                 _validate_context_batch_config)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
-from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
+from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ, _PromptGroupRolloutStats
 from twinkle_agentic.async_rl.workers import RolloutWorker
 
 
@@ -204,6 +205,55 @@ def test_sampler_dp_dispatch_slices_complete_groups_without_duplication():
     assert [args[1] for _, args, _ in dispatched] == [groups[:2], groups[2:]]
     assert all(args[0] is admission for _, args, _ in dispatched)
     assert [group for _, args, _ in dispatched for group in args[1]] == groups
+
+
+@pytest.mark.parametrize(('dp_size', 'expected_event'), [(1, 'rollout_partition_done'), (2, 'rollout_shard_done')])
+def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_size, expected_event):
+    context = _context()
+    admission = PartitionAdmission(context, context.partition_id(0), 0, 2, 2, 0)
+    groups = [
+        PromptGroup(context, admission, f'{admission.partition_id}/group_{index}', {}, object())
+        for index in range(2)
+    ]
+
+    class RolloutMetricsHarness:
+        def __init__(self):
+            self.device_mesh = DeviceMesh.from_sizes(world_size=dp_size, dp_size=dp_size)
+            self.events = []
+
+        async def _run_prompt_group(self, *, group, **_kwargs):
+            index = int(group.group_id.rsplit('_', 1)[1])
+            lengths = ((10, 20), (30, 40))[index]
+            reasons = (('stop', 'length'), ('stop', 'stop'))[index]
+            return _PromptGroupRolloutStats(lengths, reasons, (index + 1, index + 1))
+
+        async def _emit(self, event, event_context, partition_id, metrics):
+            self.events.append((event, event_context, partition_id, metrics))
+
+    sampler = RolloutMetricsHarness()
+    asyncio.run(
+        VLLMSamplerTQ._sample_prompt_groups(
+            sampler,
+            'submission',
+            groups,
+            SamplingParams(max_tokens=64),
+            False,
+            time.perf_counter() - 1,
+        ))
+
+    event, event_context, partition_id, metrics = sampler.events[-1]
+    assert event == expected_event
+    assert event_context == context
+    assert partition_id == admission.partition_id
+    assert metrics['prompt_group_count'] == 2
+    assert metrics['sample_count'] == 4
+    assert metrics['output_tokens'] == 100
+    assert metrics['completion_length_mean'] == 25
+    assert metrics['completion_truncated_samples'] == 1
+    assert metrics['policy_version_min'] == 1
+    assert metrics['policy_version_max'] == 2
+    assert metrics['sampler_dp_size'] == dp_size
+    assert metrics['output_tokens_per_s'] == pytest.approx(100 / metrics['rollout_latency_s'])
 
 
 def test_aborted_generation_restarts_from_original_prompt_when_partial_is_disabled():
