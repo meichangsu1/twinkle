@@ -14,6 +14,7 @@ from twinkle import DeviceMesh, get_logger, remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
+from .metrics import rollout_performance_metrics
 from .types import LoraContext, MetricEvent, PromptGroup, RolloutOutput, RolloutPolicy
 
 logger = get_logger()
@@ -268,30 +269,28 @@ class VLLMSamplerTQ(vLLMSampler):
             tag_metrics=reward_metrics,
         )
 
-        completion_lengths = [int(row.get('completion_length', 0)) for row in rows]
-        output_tokens = sum(completion_lengths)
         rollout_latency_s = asyncio.get_running_loop().time() - started
         policy_versions = [policy.version for sample in generated_samples for policy in sample.policies]
-        ordered_completion_lengths = sorted(completion_lengths)
-        completion_p95_index = max(0, (95 * len(ordered_completion_lengths) + 99) // 100 - 1)
         await self._emit(
             'rollout_done',
             group.context,
             group.partition_id,
             {
-                'group_id': group.group_id,
-                'sample_count': len(rows),
-                'completion_length_mean': sum(completion_lengths) / len(completion_lengths),
-                'completion_length_p95': ordered_completion_lengths[completion_p95_index],
-                'rollout_latency_s': rollout_latency_s,
-                'output_tokens': output_tokens,
-                'output_tokens_per_s': output_tokens / rollout_latency_s,
-                'retry_count': sum(sample.retry_count for sample in generated_samples),
-                'aborted_sample_count': sum(sample.was_aborted for sample in generated_samples),
-                'partial_resumed_sample_count': sum(sample.resumed_partial_output for sample in generated_samples),
-                'policy_version': max(policy_versions),
-                'policy_version_min': min(policy_versions),
-                'policy_version_max': max(policy_versions),
+                'group_id':
+                group.group_id,
+                **rollout_performance_metrics(rows, rollout_latency_s=rollout_latency_s),
+                'retry_count':
+                sum(sample.retry_count for sample in generated_samples),
+                'aborted_sample_count':
+                sum(sample.was_aborted for sample in generated_samples),
+                'partial_resumed_sample_count':
+                sum(sample.resumed_partial_output for sample in generated_samples),
+                'policy_version':
+                max(policy_versions),
+                'policy_version_min':
+                min(policy_versions),
+                'policy_version_max':
+                max(policy_versions),
             },
         )
 

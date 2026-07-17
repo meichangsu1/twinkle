@@ -15,6 +15,10 @@ template:
   cls: Qwen3_5Template
   enable_thinking: false
 
+model:
+  sequence_parallel_size: 1
+  padding_free: false
+
 lora:
   r: 16
   alpha: 32
@@ -27,16 +31,19 @@ lora_contexts:
     adapter_name: tenant_a_gsm8k_lora
     reward_type: gsm8k_accuracy
     dataset:
-      dataset_id: ${oc.env:DATASET_ID,ms://modelscope/gsm8k}
+      dataset_id: ${oc.env:TENANT_A_DATASET_ID}
       subset_name: main
       split: train
       data_num: 128
       max_length: 8192
       processor: GSM8KProcessor
+      system_prompt: >-
+        You are a helpful math assistant. Solve the problem with minimal but
+        correct reasoning and put your final answer within \boxed{}.
     rollout:
       batch_size: 16
       num_generations: 4
-      max_tokens: 4096
+      max_tokens: 2048
       temperature: 1.0
       top_p: 0.95
     advantage:
@@ -50,16 +57,19 @@ lora_contexts:
     adapter_name: tenant_b_gsm8k_lora
     reward_type: gsm8k_accuracy
     dataset:
-      dataset_id: ${oc.env:DATASET_ID,ms://modelscope/gsm8k}
+      dataset_id: ${oc.env:TENANT_B_DATASET_ID}
       subset_name: main
       split: train
       data_num: 128
       max_length: 8192
       processor: GSM8KProcessor
+      system_prompt: >-
+        You are a helpful math assistant. Solve the problem with minimal but
+        correct reasoning and put your final answer within \boxed{}.
     rollout:
       batch_size: 16
       num_generations: 4
-      max_tokens: 4096
+      max_tokens: 2048
       temperature: 1.0
       top_p: 0.95
     advantage:

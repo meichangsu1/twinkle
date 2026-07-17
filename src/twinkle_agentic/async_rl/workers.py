@@ -163,6 +163,7 @@ class RolloutWorker(_Worker):
                 await asyncio.sleep(self.idle_delay_s)
                 continue
             self._next_batch_tasks.pop(key)
+            submission_started = time.perf_counter()
             try:
                 prepared = await self.data_plane.prepare_rollout_partition(
                     admission,
@@ -185,10 +186,13 @@ class RolloutWorker(_Worker):
                 raise RuntimeError(f'rollout submission failed for {admission.partition_id}: {exc}') from exc
             self._start_next_batch(key)
             self.scheduler.on_success(candidate)
-            self._record('rollout_submitted', admission.context, admission.partition_id, {
-                'prompt_count': admission.target_groups,
-                'sample_count': admission.sample_count
-            })
+            self._record(
+                'rollout_submitted', admission.context, admission.partition_id, {
+                    'prompt_count': admission.target_groups,
+                    'sample_count': admission.sample_count,
+                    'num_generations': admission.num_generations,
+                    'rollout_submission_latency_s': time.perf_counter() - submission_started,
+                })
 
 
 class AdvantageWorker(_Worker):
@@ -289,6 +293,7 @@ class TrainerWorker(_Worker):
             if path:
                 self._adapter_history[context_key].append(path)
         self.remove_adapter = remove_adapter or _remove_local_adapter
+        self._adapter_removal_tasks: set[asyncio.Task[None]] = set()
 
     def drain_metrics(self) -> list[MetricEvent]:
         return self.metrics.drain()
@@ -300,6 +305,12 @@ class TrainerWorker(_Worker):
                 metrics: dict[str, Any],
                 policy_version: int | None = None) -> None:
         self.metrics.record(event, context, partition_id, metrics, policy_version)
+
+    async def stop(self) -> None:
+        await super().stop()
+        pending = tuple(self._adapter_removal_tasks)
+        if pending:
+            await asyncio.gather(*pending)
 
     async def _serve(self) -> None:
         while not self._stop_requested and not await self.context_manager.is_run_finished.remote():
@@ -351,25 +362,87 @@ class TrainerWorker(_Worker):
                 await asyncio.sleep(self.idle_delay_s)
 
     async def _finish_partition(self, admission: PartitionAdmission) -> None:
+        finalize_started = time.perf_counter()
+        save_started = time.perf_counter()
         adapter_path = self.save_adapter(admission)
+        adapter_save_latency_s = time.perf_counter() - save_started
+        publish_started = time.perf_counter()
         policy = await self.context_manager.on_partition_trained.remote(admission, adapter_path=adapter_path)
-        self._record('policy_published', admission.context, admission.partition_id, {'adapter_path': adapter_path},
-                     policy.version)
+        policy_publish_latency_s = time.perf_counter() - publish_started
+        self._record(
+            'policy_published',
+            admission.context,
+            admission.partition_id,
+            {
+                'adapter_path': adapter_path,
+                'adapter_save_latency_s': adapter_save_latency_s,
+                'policy_publish_latency_s': policy_publish_latency_s,
+            },
+            policy.version,
+        )
+        clear_started = time.perf_counter()
         await self.data_plane.clear_partition(admission)
+        tq_clear_latency_s = time.perf_counter() - clear_started
+        release_started = time.perf_counter()
         await self.context_manager.on_partition_cleared.remote(admission)
+        partition_release_latency_s = time.perf_counter() - release_started
         self._adapter_history[admission.context.key].append(adapter_path)
-        await self._prune_adapter_history(admission.context.key)
-        self._record('partition_done', admission.context, admission.partition_id, {}, policy.version)
+        prune_started = time.perf_counter()
+        await self._prune_adapter_history(admission.context)
+        adapter_prune_schedule_latency_s = time.perf_counter() - prune_started
+        self._record(
+            'partition_done',
+            admission.context,
+            admission.partition_id,
+            {
+                'adapter_save_latency_s': adapter_save_latency_s,
+                'policy_publish_latency_s': policy_publish_latency_s,
+                'tq_clear_latency_s': tq_clear_latency_s,
+                'partition_release_latency_s': partition_release_latency_s,
+                'adapter_prune_schedule_latency_s': adapter_prune_schedule_latency_s,
+                'partition_finalize_latency_s': time.perf_counter() - finalize_started,
+            },
+            policy.version,
+        )
 
-    async def _prune_adapter_history(self, context_key: str) -> None:
+    async def _prune_adapter_history(self, context: LoraContext) -> None:
         protected = set(await self.context_manager.adapter_paths_to_keep.remote())
+        context_key = context.key
         history = self._adapter_history[context_key]
         retained_history = set(history[-self.keep_adapter_versions:]) if self.keep_adapter_versions else set()
         retained = protected | retained_history
         stale = [path for path in history if path not in retained]
-        for path in stale:
-            self.remove_adapter(path)
         self._adapter_history[context_key] = [path for path in history if path in retained]
+        for path in stale:
+            task = asyncio.create_task(self._remove_adapter(context, path))
+            self._adapter_removal_tasks.add(task)
+            task.add_done_callback(self._adapter_removal_tasks.discard)
+
+    async def _remove_adapter(self, context: LoraContext, path: str) -> None:
+        started = time.perf_counter()
+        try:
+            await asyncio.to_thread(self.remove_adapter, path)
+        except OSError as exc:
+            self._record(
+                'adapter_prune_failed',
+                context,
+                None,
+                {
+                    'adapter_path': path,
+                    'adapter_prune_latency_s': time.perf_counter() - started,
+                    'error': str(exc),
+                },
+            )
+            return
+        self._record(
+            'adapter_pruned',
+            context,
+            None,
+            {
+                'adapter_path': path,
+                'adapter_prune_latency_s': time.perf_counter() - started,
+            },
+        )
 
 
 def _remove_local_adapter(path: str) -> None:

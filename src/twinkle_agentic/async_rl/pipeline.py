@@ -32,6 +32,15 @@ def _sampler_data_parallel_size(sampler_gpus: int, sampler_tp: int) -> int:
     return sampler_gpus // sampler_tp
 
 
+def _sequence_parallel_size(model_gpus: int, configured_size: int) -> int:
+    if configured_size <= 0:
+        raise ValueError(f'model.sequence_parallel_size must be positive, got {configured_size}')
+    if model_gpus % configured_size:
+        raise ValueError(f'runtime.model_gpus ({model_gpus}) must be divisible by '
+                         f'model.sequence_parallel_size ({configured_size})')
+    return configured_size
+
+
 def _validate_context_batch_config(
     context_key: str,
     *,
@@ -115,6 +124,7 @@ class AsyncMultiLoraGRPOPipeline:
         from .group_sampler import ContextGRPOGroupNSampler
 
         runtime = raw_config['runtime']
+        model_config = raw_config['model']
         lora_config_data = raw_config['lora']
         template_config = raw_config.get('template', {})
         template_cls = template_config.get('cls', 'Qwen3_5Template')
@@ -123,6 +133,11 @@ class AsyncMultiLoraGRPOPipeline:
         sampler_tp = int(runtime['sampler_tp'])
         sampler_dp = _sampler_data_parallel_size(sampler_gpus, sampler_tp)
         model_dp = int(runtime['model_gpus'])
+        sequence_parallel_size = _sequence_parallel_size(
+            model_dp,
+            int(model_config['sequence_parallel_size']),
+        )
+        padding_free = bool(model_config['padding_free'])
         total_gpus = model_dp + sampler_gpus
         device_groups = [
             DeviceGroup('model', list(range(int(runtime['model_gpus']))), device_type='GPU'),
@@ -149,7 +164,12 @@ class AsyncMultiLoraGRPOPipeline:
                 },
                 flags={'allow_objects': True}))
 
-        model_mesh = DeviceMesh.from_sizes(world_size=model_dp, dp_size=model_dp)
+        model_mesh = DeviceMesh.from_sizes(
+            world_size=model_dp,
+            dp_size=model_dp,
+            ulysses_size=sequence_parallel_size,
+        )
+        model_data_parallel_size = model_mesh.data_world_size
         sampler_mesh = DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_dp, tp_size=sampler_tp)
         model = MultiLoraTransformersModel(model_id=runtime['model_id'], device_mesh=model_mesh, remote_group='model')
         lora_config = LoraConfig(
@@ -178,7 +198,11 @@ class AsyncMultiLoraGRPOPipeline:
             model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
             model.set_optimizer('AdamW', lr=lora_config_data['learning_rate'], adapter_name=context.adapter_name)
             model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
-            model.set_processor(InputProcessor, adapter_name=context.adapter_name)
+            model.set_processor(
+                InputProcessor,
+                adapter_name=context.adapter_name,
+                padding_free=padding_free,
+            )
             model.set_template(
                 template_cls,
                 model_id=runtime['model_id'],
@@ -202,7 +226,7 @@ class AsyncMultiLoraGRPOPipeline:
                 train_groups=train_groups,
                 micro_batch_size=micro_batch_size,
                 sampler_dp=sampler_dp,
-                model_dp=model_dp,
+                model_dp=model_data_parallel_size,
             )
             prompt_sources[context.key] = partial(
                 _prompt_batches,
@@ -224,6 +248,7 @@ class AsyncMultiLoraGRPOPipeline:
                     max_tokens=rollout['max_tokens'],
                     temperature=rollout['temperature'],
                     top_p=rollout['top_p'],
+                    repetition_penalty=float(rollout.get('repetition_penalty', 1.0)),
                     logprobs=1,
                     num_samples=1,
                 ),
@@ -332,13 +357,17 @@ class AsyncMultiLoraGRPOPipeline:
                 await asyncio.sleep(self.config.metrics_drain_interval_s)
         except Exception as exc:
             if self.metrics is not None:
+                self.metrics.flush()
+                failure_metrics = {
+                    'error': f'{type(exc).__name__}: {exc}',
+                    'wall_time_s': time.perf_counter() - started,
+                    **self.metrics.stats(),
+                }
                 self.metrics.record(
                     event='run_failed',
-                    metrics={
-                        'error': f'{type(exc).__name__}: {exc}',
-                        'wall_time_s': time.perf_counter() - started,
-                    },
+                    metrics=failure_metrics,
                 )
+                self.metrics.flush()
             raise
         finally:
             await asyncio.gather(*(worker.stop.remote() for worker in workers), return_exceptions=True)
@@ -348,11 +377,18 @@ class AsyncMultiLoraGRPOPipeline:
             'wall_time_s': time.perf_counter() - started,
         }
         if self.metrics is not None:
+            self.metrics.flush()
+            result.update(self.metrics.stats())
             self.metrics.record(event='run_completed', metrics=result)
+            self.metrics.flush()
         return result
 
     def run(self) -> dict[str, Any]:
-        return asyncio.run(self.run_async())
+        try:
+            return asyncio.run(self.run_async())
+        finally:
+            if self.metrics is not None:
+                self.metrics.close()
 
     async def _drain_metrics(self) -> None:
         if self.metrics is None:
@@ -386,8 +422,11 @@ def create_cpu_actor(cls: type, *args: Any, **kwargs: Any) -> Any:
     import ray
     actor_class = ray.remote(
         num_cpus=1,
-        runtime_env={'env_vars': {'TWINKLE_MODE': 'ray'}},
-    )(cls)
+        runtime_env={'env_vars': {
+            'TWINKLE_MODE': 'ray'
+        }},
+    )(
+        cls)
     return actor_class.remote(*args, **kwargs)
 
 
@@ -423,8 +462,13 @@ def _prompt_batches(
             max_length=dataset_config['max_length'],
             enable_thinking=enable_thinking,
         )
-        processor_cls = getattr(llm_processors, dataset_config.get('processor', 'GSM8KProcessor'))
-        dataset.map(processor_cls())
+        processor_name = dataset_config.get('processor', 'GSM8KProcessor')
+        processor_cls = getattr(llm_processors, processor_name)
+        if processor_name == 'GSM8KProcessor':
+            processor = processor_cls(system=dataset_config['system_prompt'])
+        else:
+            processor = processor_cls()
+        dataset.map(processor)
         dataset.encode(add_generation_prompt=True)
         loader = DataLoader(dataset=dataset, batch_size=batch_size, min_batch_size=batch_size)
         remaining = data_num

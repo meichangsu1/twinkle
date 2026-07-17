@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 
+import pytest
+
 from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import _dispatch_args
@@ -13,6 +15,7 @@ from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
 from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _sampler_data_parallel_size,
+                                                _sequence_parallel_size,
                                                 _validate_context_batch_config)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
 from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
@@ -64,6 +67,14 @@ def test_cpu_service_actor_uses_twinkle_ray_mode(monkeypatch):
     }
     assert captured['actor_args'] == ('value', )
     assert captured['actor_kwargs'] == {'enabled': True}
+
+
+def test_sequence_parallel_size_must_divide_model_gpus():
+    assert _sequence_parallel_size(2, 1) == 1
+    assert _sequence_parallel_size(2, 2) == 2
+
+    with pytest.raises(ValueError, match='must be divisible'):
+        _sequence_parallel_size(2, 3)
 
 
 class PolicyProvider:
@@ -703,6 +714,15 @@ def test_checkpoint_retention_preserves_current_policy_and_history_window():
     manager.on_partition_trained(admission, adapter_path='current')
     manager.on_partition_cleared(admission)
     worker._adapter_history[context.key].append('current')
-    asyncio.run(worker._prune_adapter_history(context.key))
+    async def prune():
+        await worker._prune_adapter_history(context)
+        await worker.stop()
+
+    asyncio.run(prune())
     assert removed == ['initial']
     assert worker._adapter_history[context.key] == ['current']
+    prune_events = [event for event in worker.drain_metrics() if event.event == 'adapter_pruned']
+    assert len(prune_events) == 1
+    assert prune_events[0].context == context
+    assert prune_events[0].metrics['adapter_path'] == 'initial'
+    assert prune_events[0].metrics['adapter_prune_latency_s'] >= 0
