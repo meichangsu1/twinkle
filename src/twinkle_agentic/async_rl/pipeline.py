@@ -484,9 +484,11 @@ def _prompt_batches(
 
 
 def _reward_for_context(context: LoraContext) -> Any:
-    from twinkle.reward import BoxedMathAccuracyReward, GSM8KAccuracyReward
+    from twinkle.reward import BoxedMathAccuracyReward, GSM8KAccuracyBrevityReward, GSM8KAccuracyReward
     if context.reward_type in {'gsm8k', 'gsm8k_accuracy'}:
         return GSM8KAccuracyReward()
+    if context.reward_type == 'gsm8k_accuracy_brevity':
+        return GSM8KAccuracyBrevityReward()
     if context.reward_type in {'dapo_math_accuracy', 'aime2024_accuracy'}:
         return BoxedMathAccuracyReward()
     raise ValueError(f'unsupported async-RL reward_type {context.reward_type!r} for {context.key}')

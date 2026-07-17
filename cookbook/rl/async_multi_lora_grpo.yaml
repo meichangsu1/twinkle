@@ -41,7 +41,7 @@ lora_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_async
     adapter_name: tenant_a_gsm8k_lora
-    reward_type: gsm8k_accuracy
+    reward_type: gsm8k_accuracy_brevity
     dataset:
       dataset_id: ${oc.env:TENANT_A_DATASET_ID}
       subset_name: main

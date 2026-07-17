@@ -80,6 +80,65 @@ class GSM8KAccuracyReward(Reward):
         return rewards
 
 
+class GSM8KBrevityReward(Reward):
+    """Reward concise completions that contain a parseable final answer."""
+
+    def __init__(self, full_reward_length: int = 300, decay_length: int = 3000):
+        self.full_reward_length = full_reward_length
+        self.decay_length = decay_length
+
+    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+        rewards = []
+        for trajectory in trajectories:
+            completion = ''
+            for message in reversed(trajectory.get('messages', [])):
+                if message.get('role') == 'assistant':
+                    completion = message.get('content', '')
+                    break
+            has_answer = _has_boxed(completion) or bool(re.search(r'####\s*[\-\d,\.]+', completion))
+            if not has_answer:
+                rewards.append(0.0)
+                continue
+            excess_length = max(0, len(completion) - self.full_reward_length)
+            rewards.append(max(0.0, 1.0 - excess_length / self.decay_length))
+        return rewards
+
+
+class GSM8KAccuracyBrevityReward(Reward):
+    """Sum GSM8K answer accuracy and brevity rewards."""
+
+    def __init__(self, accuracy_weight: float = 1.0, brevity_weight: float = 1.0):
+        self.accuracy_weight = accuracy_weight
+        self.brevity_weight = brevity_weight
+        self.accuracy_reward = GSM8KAccuracyReward()
+        self.brevity_reward = GSM8KBrevityReward()
+
+    def components(self, trajectories: List[Dict[str, Any]]) -> tuple[list[float], list[float]]:
+        return self.accuracy_reward(trajectories), self.brevity_reward(trajectories)
+
+    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+        accuracy_rewards, brevity_rewards = self.components(trajectories)
+        return [
+            self.accuracy_weight * accuracy + self.brevity_weight * brevity
+            for accuracy, brevity in zip(accuracy_rewards, brevity_rewards)
+        ]
+
+    def metric_payload(
+        self,
+        trajectories: List[Dict[str, Any]],
+        *,
+        rewards: List[float],
+        **kwargs,
+    ) -> Dict[str, float]:
+        accuracy_rewards, brevity_rewards = self.components(trajectories)
+        size = len(trajectories)
+        return {
+            'total_reward': sum(rewards) / size,
+            'accuracy_reward': sum(accuracy_rewards) / size,
+            'brevity_reward': sum(brevity_rewards) / size,
+        }
+
+
 class GSM8KFormatReward(Reward):
     """Format reward: checks if output contains \\boxed{} or #### answer format.
 
