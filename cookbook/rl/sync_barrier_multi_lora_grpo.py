@@ -173,6 +173,7 @@ class SyncBarrierMultiLoraGRPO:
                 model_id=runtime['model_id'],
                 adapter_name=context.adapter_name,
                 enable_thinking=enable_thinking,
+                max_length=model_max_length,
             )
             initial_path = self.model.save(
                 f'sync-{context.adapter_name}-initial',
@@ -228,6 +229,7 @@ class SyncBarrierMultiLoraGRPO:
             template_cls,
             model_id=runtime['model_id'],
             enable_thinking=enable_thinking,
+            max_length=model_max_length,
         )
         self.output_dir = runtime['output_dir']
         self.max_steps = runtime.get('max_steps')

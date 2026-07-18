@@ -251,6 +251,7 @@ class AsyncMultiLoraGRPOPipeline:
                 model_id=runtime['model_id'],
                 adapter_name=context.adapter_name,
                 enable_thinking=enable_thinking,
+                max_length=model_max_length,
             )
 
             rollout = item['rollout']
@@ -339,6 +340,7 @@ class AsyncMultiLoraGRPOPipeline:
             template_cls,
             model_id=runtime['model_id'],
             enable_thinking=enable_thinking,
+            max_length=model_max_length,
         )
 
         rollout_worker = create_cpu_actor(
