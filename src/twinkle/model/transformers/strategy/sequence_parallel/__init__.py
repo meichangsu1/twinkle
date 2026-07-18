@@ -107,17 +107,22 @@ class SequenceParallel:
             origin_uses_cache_position = has_signature_parameter(origin_sdpa, 'cache_position')
 
             def sdpa_mask(batch_size, q_length=None, kv_length=None, *args, **kwargs):
+                real_position_ids = self.real_position_ids
+                if self.world_size > 1 and real_position_ids is None:
+                    raise RuntimeError(
+                        'SequenceParallel requires position_ids before constructing the distributed attention mask. '
+                        'Ensure the rollout/TQ training batch preserves position_ids.')
                 q_length = q_length if q_length is not None else kwargs.pop('cache_position', None)
                 device = q_length.device if torch.is_tensor(q_length) else kwargs.pop('device', None)
                 if device is None:
-                    device = self.real_position_ids.device
+                    device = real_position_ids.device
 
                 cache_position = None
                 if self.world_size > 1:
                     padded_position_ids = self.pad(
-                        self.real_position_ids[0],
+                        real_position_ids[0],
                         padding_value=-1,
-                        position_ids=self.real_position_ids,
+                        position_ids=real_position_ids,
                         dim=0,
                     )
                     global_length = padded_position_ids.shape[0]

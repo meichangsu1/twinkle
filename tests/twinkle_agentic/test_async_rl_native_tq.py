@@ -15,9 +15,10 @@ from twinkle_agentic.async_rl import (AsyncMultiLoraGRPOPipeline, ContextSchedul
 from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
-from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _sampler_data_parallel_size,
-                                                _sequence_parallel_size,
-                                                _validate_context_batch_config, configure_lora_lr_scheduler)
+from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _model_attention_implementation,
+                                                _sampler_data_parallel_size, _sequence_parallel_size,
+                                                _train_batch, _validate_context_batch_config,
+                                                configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
 from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ, _PromptGroupRolloutStats
 from twinkle_agentic.async_rl.workers import RolloutWorker
@@ -76,6 +77,56 @@ def test_sequence_parallel_size_must_divide_model_gpus():
 
     with pytest.raises(ValueError, match='must be divisible'):
         _sequence_parallel_size(2, 3)
+
+
+def test_padding_free_sequence_parallel_requires_flash_attention():
+    assert _model_attention_implementation(
+        {'attn_implementation': 'flash_attention_2'},
+        padding_free=True,
+        sequence_parallel_size=2,
+    ) == 'flash_attention_2'
+
+    with pytest.raises(ValueError, match='model.attn_implementation'):
+        _model_attention_implementation({}, padding_free=True, sequence_parallel_size=2)
+
+
+def test_train_batch_preserves_position_ids_from_tq():
+    class Batch(dict):
+        batch_size = (1, )
+
+    class Model:
+        inputs = None
+
+        def forward_backward(self, *, inputs, **_kwargs):
+            self.inputs = inputs
+
+        def clip_grad_and_step(self, **_kwargs):
+            return None
+
+        def calculate_metric(self, **_kwargs):
+            return {}
+
+    context = _context()
+    admission = PartitionAdmission(context, context.partition_id(0), 0, 1, 1, 0)
+    data = Batch({
+        'input_ids': [[1, 2]],
+        'labels': [[-100, 2]],
+        'attention_mask': [[1, 1]],
+        'position_ids': [[0, 1]],
+        'logprobs': [[-.1]],
+        'advantages': [1.],
+        'rewards': [1.],
+    })
+    model = Model()
+
+    _train_batch(model, {context.key: 1}, data, admission)
+
+    assert model.inputs == [{
+        'input_ids': [1, 2],
+        'labels': [-100, 2],
+        'attention_mask': [1, 1],
+        'position_ids': [0, 1],
+    }]
 
 
 class PolicyProvider:
@@ -717,6 +768,7 @@ def test_data_plane_completes_rollout_with_full_training_trajectory():
         'input_ids': [1, 2, token],
         'labels': [-100, -100, token],
         'attention_mask': [1, 1, 1],
+        'position_ids': [0, 1, 2],
         'logprobs': [-.1],
         'generation_idx': generation_idx,
         'rollout_policy_version': 3,
@@ -736,7 +788,9 @@ def test_data_plane_completes_rollout_with_full_training_trajectory():
             submission_id='submission',
         ))
 
-    assert set(client.written.keys()) == {'input_ids', 'labels', 'attention_mask', 'logprobs', 'rewards'}
+    assert set(client.written.keys()) == {
+        'input_ids', 'labels', 'attention_mask', 'position_ids', 'logprobs', 'rewards'
+    }
     assert client.calls == ['tags', 'fields']
     assert [tag['rollout_status'] for tag in metadata.custom_meta] == ['ROLLOUT_DONE', 'ROLLOUT_DONE']
     assert [tag['submission_id'] for tag in metadata.custom_meta] == ['submission', 'submission']
@@ -765,6 +819,7 @@ def test_data_plane_rejects_rollout_without_complete_model_inputs():
             ))
     except ValueError as exc:
         assert 'attention_mask' in str(exc)
+        assert 'position_ids' in str(exc)
     else:
         raise AssertionError('expected incomplete rollout model fields to fail')
 

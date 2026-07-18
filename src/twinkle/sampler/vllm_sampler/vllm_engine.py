@@ -68,6 +68,7 @@ class VLLMEngine(BaseSamplerEngine):
         gpu_memory_utilization: float = 0.7,
         max_model_len: Optional[int] = None,
         max_num_seqs: int = 256,
+        max_num_batched_tokens: Optional[int] = None,
         enable_lora: bool = False,
         max_loras: int = 1,
         max_lora_rank: int = 32,
@@ -88,6 +89,7 @@ class VLLMEngine(BaseSamplerEngine):
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.enable_lora = enable_lora
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
@@ -154,6 +156,8 @@ class VLLMEngine(BaseSamplerEngine):
 
         if self.max_model_len is not None:
             engine_config['max_model_len'] = self.max_model_len
+        if self.max_num_batched_tokens is not None:
+            engine_config['max_num_batched_tokens'] = self.max_num_batched_tokens
 
         if self.quantization is not None:
             engine_config['quantization'] = self.quantization

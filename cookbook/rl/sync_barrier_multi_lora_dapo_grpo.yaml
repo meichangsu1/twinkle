@@ -1,5 +1,5 @@
 runtime:
-  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3.5-4B}
+  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3-4B}
   mode: ray
   model_gpus: 2
   sampler_gpus: 1
@@ -12,18 +12,23 @@ runtime:
   run_id: sync_barrier_multi_lora_dapo_grpo
 
 template:
-  cls: Qwen3_5Template
+  cls: Template
   enable_thinking: false
 
 model:
   # Must match the async experiment: SP=2 and effective model DP=1.
   sequence_parallel_size: 2
   padding_free: true
+  attn_implementation: flash_attention_2
   max_length: 12288
 
 sampler:
   max_model_len: 12288
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.8
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  # Keep sampler execution semantics aligned with the async experiment.
+  enforce_eager: true
 
 lora:
   r: 16

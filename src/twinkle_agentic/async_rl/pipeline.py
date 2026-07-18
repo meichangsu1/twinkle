@@ -41,6 +41,18 @@ def _sequence_parallel_size(model_gpus: int, configured_size: int) -> int:
     return configured_size
 
 
+def _model_attention_implementation(model_config: Any, *, padding_free: bool,
+                                    sequence_parallel_size: int) -> str | None:
+    implementation = model_config.get('attn_implementation')
+    if implementation is not None:
+        implementation = str(implementation)
+    if padding_free and sequence_parallel_size > 1 and implementation != 'flash_attention_2':
+        raise ValueError(
+            'model.attn_implementation must be flash_attention_2 when '
+            'model.padding_free=true and model.sequence_parallel_size>1')
+    return implementation
+
+
 def configure_lora_lr_scheduler(model: Any, adapter_name: str, lora_config: dict[str, Any]) -> None:
     """Configure one adapter's learning-rate scheduler from the shared LoRA config."""
     scheduler_config = lora_config.get('lr_scheduler')
@@ -152,6 +164,11 @@ class AsyncMultiLoraGRPOPipeline:
             int(model_config['sequence_parallel_size']),
         )
         padding_free = bool(model_config['padding_free'])
+        attn_implementation = _model_attention_implementation(
+            model_config,
+            padding_free=padding_free,
+            sequence_parallel_size=sequence_parallel_size,
+        )
         model_max_length = int(model_config['max_length'])
         sampler_config = raw_config['sampler']
         total_gpus = model_dp + sampler_gpus
@@ -187,11 +204,15 @@ class AsyncMultiLoraGRPOPipeline:
         )
         model_data_parallel_size = model_mesh.data_world_size
         sampler_mesh = DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_dp, tp_size=sampler_tp)
+        model_kwargs = {}
+        if attn_implementation is not None:
+            model_kwargs['attn_implementation'] = attn_implementation
         model = MultiLoraTransformersModel(
             model_id=runtime['model_id'],
             device_mesh=model_mesh,
             remote_group='model',
             max_length=model_max_length,
+            **model_kwargs,
         )
         lora_config = LoraConfig(
             target_modules='all-linear',
@@ -305,6 +326,9 @@ class AsyncMultiLoraGRPOPipeline:
                 'max_lora_rank': lora_config_data['r'],
                 'max_model_len': int(sampler_config['max_model_len']),
                 'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
+                'max_num_seqs': int(sampler_config['max_num_seqs']),
+                'max_num_batched_tokens': int(sampler_config['max_num_batched_tokens']),
+                'enforce_eager': bool(sampler_config['enforce_eager']),
             },
             reward_registry=rewards,
             context_manager=manager,
@@ -530,8 +554,10 @@ def _compute_advantages(data: Any, admission: PartitionAdmission) -> tuple[list[
 
 def _train_batch(model: Any, micro_batch_sizes: dict[str, int], data: Any,
                  admission: PartitionAdmission) -> dict[str, Any]:
+    from .tq_utils import REQUIRED_MODEL_INPUT_FIELDS
+
     size = int(data.batch_size[0])
-    inputs = [{name: data[name][index] for name in ('input_ids', 'labels', 'attention_mask')} for index in range(size)]
+    inputs = [{name: data[name][index] for name in REQUIRED_MODEL_INPUT_FIELDS} for index in range(size)]
     model.forward_backward(
         inputs=inputs,
         old_logps=list(data['logprobs']),

@@ -1,5 +1,5 @@
 runtime:
-  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3.5-4B}
+  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3-4B}
   mode: ray
   model_gpus: 2
   sampler_gpus: 1
@@ -15,18 +15,23 @@ runtime:
   metrics_path: outputs/async_rl/dapo_metrics.jsonl
 
 template:
-  cls: Qwen3_5Template
+  cls: Template
   enable_thinking: false
 
 model:
   # Two trainer GPUs form one Ulysses SP group. The effective model DP size is 1.
   sequence_parallel_size: 2
   padding_free: true
+  attn_implementation: flash_attention_2
   max_length: 12288
 
 sampler:
   max_model_len: 12288
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.8
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  # Keep the long-sequence sampler on eager execution until CUDA-graph stability is verified.
+  enforce_eager: true
 
 tq:
   polling_mode: true

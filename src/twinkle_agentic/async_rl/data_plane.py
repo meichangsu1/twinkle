@@ -7,10 +7,10 @@ from typing import Any, Sequence
 
 from .native_tq import (AsyncTQClient, append_fields, batch_size_for_groups, clear_partition, fetch_ready_batch,
                         metadata_size, preallocate_partition, set_sample_tags, split_batch_meta)
-from .tq_utils import ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields, rows_to_tq_fields
+from .tq_utils import REQUIRED_MODEL_INPUT_FIELDS, ROLLOUT_TRAIN_FIELDS, columns_to_tq_fields, rows_to_tq_fields
 from .types import ClaimedBatch, LoraContext, PartitionAdmission, PreparedPartition, PromptGroup, RolloutOutput
 
-_REQUIRED_ROLLOUT_FIELDS = frozenset({'input_ids', 'labels', 'attention_mask', 'logprobs', 'rewards'})
+_REQUIRED_ROLLOUT_FIELDS = frozenset((*REQUIRED_MODEL_INPUT_FIELDS, 'logprobs', 'rewards'))
 
 
 def build_rollout_group_sample_write(
@@ -226,7 +226,7 @@ class TQDataPlane:
         metadata = await self._claim(
             admission,
             groups_per_batch,
-            ['input_ids', 'labels', 'attention_mask', 'logprobs', 'rewards', 'advantages', 'returns'],
+            [*REQUIRED_MODEL_INPUT_FIELDS, 'logprobs', 'rewards', 'advantages', 'returns'],
             self._trainer_task(admission),
         )
         if metadata is None:

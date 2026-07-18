@@ -26,6 +26,9 @@ model:
 sampler:
   max_model_len: 8192
   gpu_memory_utilization: 0.8
+  max_num_seqs: 64
+  max_num_batched_tokens: 8192
+  enforce_eager: false
 
 tq:
   polling_mode: true

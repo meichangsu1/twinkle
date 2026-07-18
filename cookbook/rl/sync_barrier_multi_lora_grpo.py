@@ -18,8 +18,9 @@ from typing import Any, Iterator, Sequence
 from omegaconf import OmegaConf
 
 from twinkle_agentic.async_rl.metrics import JSONLMetricsRecorder, rollout_performance_metrics
-from twinkle_agentic.async_rl.pipeline import (_prompt_batches, _reward_for_context,
-                                                _sampler_data_parallel_size, _sequence_parallel_size, _train_batch,
+from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, _prompt_batches,
+                                                _reward_for_context, _sampler_data_parallel_size,
+                                                _sequence_parallel_size, _train_batch,
                                                 _validate_context_batch_config, configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.tq_utils import columns_to_tq_fields
 from twinkle_agentic.async_rl.types import LoraContext, PartitionAdmission
@@ -80,6 +81,11 @@ class SyncBarrierMultiLoraGRPO:
             int(model_config['sequence_parallel_size']),
         )
         padding_free = bool(model_config['padding_free'])
+        attn_implementation = _model_attention_implementation(
+            model_config,
+            padding_free=padding_free,
+            sequence_parallel_size=sequence_parallel_size,
+        )
         model_max_length = int(model_config['max_length'])
         sampler_config = raw_config['sampler']
         total_gpus = model_gpus + sampler_gpus
@@ -109,11 +115,15 @@ class SyncBarrierMultiLoraGRPO:
             dp_size=sampler_dp,
             tp_size=sampler_tp,
         )
+        model_kwargs = {}
+        if attn_implementation is not None:
+            model_kwargs['attn_implementation'] = attn_implementation
         self.model = MultiLoraTransformersModel(
             model_id=runtime['model_id'],
             device_mesh=model_mesh,
             remote_group='model',
             max_length=model_max_length,
+            **model_kwargs,
         )
         lora_config = LoraConfig(
             target_modules='all-linear',
@@ -209,6 +219,9 @@ class SyncBarrierMultiLoraGRPO:
                 'max_lora_rank': lora_data['r'],
                 'max_model_len': int(sampler_config['max_model_len']),
                 'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
+                'max_num_seqs': int(sampler_config['max_num_seqs']),
+                'max_num_batched_tokens': int(sampler_config['max_num_batched_tokens']),
+                'enforce_eager': bool(sampler_config['enforce_eager']),
             },
         )
         self.sampler.set_template(
