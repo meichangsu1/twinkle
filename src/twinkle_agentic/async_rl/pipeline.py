@@ -365,7 +365,12 @@ class AsyncMultiLoraGRPOPipeline:
             TrainerWorker,
             context_manager=manager,
             data_plane=TQDataPlane(),
-            train_fn=partial(_train_batch, model, micro_batch_sizes),
+            train_fn=partial(
+                _train_batch,
+                model,
+                micro_batch_sizes,
+                model_data_parallel_size=model_data_parallel_size,
+            ),
             save_adapter=partial(_save_adapter, model, runtime['output_dir']),
             groups_per_batch=train_groups_per_batch,
             scheduler=_scheduler(raw_config['scheduler']['train']),
@@ -554,22 +559,46 @@ def _compute_advantages(data: Any, admission: PartitionAdmission) -> tuple[list[
     return advantages, rewards
 
 
-def _train_batch(model: Any, micro_batch_sizes: dict[str, int], data: Any,
-                 admission: PartitionAdmission) -> dict[str, Any]:
+def _train_batch(
+    model: Any,
+    micro_batch_sizes: dict[str, int],
+    data: Any,
+    admission: PartitionAdmission,
+    *,
+    model_data_parallel_size: int = 1,
+) -> dict[str, Any]:
     from .tq_utils import REQUIRED_MODEL_INPUT_FIELDS
 
     size = int(data.batch_size[0])
     inputs = [{name: data[name][index] for name in REQUIRED_MODEL_INPUT_FIELDS} for index in range(size)]
-    model.forward_backward(
-        inputs=inputs,
-        old_logps=list(data['logprobs']),
-        advantages=list(data['advantages']),
-        micro_batch_size=micro_batch_sizes[admission.context.key],
-        adapter_name=admission.context.adapter_name,
-    )
+    old_logps = list(data['logprobs'])
+    advantages = list(data['advantages'])
+    per_rank_micro_batch_size = micro_batch_sizes[admission.context.key]
+    global_micro_batch_size = per_rank_micro_batch_size * model_data_parallel_size
+    if global_micro_batch_size <= 0:
+        raise ValueError(f'global micro-batch size must be positive, got {global_micro_batch_size}')
+    if size % model_data_parallel_size:
+        raise ValueError(f'train batch size {size} must be divisible by model DP size '
+                         f'{model_data_parallel_size}')
+
+    micro_batch_count = 0
+    for start in range(0, size, global_micro_batch_size):
+        end = min(start + global_micro_batch_size, size)
+        # GRPO loss averages over the samples in each forward. Weight every
+        # micro-batch so accumulated gradients equal the full-batch mean.
+        batch_weight = (end - start) / size
+        model.forward_backward(
+            inputs=inputs[start:end],
+            old_logps=old_logps[start:end],
+            advantages=[float(value) * batch_weight for value in advantages[start:end]],
+            adapter_name=admission.context.adapter_name,
+        )
+        micro_batch_count += 1
     model.clip_grad_and_step(adapter_name=admission.context.adapter_name)
     metrics = dict(model.calculate_metric(is_training=True, adapter_name=admission.context.adapter_name))
     metrics['reward'] = sum(float(value) for value in data['rewards']) / size
+    metrics['micro_batch_count'] = micro_batch_count
+    metrics['micro_batch_size_per_rank'] = per_rank_micro_batch_size
     return metrics
 
 

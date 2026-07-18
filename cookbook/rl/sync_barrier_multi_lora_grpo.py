@@ -110,6 +110,7 @@ class SyncBarrierMultiLoraGRPO:
             ulysses_size=sequence_parallel_size,
         )
         model_data_parallel_size = model_mesh.data_world_size
+        self.model_data_parallel_size = model_data_parallel_size
         sampler_mesh = DeviceMesh.from_sizes(
             world_size=sampler_gpus,
             dp_size=sampler_dp,
@@ -447,7 +448,13 @@ class SyncBarrierMultiLoraGRPO:
                     partition.advantages[start:end],
                 )
                 train_started = time.perf_counter()
-                metrics = _train_batch(self.model, self.micro_batch_sizes, batch, admission)
+                metrics = _train_batch(
+                    self.model,
+                    self.micro_batch_sizes,
+                    batch,
+                    admission,
+                    model_data_parallel_size=self.model_data_parallel_size,
+                )
                 state.optimizer_steps += 1
                 metrics.update({
                     'sample_count': end - start,

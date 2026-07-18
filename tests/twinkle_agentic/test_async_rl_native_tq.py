@@ -130,6 +130,46 @@ def test_train_batch_preserves_position_ids_from_tq():
     }]
 
 
+def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
+    class Batch(dict):
+        batch_size = (4, )
+
+    class Model:
+        def __init__(self):
+            self.calls = []
+            self.optimizer_steps = 0
+
+        def forward_backward(self, **kwargs):
+            self.calls.append(kwargs)
+
+        def clip_grad_and_step(self, **_kwargs):
+            self.optimizer_steps += 1
+
+        def calculate_metric(self, **_kwargs):
+            return {}
+
+    context = _context()
+    admission = PartitionAdmission(context, context.partition_id(0), 0, 1, 4, 0)
+    data = Batch({
+        'input_ids': [[index] for index in range(4)],
+        'labels': [[index] for index in range(4)],
+        'attention_mask': [[1] for _ in range(4)],
+        'position_ids': [[0] for _ in range(4)],
+        'logprobs': [[-.1] for _ in range(4)],
+        'advantages': [1., 2., 3., 4.],
+        'rewards': [1., 1., 1., 1.],
+    })
+    model = Model()
+
+    metrics = _train_batch(model, {context.key: 1}, data, admission, model_data_parallel_size=1)
+
+    assert [len(call['inputs']) for call in model.calls] == [1, 1, 1, 1]
+    assert [call['advantages'] for call in model.calls] == [[.25], [.5], [.75], [1.]]
+    assert model.optimizer_steps == 1
+    assert metrics['micro_batch_count'] == 4
+    assert metrics['micro_batch_size_per_rank'] == 1
+
+
 def test_sync_training_batch_preserves_position_ids():
     rows = [{
         'input_ids': [1, 2],
