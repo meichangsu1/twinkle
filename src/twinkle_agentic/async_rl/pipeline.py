@@ -41,6 +41,20 @@ def _sequence_parallel_size(model_gpus: int, configured_size: int) -> int:
     return configured_size
 
 
+def configure_lora_lr_scheduler(model: Any, adapter_name: str, lora_config: dict[str, Any]) -> None:
+    """Configure one adapter's learning-rate scheduler from the shared LoRA config."""
+    scheduler_config = lora_config.get('lr_scheduler')
+    if scheduler_config is None:
+        return
+    scheduler_config = dict(scheduler_config)
+    scheduler_cls = scheduler_config.pop('cls')
+    model.set_lr_scheduler(
+        scheduler_cls,
+        adapter_name=adapter_name,
+        **scheduler_config,
+    )
+
+
 def _validate_context_batch_config(
     context_key: str,
     *,
@@ -197,6 +211,7 @@ class AsyncMultiLoraGRPOPipeline:
             contexts.append(context)
             model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
             model.set_optimizer('AdamW', lr=lora_config_data['learning_rate'], adapter_name=context.adapter_name)
+            configure_lora_lr_scheduler(model, context.adapter_name, lora_config_data)
             model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
             model.set_processor(
                 InputProcessor,

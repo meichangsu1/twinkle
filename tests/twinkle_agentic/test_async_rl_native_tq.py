@@ -17,7 +17,7 @@ from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
 from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _sampler_data_parallel_size,
                                                 _sequence_parallel_size,
-                                                _validate_context_batch_config)
+                                                _validate_context_batch_config, configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
 from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ, _PromptGroupRolloutStats
 from twinkle_agentic.async_rl.workers import RolloutWorker
@@ -139,6 +139,32 @@ def test_sampler_parallelism_rejects_incomplete_tp_group():
         assert 'must be divisible' in str(exc)
     else:
         raise AssertionError('expected invalid sampler GPU/TP layout to fail')
+
+
+def test_lora_lr_scheduler_uses_shared_adapter_config():
+    calls = []
+
+    class Model:
+        def set_lr_scheduler(self, scheduler_cls, **kwargs):
+            calls.append((scheduler_cls, kwargs))
+
+    configure_lora_lr_scheduler(
+        Model(),
+        'tenant_lora',
+        {
+            'lr_scheduler': {
+                'cls': 'CosineAnnealingLR',
+                'T_max': 2000,
+                'eta_min': 0.0,
+            },
+        },
+    )
+
+    assert calls == [('CosineAnnealingLR', {
+        'adapter_name': 'tenant_lora',
+        'T_max': 2000,
+        'eta_min': 0.0,
+    })]
 
 
 def test_context_batch_config_accepts_group_aligned_dp_batches():

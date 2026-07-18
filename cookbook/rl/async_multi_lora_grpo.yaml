@@ -36,6 +36,11 @@ lora:
   alpha: 32
   dropout: 0.05
   learning_rate: 5.0e-5
+  lr_scheduler:
+    cls: CosineAnnealingLR
+    # One optimizer step per prompt with the current groups_per_batch=1 setup.
+    T_max: 2000
+    eta_min: 0.0
 
 lora_contexts:
   - tenant_id: tenant_a

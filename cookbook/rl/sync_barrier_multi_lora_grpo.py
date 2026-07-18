@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 from twinkle_agentic.async_rl.metrics import JSONLMetricsRecorder, rollout_performance_metrics
 from twinkle_agentic.async_rl.pipeline import (_prompt_batches, _reward_for_context,
                                                 _sampler_data_parallel_size, _sequence_parallel_size, _train_batch,
-                                                _validate_context_batch_config)
+                                                _validate_context_batch_config, configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.tq_utils import columns_to_tq_fields
 from twinkle_agentic.async_rl.types import LoraContext, PartitionAdmission
 from twinkle_agentic.async_rl.vllm_sampler_tq import (_compute_reward_metrics,
@@ -148,6 +148,7 @@ class SyncBarrierMultiLoraGRPO:
             )
             self.model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
             self.model.set_optimizer('AdamW', lr=lora_data['learning_rate'], adapter_name=context.adapter_name)
+            configure_lora_lr_scheduler(self.model, context.adapter_name, lora_data)
             self.model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
             self.model.set_processor(
                 InputProcessor,
