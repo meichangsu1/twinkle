@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from cookbook.rl.sync_barrier_multi_lora_grpo import SyncBarrierMultiLoraGRPO
 from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import _dispatch_args
@@ -127,6 +128,21 @@ def test_train_batch_preserves_position_ids_from_tq():
         'attention_mask': [1, 1],
         'position_ids': [0, 1],
     }]
+
+
+def test_sync_training_batch_preserves_position_ids():
+    rows = [{
+        'input_ids': [1, 2],
+        'labels': [-100, 2],
+        'attention_mask': [1, 1],
+        'position_ids': [0, 1],
+        'logprobs': [-.1],
+    }]
+
+    batch = SyncBarrierMultiLoraGRPO._training_batch(rows, rewards=[1.], advantages=[0.])
+
+    assert 'position_ids' in batch.keys()
+    assert batch['position_ids'][0] == [0, 1]
 
 
 class PolicyProvider:

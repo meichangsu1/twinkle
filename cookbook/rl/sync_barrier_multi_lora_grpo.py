@@ -22,7 +22,7 @@ from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, 
                                                 _reward_for_context, _sampler_data_parallel_size,
                                                 _sequence_parallel_size, _train_batch,
                                                 _validate_context_batch_config, configure_lora_lr_scheduler)
-from twinkle_agentic.async_rl.tq_utils import columns_to_tq_fields
+from twinkle_agentic.async_rl.tq_utils import REQUIRED_MODEL_INPUT_FIELDS, columns_to_tq_fields
 from twinkle_agentic.async_rl.types import LoraContext, PartitionAdmission
 from twinkle_agentic.async_rl.vllm_sampler_tq import (_compute_reward_metrics,
                                                       _sample_responses_to_rollout_rows)
@@ -509,7 +509,7 @@ class SyncBarrierMultiLoraGRPO:
     def _training_batch(rows: list[dict[str, Any]], rewards: list[float], advantages: list[float]):
         fields = {
             name: [row[name] for row in rows]
-            for name in ('input_ids', 'labels', 'attention_mask', 'logprobs')
+            for name in (*REQUIRED_MODEL_INPUT_FIELDS, 'logprobs')
         }
         fields.update({'rewards': rewards, 'advantages': advantages})
         return columns_to_tq_fields(fields, len(rows))
