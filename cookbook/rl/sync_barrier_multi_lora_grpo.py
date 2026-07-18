@@ -80,6 +80,8 @@ class SyncBarrierMultiLoraGRPO:
             int(model_config['sequence_parallel_size']),
         )
         padding_free = bool(model_config['padding_free'])
+        model_max_length = int(model_config['max_length'])
+        sampler_config = raw_config['sampler']
         total_gpus = model_gpus + sampler_gpus
 
         twinkle.initialize(
@@ -111,6 +113,7 @@ class SyncBarrierMultiLoraGRPO:
             model_id=runtime['model_id'],
             device_mesh=model_mesh,
             remote_group='model',
+            max_length=model_max_length,
         )
         lora_config = LoraConfig(
             target_modules='all-linear',
@@ -204,6 +207,8 @@ class SyncBarrierMultiLoraGRPO:
                 'enable_lora': True,
                 'max_loras': int(runtime['sampler_max_loras']),
                 'max_lora_rank': lora_data['r'],
+                'max_model_len': int(sampler_config['max_model_len']),
+                'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
             },
         )
         self.sampler.set_template(

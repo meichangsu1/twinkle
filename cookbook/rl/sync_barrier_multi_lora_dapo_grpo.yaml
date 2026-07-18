@@ -1,0 +1,88 @@
+runtime:
+  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3.5-4B}
+  mode: ray
+  model_gpus: 2
+  sampler_gpus: 1
+  sampler_tp: 1
+  sampler_max_loras: 4
+  max_steps: null
+  keep_adapter_versions: 2
+  output_dir: output/sync_barrier_multi_lora_dapo_grpo
+  metrics_path: outputs/sync_barrier_rl/dapo_metrics.jsonl
+  run_id: sync_barrier_multi_lora_dapo_grpo
+
+template:
+  cls: Qwen3_5Template
+  enable_thinking: false
+
+model:
+  # Must match the async experiment: SP=2 and effective model DP=1.
+  sequence_parallel_size: 2
+  padding_free: true
+  max_length: 12288
+
+sampler:
+  max_model_len: 12288
+  gpu_memory_utilization: 0.9
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  learning_rate: 5.0e-5
+  lr_scheduler:
+    cls: CosineAnnealingLR
+    T_max: 2000
+    eta_min: 0.0
+
+lora_contexts:
+  # Set both environment variables to the same files used by the async experiment.
+  - tenant_id: tenant_a
+    training_run_id: dapo_sync
+    adapter_name: tenant_a_dapo_math_lora
+    reward_type: dapo_math_accuracy
+    dataset:
+      dataset_id: ${oc.env:TENANT_A_DAPO_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
+      subset_name: default
+      split: train
+      data_num: 2000
+      max_length: 4096
+      processor: DAPOMathProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 8
+      max_tokens: 8192
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      groups_per_batch: 1
+      micro_batch_size: 1
+
+  - tenant_id: tenant_b
+    training_run_id: dapo_sync
+    adapter_name: tenant_b_dapo_math_lora
+    reward_type: dapo_math_accuracy
+    dataset:
+      dataset_id: ${oc.env:TENANT_B_DAPO_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
+      subset_name: default
+      split: train
+      data_num: 2000
+      max_length: 4096
+      processor: DAPOMathProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 8
+      max_tokens: 8192
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      groups_per_batch: 1
+      micro_batch_size: 1
+
+
+# python cookbook/rl/sync_barrier_multi_lora_grpo.py \
+#   --config cookbook/rl/sync_barrier_multi_lora_dapo_grpo.yaml

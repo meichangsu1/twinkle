@@ -152,6 +152,8 @@ class AsyncMultiLoraGRPOPipeline:
             int(model_config['sequence_parallel_size']),
         )
         padding_free = bool(model_config['padding_free'])
+        model_max_length = int(model_config['max_length'])
+        sampler_config = raw_config['sampler']
         total_gpus = model_dp + sampler_gpus
         device_groups = [
             DeviceGroup('model', list(range(int(runtime['model_gpus']))), device_type='GPU'),
@@ -185,7 +187,12 @@ class AsyncMultiLoraGRPOPipeline:
         )
         model_data_parallel_size = model_mesh.data_world_size
         sampler_mesh = DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_dp, tp_size=sampler_tp)
-        model = MultiLoraTransformersModel(model_id=runtime['model_id'], device_mesh=model_mesh, remote_group='model')
+        model = MultiLoraTransformersModel(
+            model_id=runtime['model_id'],
+            device_mesh=model_mesh,
+            remote_group='model',
+            max_length=model_max_length,
+        )
         lora_config = LoraConfig(
             target_modules='all-linear',
             r=lora_config_data['r'],
@@ -296,6 +303,8 @@ class AsyncMultiLoraGRPOPipeline:
                 'enable_lora': True,
                 'max_loras': int(runtime['sampler_max_loras']),
                 'max_lora_rank': lora_config_data['r'],
+                'max_model_len': int(sampler_config['max_model_len']),
+                'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
             },
             reward_registry=rewards,
             context_manager=manager,
@@ -499,12 +508,15 @@ def _prompt_batches(
 
 
 def _reward_for_context(context: LoraContext) -> Any:
-    from twinkle.reward import BoxedMathAccuracyReward, GSM8KAccuracyBrevityReward, GSM8KAccuracyReward
+    from twinkle.reward import (BoxedMathAccuracyReward, DAPOMathAccuracyReward, GSM8KAccuracyBrevityReward,
+                                GSM8KAccuracyReward)
     if context.reward_type in {'gsm8k', 'gsm8k_accuracy'}:
         return GSM8KAccuracyReward()
     if context.reward_type == 'gsm8k_accuracy_brevity':
         return GSM8KAccuracyBrevityReward()
-    if context.reward_type in {'dapo_math_accuracy', 'aime2024_accuracy'}:
+    if context.reward_type == 'dapo_math_accuracy':
+        return DAPOMathAccuracyReward()
+    if context.reward_type == 'aime2024_accuracy':
         return BoxedMathAccuracyReward()
     raise ValueError(f'unsupported async-RL reward_type {context.reward_type!r} for {context.key}')
 

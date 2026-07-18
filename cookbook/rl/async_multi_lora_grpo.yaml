@@ -21,6 +21,11 @@ template:
 model:
   sequence_parallel_size: 1
   padding_free: false
+  max_length: 8192
+
+sampler:
+  max_model_len: 8192
+  gpu_memory_utilization: 0.8
 
 tq:
   polling_mode: true

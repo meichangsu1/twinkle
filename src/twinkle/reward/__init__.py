@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Reward
 from .boxed_math import BoxedMathAccuracyReward
+from .dapo_math import DAPOMathAccuracyReward
 from .format_reward import FormatReward
 from .gsm8k import GSM8KAccuracyBrevityReward, GSM8KAccuracyReward, GSM8KBrevityReward, GSM8KFormatReward
 from .math_reward import MathReward
