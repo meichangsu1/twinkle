@@ -111,6 +111,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
+        print('rank=', self.device_mesh.data_rank, 'local_batch_size=', len(inputs))
         self._check_adapter_valid(kwargs.get('adapter_name'))
         optimizer_config = self.optimizer_group[kwargs.get('adapter_name')]
         if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
