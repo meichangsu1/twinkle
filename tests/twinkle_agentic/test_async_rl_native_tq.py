@@ -17,7 +17,8 @@ from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
 from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _model_attention_implementation,
-                                                _sampler_data_parallel_size, _sequence_parallel_size,
+                                                _reward_for_context, _sampler_data_parallel_size,
+                                                _sequence_parallel_size,
                                                 _train_batch, _validate_context_batch_config,
                                                 configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
@@ -272,6 +273,21 @@ def test_lora_lr_scheduler_uses_shared_adapter_config():
         'T_max': 2000,
         'eta_min': 0.0,
     })]
+
+
+def test_dapo_reward_factory_uses_rollout_token_limit():
+    reward = _reward_for_context(
+        LoraContext('tenant', 'run', 'model', 'adapter', reward_type='dapo_math'),
+        reward_config={
+            'overlong_buffer_length': 4096,
+            'overlong_penalty_factor': 1.0,
+            'score_tail_chars': 300,
+        },
+        rollout_config={'max_tokens': 8192},
+    )
+
+    assert reward.max_response_length == 8192
+    assert reward.overlong_buffer_length == 4096
 
 
 def test_context_batch_config_accepts_group_aligned_dp_batches():

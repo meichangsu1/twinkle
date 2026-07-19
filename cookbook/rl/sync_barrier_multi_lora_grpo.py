@@ -20,8 +20,8 @@ from omegaconf import OmegaConf
 from twinkle_agentic.async_rl.metrics import JSONLMetricsRecorder, rollout_performance_metrics
 from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, _prompt_batches,
                                                 _reward_for_context, _sampler_data_parallel_size,
-                                                _sequence_parallel_size, _train_batch,
-                                                _validate_context_batch_config, configure_lora_lr_scheduler)
+                                                _sequence_parallel_size, _train_batch, _validate_context_batch_config,
+                                                configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.tq_utils import REQUIRED_MODEL_INPUT_FIELDS, columns_to_tq_fields
 from twinkle_agentic.async_rl.types import LoraContext, PartitionAdmission
 from twinkle_agentic.async_rl.vllm_sampler_tq import (_compute_reward_metrics,
@@ -203,7 +203,11 @@ class SyncBarrierMultiLoraGRPO:
                 ),
                 advantage_groups_per_batch=advantage_groups,
                 train_groups_per_batch=train_groups,
-                reward_fn=_reward_for_context(context),
+                reward_fn=_reward_for_context(
+                    context,
+                    reward_config=item.get('reward'),
+                    rollout_config=rollout,
+                ),
                 adapter_path=initial_path,
                 adapter_history=[initial_path],
             )

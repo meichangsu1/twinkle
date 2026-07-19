@@ -46,18 +46,19 @@ lora:
   r: 16
   alpha: 32
   dropout: 0.05
-  learning_rate: 5.0e-5
-  lr_scheduler:
-    cls: CosineAnnealingLR
-    T_max: 2000
-    eta_min: 0.0
+  # Match verl's stable GRPO-on-DAPO learning rate. No scheduler means constant LR.
+  learning_rate: 1.0e-6
 
 lora_contexts:
   # Set both environment variables to distinct local parquet splits for a disjoint-tenant experiment.
   - tenant_id: tenant_a
     training_run_id: dapo_async
     adapter_name: tenant_a_dapo_math_lora
-    reward_type: dapo_math_accuracy
+    reward_type: dapo_math
+    reward:
+      overlong_buffer_length: 4096
+      overlong_penalty_factor: 1.0
+      score_tail_chars: 300
     dataset:
       dataset_id: ${oc.env:TENANT_A_DAPO_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
       subset_name: default
@@ -81,7 +82,11 @@ lora_contexts:
   - tenant_id: tenant_b
     training_run_id: dapo_async
     adapter_name: tenant_b_dapo_math_lora
-    reward_type: dapo_math_accuracy
+    reward_type: dapo_math
+    reward:
+      overlong_buffer_length: 4096
+      overlong_penalty_factor: 1.0
+      score_tail_chars: 300
     dataset:
       dataset_id: ${oc.env:TENANT_B_DAPO_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
       subset_name: default

@@ -300,7 +300,11 @@ class AsyncMultiLoraGRPOPipeline:
             advantage_groups_per_batch[context.key] = advantage_groups
             train_groups_per_batch[context.key] = train_groups
             micro_batch_sizes[context.key] = micro_batch_size
-            rewards[context.key] = _reward_for_context(context)
+            rewards[context.key] = _reward_for_context(
+                context,
+                reward_config=item.get('reward'),
+                rollout_config=rollout,
+            )
             initial_paths[context.key] = model.save(
                 f'async-{context.adapter_name}-initial',
                 output_dir=runtime['output_dir'],
@@ -538,15 +542,30 @@ def _prompt_batches(
     return batches()
 
 
-def _reward_for_context(context: LoraContext) -> Any:
-    from twinkle.reward import (BoxedMathAccuracyReward, DAPOMathAccuracyReward, GSM8KAccuracyBrevityReward,
-                                GSM8KAccuracyReward)
+def _reward_for_context(
+    context: LoraContext,
+    *,
+    reward_config: dict[str, Any] | None = None,
+    rollout_config: dict[str, Any] | None = None,
+) -> Any:
+    from twinkle.reward import (BoxedMathAccuracyReward, DAPOMathAccuracyReward, DAPOMathReward,
+                                GSM8KAccuracyBrevityReward, GSM8KAccuracyReward)
     if context.reward_type in {'gsm8k', 'gsm8k_accuracy'}:
         return GSM8KAccuracyReward()
     if context.reward_type == 'gsm8k_accuracy_brevity':
         return GSM8KAccuracyBrevityReward()
     if context.reward_type == 'dapo_math_accuracy':
         return DAPOMathAccuracyReward()
+    if context.reward_type == 'dapo_math':
+        if rollout_config is None:
+            raise ValueError(f'rollout config is required for DAPO reward in {context.key}')
+        reward_config = dict(reward_config or {})
+        return DAPOMathReward(
+            max_response_length=int(rollout_config['max_tokens']),
+            overlong_buffer_length=int(reward_config['overlong_buffer_length']),
+            overlong_penalty_factor=float(reward_config.get('overlong_penalty_factor', 1.0)),
+            score_tail_chars=int(reward_config.get('score_tail_chars', 300)),
+        )
     if context.reward_type == 'aime2024_accuracy':
         return BoxedMathAccuracyReward()
     raise ValueError(f'unsupported async-RL reward_type {context.reward_type!r} for {context.key}')
