@@ -1,0 +1,176 @@
+runtime:
+  model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3-4B}
+  mode: ray
+  # Three-GPU layout: two trainer GPUs in one SP group plus one sampler GPU.
+  model_gpus: 2
+  sampler_gpus: 1
+  sampler_tp: 1
+  sampler_max_loras: 4
+  max_staleness: 2
+  max_steps: null
+  allow_partial_rollout: false
+  rollout_max_retries: 2
+  rollout_retry_delay_s: 0.5
+  keep_adapter_versions: 2
+  output_dir: output/async_multi_lora_dapo_hparam_sweep
+  metrics_path: outputs/async_rl/dapo_hparam_sweep_metrics.jsonl
+
+template:
+  cls: Template
+  enable_thinking: false
+
+model:
+  strategy: native_fsdp
+  fsdp_config:
+    reshard_after_forward: true
+  sequence_parallel_size: 2
+  padding_free: true
+  attn_implementation: flash_attention_2
+  max_length: 12288
+
+sampler:
+  max_model_len: 12288
+  gpu_memory_utilization: 0.8
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  enforce_eager: true
+
+tq:
+  polling_mode: true
+  storage_units: 2
+
+scheduler:
+  rollout: {policy: round_robin, max_consecutive_units: 1}
+  advantage: {policy: oldest_partition, max_consecutive_units: 1}
+  # Interleave hyperparameter candidates so one adapter cannot monopolize training.
+  train: {policy: round_robin, max_consecutive_units: 1}
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # Used only when a context omits train.learning_rate.
+  learning_rate: 1.0e-6
+
+lora_contexts:
+  # A/B/C isolate learning rate while keeping groups_per_batch fixed at 4.
+  - tenant_id: tenant_lr1e6_g4
+    training_run_id: dapo_hparam_sweep
+    adapter_name: dapo_lr1e6_g4_lora
+    reward_type: dapo_math
+    reward:
+      overlong_buffer_length: 4096
+      overlong_penalty_factor: 1.0
+      score_tail_chars: 300
+    dataset:
+      dataset_id: ${oc.env:DAPO_HPARAM_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
+      subset_name: default
+      split: train
+      data_num: 500
+      max_length: 4096
+      processor: DAPOMathProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 8
+      max_tokens: 8192
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      learning_rate: 1.0e-6
+      groups_per_batch: 4
+      micro_batch_size: 1
+
+  - tenant_id: tenant_lr5e6_g4
+    training_run_id: dapo_hparam_sweep
+    adapter_name: dapo_lr5e6_g4_lora
+    reward_type: dapo_math
+    reward:
+      overlong_buffer_length: 4096
+      overlong_penalty_factor: 1.0
+      score_tail_chars: 300
+    dataset:
+      dataset_id: ${oc.env:DAPO_HPARAM_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
+      subset_name: default
+      split: train
+      data_num: 500
+      max_length: 4096
+      processor: DAPOMathProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 8
+      max_tokens: 8192
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      learning_rate: 5.0e-6
+      groups_per_batch: 4
+      micro_batch_size: 1
+
+  - tenant_id: tenant_lr1e5_g4
+    training_run_id: dapo_hparam_sweep
+    adapter_name: dapo_lr1e5_g4_lora
+    reward_type: dapo_math
+    reward:
+      overlong_buffer_length: 4096
+      overlong_penalty_factor: 1.0
+      score_tail_chars: 300
+    dataset:
+      dataset_id: ${oc.env:DAPO_HPARAM_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
+      subset_name: default
+      split: train
+      data_num: 500
+      max_length: 4096
+      processor: DAPOMathProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 8
+      max_tokens: 8192
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      learning_rate: 1.0e-5
+      groups_per_batch: 4
+      micro_batch_size: 1
+
+  # B/D isolate train batch size while keeping learning_rate fixed at 5e-6.
+  - tenant_id: tenant_lr5e6_g16
+    training_run_id: dapo_hparam_sweep
+    adapter_name: dapo_lr5e6_g16_lora
+    reward_type: dapo_math
+    reward:
+      overlong_buffer_length: 4096
+      overlong_penalty_factor: 1.0
+      score_tail_chars: 300
+    dataset:
+      dataset_id: ${oc.env:DAPO_HPARAM_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
+      subset_name: default
+      split: train
+      data_num: 500
+      max_length: 4096
+      processor: DAPOMathProcessor
+    rollout:
+      batch_size: 16
+      num_generations: 8
+      max_tokens: 8192
+      temperature: 1.0
+      top_p: 0.95
+    advantage:
+      groups_per_batch: 1
+    train:
+      learning_rate: 5.0e-6
+      groups_per_batch: 16
+      micro_batch_size: 1
+
+
+# CUDA_VISIBLE_DEVICES=0,1,2 \
+# MODEL_ID=/nas/disk1/Qwen3-4B \
+# DAPO_HPARAM_DATASET_ID=/path/to/dapo_math_500.parquet \
+# TWINKLE_SEED=42 \
+# python3 cookbook/rl/async_multi_lora_grpo.py \
+#   --config cookbook/rl/async_multi_lora_dapo_hparam_sweep.yaml

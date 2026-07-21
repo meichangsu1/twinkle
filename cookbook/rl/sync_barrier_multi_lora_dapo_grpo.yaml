@@ -16,6 +16,9 @@ template:
   enable_thinking: false
 
 model:
+  strategy: native_fsdp
+  fsdp_config:
+    reshard_after_forward: true
   # Must match the async experiment: SP=2 and effective model DP=1.
   sequence_parallel_size: 2
   padding_free: true

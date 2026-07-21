@@ -19,6 +19,9 @@ template:
   enable_thinking: false
 
 model:
+  strategy: native_fsdp
+  fsdp_config:
+    reshard_after_forward: true
   sequence_parallel_size: 1
   padding_free: false
   max_length: 8192

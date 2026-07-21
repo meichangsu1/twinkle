@@ -17,6 +17,7 @@ from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
 from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _model_attention_implementation,
+                                                _context_learning_rate, _native_fsdp_model_kwargs,
                                                 _reward_for_context, _sampler_data_parallel_size,
                                                 _sequence_parallel_size,
                                                 _train_batch, _validate_context_batch_config,
@@ -273,6 +274,33 @@ def test_lora_lr_scheduler_uses_shared_adapter_config():
         'T_max': 2000,
         'eta_min': 0.0,
     })]
+
+
+def test_context_learning_rate_overrides_global_default():
+    assert _context_learning_rate({'learning_rate': 5e-6}, {'learning_rate': 1e-6}) == pytest.approx(5e-6)
+    assert _context_learning_rate({}, {'learning_rate': 1e-6}) == pytest.approx(1e-6)
+
+
+@pytest.mark.parametrize('value', [0, -1e-6, float('inf')])
+def test_context_learning_rate_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match='positive finite'):
+        _context_learning_rate({'learning_rate': value}, {'learning_rate': 1e-6})
+
+
+def test_rl_model_kwargs_enforce_native_fsdp():
+    assert _native_fsdp_model_kwargs({}) == {
+        'strategy': 'native_fsdp',
+        'fsdp_config': {},
+    }
+    assert _native_fsdp_model_kwargs({
+        'strategy': 'native_fsdp',
+        'fsdp_config': {'reshard_after_forward': False},
+    }) == {
+        'strategy': 'native_fsdp',
+        'fsdp_config': {'reshard_after_forward': False},
+    }
+    with pytest.raises(ValueError, match='must be native_fsdp'):
+        _native_fsdp_model_kwargs({'strategy': 'accelerate'})
 
 
 def test_dapo_reward_factory_uses_rollout_token_limit():

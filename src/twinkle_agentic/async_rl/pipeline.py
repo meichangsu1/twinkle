@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -53,6 +54,17 @@ def _model_attention_implementation(model_config: Any, *, padding_free: bool,
     return implementation
 
 
+def _native_fsdp_model_kwargs(model_config: dict[str, Any]) -> dict[str, Any]:
+    """Build model kwargs while enforcing FSDP for all RL training entrypoints."""
+    strategy = str(model_config.get('strategy', 'native_fsdp'))
+    if strategy != 'native_fsdp':
+        raise ValueError(f'model.strategy must be native_fsdp for RL training, got {strategy!r}')
+    return {
+        'strategy': strategy,
+        'fsdp_config': dict(model_config.get('fsdp_config') or {}),
+    }
+
+
 def configure_lora_lr_scheduler(model: Any, adapter_name: str, lora_config: dict[str, Any]) -> None:
     """Configure one adapter's learning-rate scheduler from the shared LoRA config."""
     scheduler_config = lora_config.get('lr_scheduler')
@@ -65,6 +77,17 @@ def configure_lora_lr_scheduler(model: Any, adapter_name: str, lora_config: dict
         adapter_name=adapter_name,
         **scheduler_config,
     )
+
+
+def _context_learning_rate(train_config: dict[str, Any], lora_config: dict[str, Any]) -> float:
+    """Resolve one adapter's learning rate, falling back to the global LoRA default."""
+    configured = train_config.get('learning_rate', lora_config.get('learning_rate'))
+    if configured is None:
+        raise ValueError('train.learning_rate or lora.learning_rate must be configured')
+    learning_rate = float(configured)
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError(f'train.learning_rate must be a positive finite value, got {configured!r}')
+    return learning_rate
 
 
 def _validate_context_batch_config(
@@ -204,7 +227,7 @@ class AsyncMultiLoraGRPOPipeline:
         )
         model_data_parallel_size = model_mesh.data_world_size
         sampler_mesh = DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_dp, tp_size=sampler_tp)
-        model_kwargs = {}
+        model_kwargs = _native_fsdp_model_kwargs(model_config)
         if attn_implementation is not None:
             model_kwargs['attn_implementation'] = attn_implementation
         model = MultiLoraTransformersModel(
@@ -229,6 +252,7 @@ class AsyncMultiLoraGRPOPipeline:
         rewards: dict[str, Any] = {}
         initial_paths: dict[str, str] = {}
         for item in raw_config['lora_contexts']:
+            train = item['train']
             context = LoraContext(
                 item['tenant_id'],
                 item['training_run_id'],
@@ -238,7 +262,11 @@ class AsyncMultiLoraGRPOPipeline:
             )
             contexts.append(context)
             model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
-            model.set_optimizer('AdamW', lr=lora_config_data['learning_rate'], adapter_name=context.adapter_name)
+            model.set_optimizer(
+                'AdamW',
+                lr=_context_learning_rate(train, lora_config_data),
+                adapter_name=context.adapter_name,
+            )
             configure_lora_lr_scheduler(model, context.adapter_name, lora_config_data)
             model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
             model.set_processor(
@@ -256,7 +284,6 @@ class AsyncMultiLoraGRPOPipeline:
 
             rollout = item['rollout']
             advantage = item['advantage']
-            train = item['train']
             rollout_batch_size = int(rollout['batch_size'])
             num_generations = int(rollout['num_generations'])
             advantage_groups = int(advantage['groups_per_batch'])

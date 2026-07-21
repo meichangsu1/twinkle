@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 
 from twinkle_agentic.async_rl.metrics import JSONLMetricsRecorder, rollout_performance_metrics
 from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, _prompt_batches,
+                                                _context_learning_rate, _native_fsdp_model_kwargs,
                                                 _reward_for_context, _sampler_data_parallel_size,
                                                 _sequence_parallel_size, _train_batch, _validate_context_batch_config,
                                                 configure_lora_lr_scheduler)
@@ -116,7 +117,7 @@ class SyncBarrierMultiLoraGRPO:
             dp_size=sampler_dp,
             tp_size=sampler_tp,
         )
-        model_kwargs = {}
+        model_kwargs = _native_fsdp_model_kwargs(model_config)
         if attn_implementation is not None:
             model_kwargs['attn_implementation'] = attn_implementation
         self.model = MultiLoraTransformersModel(
@@ -161,7 +162,11 @@ class SyncBarrierMultiLoraGRPO:
                 model_dp=model_data_parallel_size,
             )
             self.model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
-            self.model.set_optimizer('AdamW', lr=lora_data['learning_rate'], adapter_name=context.adapter_name)
+            self.model.set_optimizer(
+                'AdamW',
+                lr=_context_learning_rate(train, lora_data),
+                adapter_name=context.adapter_name,
+            )
             configure_lora_lr_scheduler(self.model, context.adapter_name, lora_data)
             self.model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
             self.model.set_processor(
