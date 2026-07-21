@@ -32,7 +32,14 @@ def _safe(value: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', value).strip('_') or 'default'
 
 
-def replay(input_path: Path, logdir: Path, *, project: str, experiment: str) -> int:
+def replay(
+    input_path: Path,
+    logdir: Path,
+    *,
+    project: str,
+    experiment: str,
+    smooth_span: int = 0,
+) -> int:
     try:
         import swanlab
     except ImportError as exc:
@@ -44,7 +51,12 @@ def replay(input_path: Path, logdir: Path, *, project: str, experiment: str) -> 
         logdir=str(logdir),
         mode='local',
     )
+    if smooth_span < 0:
+        raise ValueError(f'smooth_span must be non-negative, got {smooth_span}')
+
     logged = 0
+    reward_ema: dict[str, float] = {}
+    ema_alpha = 2.0 / (smooth_span + 1) if smooth_span else 0.0
     with input_path.open(encoding='utf-8') as stream:
         for event_index, line in enumerate(stream, start=1):
             if not line.strip():
@@ -58,6 +70,12 @@ def replay(input_path: Path, logdir: Path, *, project: str, experiment: str) -> 
                 number = _number(value)
                 if number is not None:
                     values[f'{prefix}/{event_name}/{_safe(str(name))}'] = number
+                    if smooth_span and event_name == 'train_step_done' and name == 'reward':
+                        previous = reward_ema.get(prefix)
+                        smoothed = float(number) if previous is None else ema_alpha * float(number) + (
+                            1.0 - ema_alpha) * previous
+                        reward_ema[prefix] = smoothed
+                        values[f'{prefix}/{event_name}/reward_ema{smooth_span}'] = smoothed
             if not values:
                 continue
             raw_step = (event.get('metrics') or {}).get('step')
@@ -76,9 +94,21 @@ def main() -> None:
     parser.add_argument('--logdir', type=Path, default=Path('outputs/swanlab_async_rl'))
     parser.add_argument('--project', default='twinkle-async-rl')
     parser.add_argument('--experiment', default=None)
+    parser.add_argument(
+        '--smooth-span',
+        type=int,
+        default=0,
+        help='EMA span for train_step_done/reward; 0 disables smoothing',
+    )
     args = parser.parse_args()
     experiment = args.experiment or args.metrics_jsonl.stem
-    replay(args.metrics_jsonl, args.logdir, project=args.project, experiment=experiment)
+    replay(
+        args.metrics_jsonl,
+        args.logdir,
+        project=args.project,
+        experiment=experiment,
+        smooth_span=args.smooth_span,
+    )
 
 
 if __name__ == '__main__':
