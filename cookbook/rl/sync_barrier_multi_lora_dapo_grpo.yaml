@@ -36,7 +36,7 @@ sampler:
 lora:
   r: 16
   alpha: 32
-  dropout: 0.05
+  dropout: 0.0
   # Match the async DAPO baseline exactly. No scheduler means constant LR.
   learning_rate: 1.0e-6
 
@@ -66,7 +66,8 @@ lora_contexts:
     advantage:
       groups_per_batch: 1
     train:
-      groups_per_batch: 1
+      # Keep the effective optimizer batch aligned with the async run.
+      groups_per_batch: 4
       micro_batch_size: 1
 
   - tenant_id: tenant_b
@@ -93,7 +94,7 @@ lora_contexts:
     advantage:
       groups_per_batch: 1
     train:
-      groups_per_batch: 1
+      groups_per_batch: 4
       micro_batch_size: 1
 
 

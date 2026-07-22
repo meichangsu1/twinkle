@@ -13,7 +13,7 @@ from typing import Any
 
 from .context_manager import ContextStatus, LoraContextManager
 from .data_plane import TQDataPlane
-from .metrics import MetricsBuffer, training_policy_metrics
+from .metrics import MetricsBuffer, advantage_signal_metrics, training_policy_metrics
 from .scheduler import ContextScheduler, ScheduleCandidate, SchedulerConfig
 from .types import LoraContext, MetricEvent, PartitionAdmission, PreparedPartition
 
@@ -254,10 +254,17 @@ class AdvantageWorker(_Worker):
                     raise RuntimeError(f'advantage failed for {admission.partition_id}: {exc}') from exc
                 self.scheduler.on_success(candidate)
                 policy = await self.context_manager.get_rollout_policy.remote(admission.context)
-                self._record('advantage_done', admission.context, admission.partition_id, {
+                advantage_metrics = advantage_signal_metrics(
+                    batch.data['rewards'],
+                    advantages,
+                    num_generations=admission.num_generations,
+                )
+                advantage_metrics.update({
                     'sample_count': len(advantages),
-                    'advantage_latency_s': time.perf_counter() - started
-                }, policy.version)
+                    'advantage_latency_s': time.perf_counter() - started,
+                })
+                self._record(
+                    'advantage_done', admission.context, admission.partition_id, advantage_metrics, policy.version)
                 progressed = True
                 break
             if not progressed:
@@ -277,6 +284,9 @@ class TrainerWorker(_Worker):
                  keep_adapter_versions: int = 0,
                  initial_adapter_paths: dict[str, str] | None = None,
                  remove_adapter: Callable[[str], None] | None = None,
+                 evaluation_config: dict[str, dict[str, Any]] | None = None,
+                 evaluate_batch: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any],
+                                          dict[str, Any]] | None = None,
                  idle_delay_s: float = 0.05):
         super().__init__()
         self.data_plane = data_plane
@@ -294,6 +304,10 @@ class TrainerWorker(_Worker):
                 self._adapter_history[context_key].append(path)
         self.remove_adapter = remove_adapter or _remove_local_adapter
         self._adapter_removal_tasks: set[asyncio.Task[None]] = set()
+        self.evaluation_config = dict(evaluation_config or {})
+        self.evaluate_batch = evaluate_batch
+        self._evaluation_batches: dict[str, list[Sequence[dict[str, Any]]]] = {}
+        self._optimizer_steps: dict[str, int] = defaultdict(int)
 
     def drain_metrics(self) -> list[MetricEvent]:
         return self.metrics.drain()
@@ -354,6 +368,9 @@ class TrainerWorker(_Worker):
                 metrics.setdefault('sample_count', len(batch.data['input_ids']))
                 metrics['train_latency_s'] = time.perf_counter() - started
                 metrics.update(training_policy_metrics(batch.sample_tags, policy.version))
+                context_key = admission.context.key
+                self._optimizer_steps[context_key] += 1
+                metrics['optimizer_step'] = self._optimizer_steps[context_key]
                 self.scheduler.on_success(candidate)
                 self._record('train_step_done', admission.context, admission.partition_id, metrics, policy.version)
                 progressed = True
@@ -380,6 +397,7 @@ class TrainerWorker(_Worker):
             },
             policy.version,
         )
+        await self._evaluate_policy(admission, adapter_path, policy.version)
         clear_started = time.perf_counter()
         await self.data_plane.clear_partition(admission)
         tq_clear_latency_s = time.perf_counter() - clear_started
@@ -403,6 +421,53 @@ class TrainerWorker(_Worker):
                 'partition_finalize_latency_s': time.perf_counter() - finalize_started,
             },
             policy.version,
+        )
+
+    async def _evaluate_policy(self, admission: PartitionAdmission, adapter_path: str, policy_version: int) -> None:
+        config = self.evaluation_config.get(admission.context.key)
+        if config is None or self.evaluate_batch is None:
+            return
+        interval = int(config['interval'])
+        if policy_version % interval:
+            return
+
+        context_key = admission.context.key
+        if context_key not in self._evaluation_batches:
+            source = config['prompt_batches']
+            self._evaluation_batches[context_key] = list(source() if callable(source) else source)
+        batches = self._evaluation_batches[context_key]
+        started = time.perf_counter()
+        rewards: list[float] = []
+        completion_lengths: list[int] = []
+        prompt_count = 0
+        for batch in batches:
+            result = await asyncio.to_thread(
+                self.evaluate_batch,
+                batch,
+                admission,
+                adapter_path,
+                policy_version,
+                config['sampling_params'],
+            )
+            rewards.extend(float(value) for value in result['rewards'])
+            completion_lengths.extend(int(value) for value in result['completion_lengths'])
+            prompt_count += len(batch)
+        if not rewards:
+            raise ValueError(f'evaluation dataset is empty for {context_key}')
+        self._record(
+            'eval_done',
+            admission.context,
+            admission.partition_id,
+            {
+                'accuracy': sum(rewards) / len(rewards),
+                'sample_count': len(rewards),
+                'prompt_count': prompt_count,
+                'completion_length': sum(completion_lengths) / len(completion_lengths),
+                'eval_latency_s': time.perf_counter() - started,
+                'eval_dataset': config['dataset_name'],
+                'optimizer_step': self._optimizer_steps[context_key],
+            },
+            policy_version,
         )
 
     async def _prune_adapter_history(self, context: LoraContext) -> None:

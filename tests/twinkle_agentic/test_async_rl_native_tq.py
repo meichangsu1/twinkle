@@ -957,3 +957,52 @@ def test_checkpoint_retention_preserves_current_policy_and_history_window():
     assert prune_events[0].context == context
     assert prune_events[0].metrics['adapter_path'] == 'initial'
     assert prune_events[0].metrics['adapter_prune_latency_s'] >= 0
+
+
+def test_trainer_periodically_evaluates_published_policy():
+    context = _context()
+    manager = LoraContextManager()
+    manager.register_context(context, adapter_path='initial')
+    admission = manager.request_rollout_partition(context, target_groups=1, num_generations=2)
+    calls = []
+
+    def evaluate_batch(batch, evaluated_admission, adapter_path, policy_version, sampling_params):
+        calls.append((list(batch), evaluated_admission, adapter_path, policy_version, sampling_params))
+        return {
+            'rewards': [1.0] * len(batch),
+            'completion_lengths': [10] * len(batch),
+        }
+
+    worker = TrainerWorker(
+        context_manager=LocalActorHandle(manager),
+        data_plane=TQDataPlane(),
+        train_fn=lambda _data, _admission: {},
+        save_adapter=lambda _admission: 'unused',
+        groups_per_batch={context.key: 1},
+        scheduler=SchedulerConfig(ContextSchedulePolicy.STICKY, None),
+        evaluation_config={
+            context.key: {
+                'interval': 5,
+                'dataset_name': 'validation',
+                'prompt_batches': lambda: [[{'input_ids': [1]}], [{'input_ids': [2]}]],
+                'sampling_params': 'params',
+            }
+        },
+        evaluate_batch=evaluate_batch,
+    )
+    worker._optimizer_steps[context.key] = 50
+
+    async def evaluate():
+        await worker._evaluate_policy(admission, 'adapter-v4', 4)
+        await worker._evaluate_policy(admission, 'adapter-v5', 5)
+
+    asyncio.run(evaluate())
+    assert len(calls) == 2
+    events = [event for event in worker.drain_metrics() if event.event == 'eval_done']
+    assert len(events) == 1
+    assert events[0].policy_version == 5
+    assert events[0].metrics['accuracy'] == 1.0
+    assert events[0].metrics['prompt_count'] == 2
+    assert events[0].metrics['sample_count'] == 2
+    assert events[0].metrics['completion_length'] == 10
+    assert events[0].metrics['optimizer_step'] == 50

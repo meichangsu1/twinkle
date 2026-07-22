@@ -185,6 +185,22 @@ class VLLMSamplerTQ(vLLMSampler):
             'submitted_samples': sum(group.num_samples for group in groups),
         }
 
+    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    def evaluate(
+        self,
+        inputs: list[dict[str, Any]],
+        sampling_params: SamplingParams,
+        adapter_name: str,
+        adapter_path: str,
+    ) -> list[SampleResponse]:
+        """Synchronously evaluate one adapter without writing results to TQ."""
+        return super().sample(
+            inputs,
+            sampling_params,
+            adapter_name=adapter_name,
+            adapter_path=adapter_path,
+        )
+
     def _submit_in_loop(self, coro) -> Future:
         return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
 

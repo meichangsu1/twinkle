@@ -161,6 +161,22 @@ class GSM8KProcessor(Preprocessor):
         )
 
 
+class AReaLGSM8KProcessor(GSM8KProcessor):
+    """Match the prompt contract used by AReaL's GSM8K RL dataset."""
+
+    answer_instruction = '\nPlease put your final answer within \\boxed{}.'
+
+    def preprocess(self, row) -> Trajectory:
+        question = str(row['question']) + self.answer_instruction
+        # AReaL passes the complete GSM8K answer to math_verify, not only the
+        # numeric suffix following ``####``.
+        ground_truth = str(row.get('answer', ''))
+        return Trajectory(
+            messages=[Message(role='user', content=question)],
+            user_data=[('ground_truth', ground_truth)],
+        )
+
+
 class DAPOMathProcessor(Preprocessor):
     """Prepare BytedTsinghua-SIA/DAPO-Math-17k rows for on-policy rollout.
 

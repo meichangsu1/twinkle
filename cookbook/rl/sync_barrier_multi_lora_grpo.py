@@ -17,7 +17,8 @@ from typing import Any, Iterator, Sequence
 
 from omegaconf import OmegaConf
 
-from twinkle_agentic.async_rl.metrics import JSONLMetricsRecorder, rollout_performance_metrics
+from twinkle_agentic.async_rl.metrics import (JSONLMetricsRecorder, advantage_signal_metrics,
+                                              rollout_performance_metrics)
 from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, _prompt_batches,
                                                 _context_learning_rate, _native_fsdp_model_kwargs,
                                                 _reward_for_context, _sampler_data_parallel_size,
@@ -435,12 +436,20 @@ class SyncBarrierMultiLoraGRPO:
             groups = partition.state.advantage_groups_per_batch
             samples_per_batch = groups * admission.num_generations
             for start in range(0, len(partition.rows), samples_per_batch):
+                end = min(start + samples_per_batch, len(partition.rows))
                 self.metrics.record(
                     event='advantage_done',
                     context=admission.context,
                     partition_id=admission.partition_id,
                     policy_version=partition.state.policy_version,
-                    metrics={'sample_count': min(samples_per_batch, len(partition.rows) - start)},
+                    metrics={
+                        'sample_count': end - start,
+                        **advantage_signal_metrics(
+                            partition.rewards[start:end],
+                            partition.advantages[start:end],
+                            num_generations=admission.num_generations,
+                        ),
+                    },
                 )
 
     def _train_round(self, partitions: list[SyncPartition]) -> None:

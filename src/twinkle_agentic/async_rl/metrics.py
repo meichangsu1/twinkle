@@ -68,6 +68,49 @@ def training_policy_metrics(
     }
 
 
+def advantage_signal_metrics(
+    rewards: Sequence[float],
+    advantages: Sequence[float],
+    *,
+    num_generations: int,
+    zero_tolerance: float = 1e-8,
+) -> dict[str, float | int]:
+    """Summarize whether GRPO groups provide a useful learning signal."""
+    if num_generations <= 0:
+        raise ValueError(f'num_generations must be positive, got {num_generations}')
+    if len(rewards) != len(advantages):
+        raise ValueError(f'rewards and advantages must have equal length: {len(rewards)} != {len(advantages)}')
+    if len(rewards) == 0 or len(rewards) % num_generations:
+        raise ValueError(
+            f'advantage metrics require complete groups: sample_count={len(rewards)}, '
+            f'num_generations={num_generations}')
+
+    reward_values = [float(value) for value in rewards]
+    advantage_values = [float(value) for value in advantages]
+    group_reward_stds: list[float] = []
+    zero_advantage_groups = 0
+    for start in range(0, len(reward_values), num_generations):
+        group_rewards = reward_values[start:start + num_generations]
+        group_advantages = advantage_values[start:start + num_generations]
+        reward_mean = sum(group_rewards) / num_generations
+        group_reward_stds.append(
+            math.sqrt(sum((value - reward_mean)**2 for value in group_rewards) / num_generations))
+        if max(abs(value) for value in group_advantages) <= zero_tolerance:
+            zero_advantage_groups += 1
+
+    advantage_mean = sum(advantage_values) / len(advantage_values)
+    group_count = len(group_reward_stds)
+    return {
+        'group_count': group_count,
+        'group_reward_std_mean': sum(group_reward_stds) / group_count,
+        'zero_advantage_group_ratio': zero_advantage_groups / group_count,
+        'positive_advantage_ratio': sum(value > zero_tolerance for value in advantage_values) / len(advantage_values),
+        'advantage_mean': advantage_mean,
+        'advantage_std': math.sqrt(
+            sum((value - advantage_mean)**2 for value in advantage_values) / len(advantage_values)),
+    }
+
+
 class MetricsBuffer:
     """In-process business-event buffer owned by one worker actor."""
 

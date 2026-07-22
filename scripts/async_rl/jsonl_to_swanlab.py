@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -57,8 +58,10 @@ def replay(
     logged = 0
     reward_ema: dict[str, float] = {}
     ema_alpha = 2.0 / (smooth_span + 1) if smooth_span else 0.0
+    event_steps: dict[tuple[str, str], int] = defaultdict(int)
+    rows_by_step: dict[int, dict[str, float | int]] = defaultdict(dict)
     with input_path.open(encoding='utf-8') as stream:
-        for event_index, line in enumerate(stream, start=1):
+        for line in stream:
             if not line.strip():
                 continue
             event = json.loads(line)
@@ -80,11 +83,20 @@ def replay(
                 continue
             raw_step = (event.get('metrics') or {}).get('step')
             raw_step = raw_step if raw_step is not None else (event.get('metrics') or {}).get('optimizer_step')
-            step = int(_number(raw_step) or event_index)
-            run.log(values, step=step)
-            logged += 1
+            explicit_step = _number(raw_step)
+            if explicit_step is None:
+                counter_key = (str(context or 'global'), event_name)
+                event_steps[counter_key] += 1
+                step = event_steps[counter_key]
+            else:
+                step = int(explicit_step)
+            rows_by_step[step].update(values)
+
+    for step in sorted(rows_by_step):
+        run.log(rows_by_step[step], step=step)
+        logged += 1
     swanlab.finish()
-    print(f'logged {logged} events to {logdir}')
+    print(f'logged {logged} logical steps to {logdir}')
     return logged
 
 

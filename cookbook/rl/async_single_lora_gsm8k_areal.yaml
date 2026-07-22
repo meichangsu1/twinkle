@@ -1,0 +1,99 @@
+runtime:
+  model_id: ${oc.env:MODEL_ID,/nas/disk1/Qwen3-4B}
+  mode: ray
+  model_gpus: 1
+  sampler_gpus: 1
+  sampler_tp: 1
+  sampler_max_loras: 1
+  seed: 1
+  max_staleness: 0
+  max_steps: null
+  allow_partial_rollout: false
+  rollout_max_retries: 2
+  rollout_retry_delay_s: 0.5
+  keep_adapter_versions: 2
+  output_dir: output/async_single_lora_gsm8k_areal
+  metrics_path: outputs/async_rl/single_lora_gsm8k_areal_metrics.jsonl
+
+template:
+  cls: Template
+  enable_thinking: false
+
+model:
+  strategy: native_fsdp
+  fsdp_config:
+    reshard_after_forward: true
+  sequence_parallel_size: 1
+  padding_free: false
+  max_length: 2048
+
+sampler:
+  max_model_len: 2048
+  gpu_memory_utilization: 0.8
+  max_num_seqs: 64
+  max_num_batched_tokens: 8192
+  enforce_eager: false
+
+tq:
+  polling_mode: true
+  storage_units: 2
+
+scheduler:
+  rollout: {policy: round_robin, max_consecutive_units: 1}
+  advantage: {policy: oldest_partition, max_consecutive_units: 1}
+  train: {policy: sticky, max_consecutive_units: null}
+
+evaluation:
+  enabled: true
+  interval: 10
+  batch_size: 16
+  sampling_params:
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 1.0
+
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.0
+  learning_rate: 1.7e-4
+
+lora_contexts:
+  - tenant_id: tenant_single
+    training_run_id: gsm8k_areal_pk
+    adapter_name: gsm8k_areal_pk_lora
+    reward_type: math_verify_accuracy
+    dataset:
+      dataset_id: ${oc.env:GSM8K_TRAIN_DATASET_ID}
+      subset_name: main
+      split: train
+      data_num: 2000
+      max_length: 1024
+      processor: AReaLGSM8KProcessor
+    eval_dataset:
+      name: gsm8k/test
+      dataset_id: ${oc.env:GSM8K_TEST_DATASET_ID}
+      subset_name: main
+      split: test
+      data_num: null
+      max_length: 1024
+      processor: AReaLGSM8KProcessor
+      reward_type: math_verify_accuracy
+    rollout:
+      batch_size: 16
+      num_generations: 4
+      max_tokens: 1024
+      temperature: 1.0
+      top_p: 1.0
+    advantage:
+      groups_per_batch: 16
+    train:
+      groups_per_batch: 16
+      micro_batch_size: 1
+
+# CUDA_VISIBLE_DEVICES=0,1 \
+# MODEL_ID=/nas/disk1/Qwen3-4B \
+# GSM8K_TRAIN_DATASET_ID=/path/to/train.parquet \
+# GSM8K_TEST_DATASET_ID=/path/to/test.parquet \
+# python3 cookbook/rl/async_multi_lora_grpo.py \
+#   --config cookbook/rl/async_single_lora_gsm8k_areal.yaml

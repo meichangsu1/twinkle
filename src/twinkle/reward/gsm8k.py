@@ -1,6 +1,7 @@
 import re
 from typing import Any, Dict, List
 
+from twinkle.data_format import user_data_get
 from twinkle.reward.base import Reward
 
 
@@ -78,6 +79,33 @@ class GSM8KAccuracyReward(Reward):
 
             rewards.append(1.0 if correct else 0.0)
         return rewards
+
+
+class MathVerifyAccuracyReward(Reward):
+    """Use the same math-verify parsing and equivalence check as AReaL."""
+
+    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+        from math_verify import parse, verify
+
+        rewards = []
+        for trajectory in trajectories:
+            completion = ''
+            for message in reversed(trajectory.get('messages', [])):
+                if message.get('role') == 'assistant':
+                    completion = str(message.get('content', ''))
+                    break
+            ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', ''))
+            rewards.append(float(verify(parse(completion), parse(ground_truth))))
+        return rewards
+
+    def metric_payload(
+        self,
+        trajectories: List[Dict[str, Any]],
+        *,
+        rewards: List[float],
+        **kwargs,
+    ) -> Dict[str, float]:
+        return {'accuracy_reward': sum(rewards) / len(rewards)}
 
 
 class GSM8KBrevityReward(Reward):

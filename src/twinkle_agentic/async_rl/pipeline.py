@@ -8,7 +8,7 @@ import math
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, Sequence
 
 from .context_manager import LoraContextManager
 from .data_plane import TQDataPlane
@@ -250,7 +250,10 @@ class AsyncMultiLoraGRPOPipeline:
         train_groups_per_batch: dict[str, int] = {}
         micro_batch_sizes: dict[str, int] = {}
         rewards: dict[str, Any] = {}
+        evaluation_config: dict[str, dict[str, Any]] = {}
+        evaluation_rewards: dict[str, Any] = {}
         initial_paths: dict[str, str] = {}
+        global_evaluation = dict(raw_config.get('evaluation') or {})
         for item in raw_config['lora_contexts']:
             train = item['train']
             context = LoraContext(
@@ -332,6 +335,44 @@ class AsyncMultiLoraGRPOPipeline:
                 reward_config=item.get('reward'),
                 rollout_config=rollout,
             )
+            if bool(global_evaluation.get('enabled', False)):
+                eval_dataset = item.get('eval_dataset')
+                if eval_dataset is None:
+                    raise ValueError(f'eval_dataset is required for periodic evaluation of {context.key}')
+                eval_batch_size = int(global_evaluation.get('batch_size', 16))
+                eval_interval = int(global_evaluation.get('interval', 1))
+                if eval_batch_size <= 0 or eval_interval <= 0:
+                    raise ValueError('evaluation.batch_size and evaluation.interval must be positive')
+                eval_sampling = dict(global_evaluation.get('sampling_params') or {})
+                evaluation_config[context.key] = {
+                    'interval': eval_interval,
+                    'dataset_name': eval_dataset.get('name', eval_dataset['dataset_id']),
+                    'prompt_batches': partial(
+                        _prompt_batches,
+                        eval_dataset,
+                        model_id=runtime['model_id'],
+                        batch_size=eval_batch_size,
+                        template_cls=template_cls,
+                        enable_thinking=enable_thinking,
+                        full_batches_only=False,
+                    ),
+                    'sampling_params': SamplingParams(
+                        max_tokens=int(eval_sampling.get('max_tokens', rollout['max_tokens'])),
+                        temperature=float(eval_sampling.get('temperature', 0.0)),
+                        top_p=float(eval_sampling.get('top_p', 1.0)),
+                        repetition_penalty=float(eval_sampling.get('repetition_penalty', 1.0)),
+                        logprobs=0,
+                        num_samples=1,
+                    ),
+                }
+                eval_context = LoraContext(
+                    context.tenant_id,
+                    context.training_run_id,
+                    context.base_model_id,
+                    context.adapter_name,
+                    eval_dataset['reward_type'],
+                )
+                evaluation_rewards[context.key] = _reward_for_context(eval_context)
             initial_paths[context.key] = model.save(
                 f'async-{context.adapter_name}-initial',
                 output_dir=runtime['output_dir'],
@@ -361,6 +402,7 @@ class AsyncMultiLoraGRPOPipeline:
                 'max_num_seqs': int(sampler_config['max_num_seqs']),
                 'max_num_batched_tokens': int(sampler_config['max_num_batched_tokens']),
                 'enforce_eager': bool(sampler_config['enforce_eager']),
+                'seed': int(runtime.get('seed', 1)),
             },
             reward_registry=rewards,
             context_manager=manager,
@@ -407,6 +449,8 @@ class AsyncMultiLoraGRPOPipeline:
             scheduler=_scheduler(raw_config['scheduler']['train']),
             keep_adapter_versions=runtime['keep_adapter_versions'],
             initial_adapter_paths=initial_paths,
+            evaluation_config=evaluation_config,
+            evaluate_batch=partial(_evaluate_batch, sampler, evaluation_rewards) if evaluation_config else None,
         )
         metrics = JSONLMetricsRecorder(runtime['metrics_path'], run_id='async_multi_lora_grpo', mode='ray')
         return cls(
@@ -527,6 +571,7 @@ def _prompt_batches(
     batch_size: int,
     template_cls: str,
     enable_thinking: bool,
+    full_batches_only: bool = True,
 ):
     """Create a lazy, full-batch-only prompt source for one context."""
     from twinkle.dataloader import DataLoader
@@ -556,17 +601,47 @@ def _prompt_batches(
             processor = processor_cls()
         dataset.map(processor)
         dataset.encode(add_generation_prompt=True)
-        loader = DataLoader(dataset=dataset, batch_size=batch_size, min_batch_size=batch_size)
+        loader = DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            min_batch_size=batch_size if full_batches_only else 1,
+        )
         remaining = data_num
         remaining = None if remaining is None else int(remaining)
         for batch in loader:
-            if len(batch) != batch_size or (remaining is not None and remaining < batch_size):
+            if full_batches_only and (len(batch) != batch_size or (remaining is not None and remaining < batch_size)):
                 return
             yield batch
             if remaining is not None:
                 remaining -= batch_size
 
     return batches()
+
+
+def _evaluate_batch(
+    sampler: Any,
+    reward_registry: dict[str, Any],
+    prompts: Sequence[dict[str, Any]],
+    admission: PartitionAdmission,
+    adapter_path: str,
+    policy_version: int,
+    sampling_params: Any,
+) -> dict[str, Any]:
+    from .vllm_sampler_tq import _sample_responses_to_rollout_rows
+
+    responses = sampler.evaluate(
+        list(prompts),
+        sampling_params,
+        admission.context.adapter_name,
+        adapter_path,
+    )
+    rows = _sample_responses_to_rollout_rows(list(prompts), responses, policy_version=policy_version)
+    reward_fn = reward_registry[admission.context.key]
+    rewards = list(reward_fn(rows, context=admission.context))
+    return {
+        'rewards': rewards,
+        'completion_lengths': [int(row['completion_length']) for row in rows],
+    }
 
 
 def _reward_for_context(
@@ -576,11 +651,13 @@ def _reward_for_context(
     rollout_config: dict[str, Any] | None = None,
 ) -> Any:
     from twinkle.reward import (BoxedMathAccuracyReward, DAPOMathAccuracyReward, DAPOMathReward,
-                                GSM8KAccuracyBrevityReward, GSM8KAccuracyReward)
+                                GSM8KAccuracyBrevityReward, GSM8KAccuracyReward, MathVerifyAccuracyReward)
     if context.reward_type in {'gsm8k', 'gsm8k_accuracy'}:
         return GSM8KAccuracyReward()
     if context.reward_type == 'gsm8k_accuracy_brevity':
         return GSM8KAccuracyBrevityReward()
+    if context.reward_type == 'math_verify_accuracy':
+        return MathVerifyAccuracyReward()
     if context.reward_type == 'dapo_math_accuracy':
         return DAPOMathAccuracyReward()
     if context.reward_type == 'dapo_math':

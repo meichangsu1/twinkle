@@ -2,7 +2,30 @@ from __future__ import annotations
 
 import json
 
-from twinkle_agentic.async_rl.metrics import JSONLMetricsRecorder, rollout_performance_metrics
+import pytest
+
+from twinkle_agentic.async_rl.metrics import (JSONLMetricsRecorder, advantage_signal_metrics,
+                                              rollout_performance_metrics)
+
+
+def test_advantage_signal_metrics_report_zero_and_nonzero_groups():
+    metrics = advantage_signal_metrics(
+        rewards=[1.0, 1.0, 0.0, 1.0],
+        advantages=[0.0, 0.0, -1.0, 1.0],
+        num_generations=2,
+    )
+
+    assert metrics['group_count'] == 2
+    assert metrics['group_reward_std_mean'] == pytest.approx(0.25)
+    assert metrics['zero_advantage_group_ratio'] == pytest.approx(0.5)
+    assert metrics['positive_advantage_ratio'] == pytest.approx(0.25)
+    assert metrics['advantage_mean'] == pytest.approx(0.0)
+    assert metrics['advantage_std'] == pytest.approx(2**-0.5)
+
+
+def test_advantage_signal_metrics_reject_incomplete_groups():
+    with pytest.raises(ValueError, match='complete groups'):
+        advantage_signal_metrics([1.0, 0.0, 1.0], [1.0, -1.0, 0.0], num_generations=2)
 
 
 def test_rollout_performance_metrics_include_tokens_and_truncation():
