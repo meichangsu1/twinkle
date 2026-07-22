@@ -100,7 +100,7 @@ class MathVerifyAccuracyReward(Reward):
             # which is only legal on the Python main thread.
             answer = parse(completion, parsing_timeout=None)
             gold = parse(ground_truth, parsing_timeout=None)
-            rewards.append(float(verify(answer, gold)))
+            rewards.append(float(verify(answer, gold, timeout_seconds=None)))
         return rewards
 
     def metric_payload(

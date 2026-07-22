@@ -11,8 +11,8 @@ def test_math_verify_reward_uses_complete_completion_and_ground_truth(monkeypatc
         calls.append(('parse', value, parsing_timeout))
         return f'parsed:{value}'
 
-    def verify(answer, gold):
-        calls.append(('verify', answer, gold))
+    def verify(answer, gold, *, timeout_seconds):
+        calls.append(('verify', answer, gold, timeout_seconds))
         return True
 
     monkeypatch.setitem(sys.modules, 'math_verify', SimpleNamespace(parse=parse, verify=verify))
@@ -29,5 +29,5 @@ def test_math_verify_reward_uses_complete_completion_and_ground_truth(monkeypatc
     assert calls == [
         ('parse', 'reasoning \\boxed{33}', None),
         ('parse', 'reference reasoning\n#### 33', None),
-        ('verify', 'parsed:reasoning \\boxed{33}', 'parsed:reference reasoning\n#### 33'),
+        ('verify', 'parsed:reasoning \\boxed{33}', 'parsed:reference reasoning\n#### 33', None),
     ]
