@@ -91,59 +91,55 @@ lora_contexts:
       groups_per_batch: 16
       micro_batch_size: 1
 
-# CUDA_VISIBLE_DEVICES=0,1 \
-# MODEL_ID=/nas/disk1/Qwen3-4B \
-# GSM8K_TRAIN_DATASET_ID=/path/to/train.parquet \
-# GSM8K_TEST_DATASET_ID=/path/to/test.parquet \
-# python3 cookbook/rl/async_multi_lora_grpo.py \
-#   --config cookbook/rl/async_single_lora_gsm8k_areal.yaml
-# cd /Users/linjiajia/project/AReaL
+# cd /model/ljl/project/remote-git/AReaL
 
-# CUDA_VISIBLE_DEVICES=0,1 \
+# export VIRTUAL_ENV=/opt/.venv
+# export PATH=/opt/.venv/bin:$PATH
+# export CUDA_VISIBLE_DEVICES=0,1
+# export AREAL_MODEL_PATH=/nas/disk1/Qwen3-4B
+# export AREAL_ADMIN_API_KEY="$(
+#   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+# )"
+
 # python3 examples/math/gsm8k_rl.py \
 #   --config examples/math/gsm8k_grpo_lora.yaml \
 #   scheduler.type=local \
+#   rollout.agent.admin_api_key="$AREAL_ADMIN_API_KEY" \
 #   seed=1 \
 #   cluster.n_nodes=1 \
 #   cluster.n_gpus_per_node=2 \
-#   actor.path=/nas/disk1/Qwen3-4B \
-#   tokenizer_path=/nas/disk1/Qwen3-4B \
-#   sglang.model_path=/nas/disk1/Qwen3-4B \
-#   vllm.model=/nas/disk1/Qwen3-4B \
-#   rollout.backend=sglang:d1 \
+#   actor.path="$AREAL_MODEL_PATH" \
+#   rollout.backend=vllm:d1 \
 #   actor.backend=fsdp:d1 \
-#   ref.backend=fsdp:d1 \
 #   train_dataset.batch_size=16 \
 #   train_dataset.shuffle=false \
-#   train_dataset.drop_last=true \
 #   total_train_epochs=1 \
 #   +total_train_steps=125 \
+#   rollout.consumer_batch_size=16 \
+#   rollout.max_concurrent_rollouts=16 \
+#   rollout.max_head_offpolicyness=0 \
 #   gconfig.n_samples=4 \
 #   gconfig.max_new_tokens=1024 \
 #   gconfig.max_tokens=2048 \
 #   gconfig.temperature=1.0 \
 #   +gconfig.top_p=1.0 \
+#   actor.mb_spec.max_tokens_per_mb=4096 \
 #   actor.use_lora=true \
 #   actor.lora_rank=16 \
 #   actor.lora_alpha=16 \
 #   actor.optimizer.lr=1.7e-4 \
 #   actor.optimizer.weight_decay=0.01 \
-#   actor.optimizer.beta1=0.9 \
-#   actor.optimizer.beta2=0.999 \
-#   actor.optimizer.eps=1e-8 \
-#   actor.optimizer.lr_scheduler_type=constant \
 #   actor.eps_clip=0.2 \
 #   actor.ppo_n_minibatches=1 \
 #   actor.reward_scaling=1.0 \
 #   actor.reward_bias=0.0 \
-#   actor.reward_norm.eps=1e-8 \
 #   actor.adv_norm=null \
 #   actor.kl_ctl=0.0 \
 #   actor.recompute_logprob=false \
 #   actor.use_decoupled_loss=false \
 #   actor.rejection_sampling=null \
-#   actor.importance_sampling_level=token \
-#   rollout.max_head_offpolicyness=0 \
+#   vllm.max_model_len=2048 \
+#   vllm.gpu_memory_utilization=0.8 \
 #   valid_dataset=null \
 #   evaluator.freq_epochs=null \
 #   evaluator.freq_steps=null \
