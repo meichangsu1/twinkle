@@ -7,8 +7,8 @@ from twinkle.reward import MathVerifyAccuracyReward
 def test_math_verify_reward_uses_complete_completion_and_ground_truth(monkeypatch):
     calls = []
 
-    def parse(value):
-        calls.append(('parse', value))
+    def parse(value, *, parsing_timeout):
+        calls.append(('parse', value, parsing_timeout))
         return f'parsed:{value}'
 
     def verify(answer, gold):
@@ -27,7 +27,7 @@ def test_math_verify_reward_uses_complete_completion_and_ground_truth(monkeypatc
     reward = MathVerifyAccuracyReward()
     assert reward([trajectory]) == [1.0]
     assert calls == [
-        ('parse', 'reasoning \\boxed{33}'),
-        ('parse', 'reference reasoning\n#### 33'),
+        ('parse', 'reasoning \\boxed{33}', None),
+        ('parse', 'reference reasoning\n#### 33', None),
         ('verify', 'parsed:reasoning \\boxed{33}', 'parsed:reference reasoning\n#### 33'),
     ]

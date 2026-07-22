@@ -95,7 +95,12 @@ class MathVerifyAccuracyReward(Reward):
                     completion = str(message.get('content', ''))
                     break
             ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', ''))
-            rewards.append(float(verify(parse(completion), parse(ground_truth))))
+            # Rollout rewards run on the sampler's background event-loop
+            # thread. math-verify's default parser timeout uses signal.alarm,
+            # which is only legal on the Python main thread.
+            answer = parse(completion, parsing_timeout=None)
+            gold = parse(ground_truth, parsing_timeout=None)
+            rewards.append(float(verify(answer, gold)))
         return rewards
 
     def metric_payload(

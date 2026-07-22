@@ -44,7 +44,7 @@ scheduler:
   train: {policy: sticky, max_consecutive_units: null}
 
 evaluation:
-  enabled: true
+  enabled: false
   interval: 10
   batch_size: 16
   sampling_params:
@@ -97,3 +97,54 @@ lora_contexts:
 # GSM8K_TEST_DATASET_ID=/path/to/test.parquet \
 # python3 cookbook/rl/async_multi_lora_grpo.py \
 #   --config cookbook/rl/async_single_lora_gsm8k_areal.yaml
+# cd /Users/linjiajia/project/AReaL
+
+# CUDA_VISIBLE_DEVICES=0,1 \
+# python3 examples/math/gsm8k_rl.py \
+#   --config examples/math/gsm8k_grpo_lora.yaml \
+#   scheduler.type=local \
+#   seed=1 \
+#   cluster.n_nodes=1 \
+#   cluster.n_gpus_per_node=2 \
+#   actor.path=/nas/disk1/Qwen3-4B \
+#   tokenizer_path=/nas/disk1/Qwen3-4B \
+#   sglang.model_path=/nas/disk1/Qwen3-4B \
+#   vllm.model=/nas/disk1/Qwen3-4B \
+#   rollout.backend=sglang:d1 \
+#   actor.backend=fsdp:d1 \
+#   ref.backend=fsdp:d1 \
+#   train_dataset.batch_size=16 \
+#   train_dataset.shuffle=false \
+#   train_dataset.drop_last=true \
+#   total_train_epochs=1 \
+#   +total_train_steps=125 \
+#   gconfig.n_samples=4 \
+#   gconfig.max_new_tokens=1024 \
+#   gconfig.max_tokens=2048 \
+#   gconfig.temperature=1.0 \
+#   +gconfig.top_p=1.0 \
+#   actor.use_lora=true \
+#   actor.lora_rank=16 \
+#   actor.lora_alpha=16 \
+#   actor.optimizer.lr=1.7e-4 \
+#   actor.optimizer.weight_decay=0.01 \
+#   actor.optimizer.beta1=0.9 \
+#   actor.optimizer.beta2=0.999 \
+#   actor.optimizer.eps=1e-8 \
+#   actor.optimizer.lr_scheduler_type=constant \
+#   actor.eps_clip=0.2 \
+#   actor.ppo_n_minibatches=1 \
+#   actor.reward_scaling=1.0 \
+#   actor.reward_bias=0.0 \
+#   actor.reward_norm.eps=1e-8 \
+#   actor.adv_norm=null \
+#   actor.kl_ctl=0.0 \
+#   actor.recompute_logprob=false \
+#   actor.use_decoupled_loss=false \
+#   actor.rejection_sampling=null \
+#   actor.importance_sampling_level=token \
+#   rollout.max_head_offpolicyness=0 \
+#   valid_dataset=null \
+#   evaluator.freq_epochs=null \
+#   evaluator.freq_steps=null \
+#   evaluator.freq_secs=null
