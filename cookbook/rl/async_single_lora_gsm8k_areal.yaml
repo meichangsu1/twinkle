@@ -32,7 +32,6 @@ sampler:
   max_model_len: 2048
   gpu_memory_utilization: 0.8
   max_num_seqs: 64
-  max_num_batched_tokens: 8192
   enforce_eager: false
 
 tq:
@@ -95,15 +94,15 @@ lora_contexts:
 
 
 
-cd /model/ljl/project/remote-git/AReaL
+# cd /model/ljl/project/remote-git/AReaL
 
-export VIRTUAL_ENV=/opt/.venv
-export PATH=/opt/.venv/bin:$PATH
-export CUDA_VISIBLE_DEVICES=0,1
-export AREAL_MODEL_PATH=/nas/disk1/Qwen3-4B
-export AREAL_ADMIN_API_KEY="$(
-  python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-)"
+# export VIRTUAL_ENV=/opt/.venv
+# export PATH=/opt/.venv/bin:$PATH
+# export CUDA_VISIBLE_DEVICES=0,1
+# export AREAL_MODEL_PATH=/nas/disk1/Qwen3-4B
+# export AREAL_ADMIN_API_KEY="$(
+#   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+# )"
 
 # python3 examples/math/gsm8k_rl.py \
 #   --config examples/math/gsm8k_grpo_lora.yaml \
@@ -148,11 +147,10 @@ export AREAL_ADMIN_API_KEY="$(
 #   vllm.max_model_len=2048 \
 #   vllm.gpu_memory_utilization=0.8 \
 #   vllm.max_num_seqs=64 \
-#   +vllm.max_num_batched_tokens=8192 \
 #   vllm.max_loras=1 \
 #   vllm.enforce_eager=false \
 #   valid_dataset=null \
 #   evaluator.freq_epochs=null \
 #   evaluator.freq_steps=null \
 #   evaluator.freq_secs=null \
-#   stats_logger.tensorboard.path=/tmp/areal/tensorboard/gsm8k-grpo/trial0 
+#   stats_logger.tensorboard.path=/tmp/areal/tensorboard/gsm8k-grpo/trial0
