@@ -21,6 +21,7 @@ template:
 
 model:
   strategy: native_fsdp
+  attn_implementation: flash_attention_2
   fsdp_config:
     reshard_after_forward: true
   sequence_parallel_size: 1
@@ -91,15 +92,18 @@ lora_contexts:
       groups_per_batch: 16
       micro_batch_size: 1
 
-# cd /model/ljl/project/remote-git/AReaL
 
-# export VIRTUAL_ENV=/opt/.venv
-# export PATH=/opt/.venv/bin:$PATH
-# export CUDA_VISIBLE_DEVICES=0,1
-# export AREAL_MODEL_PATH=/nas/disk1/Qwen3-4B
-# export AREAL_ADMIN_API_KEY="$(
-#   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-# )"
+
+
+cd /model/ljl/project/remote-git/AReaL
+
+export VIRTUAL_ENV=/opt/.venv
+export PATH=/opt/.venv/bin:$PATH
+export CUDA_VISIBLE_DEVICES=0,1
+export AREAL_MODEL_PATH=/nas/disk1/Qwen3-4B
+export AREAL_ADMIN_API_KEY="$(
+  python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+)"
 
 # python3 examples/math/gsm8k_rl.py \
 #   --config examples/math/gsm8k_grpo_lora.yaml \
@@ -109,8 +113,10 @@ lora_contexts:
 #   cluster.n_nodes=1 \
 #   cluster.n_gpus_per_node=2 \
 #   actor.path="$AREAL_MODEL_PATH" \
+#   actor.attn_impl=flash_attention_2 \
 #   rollout.backend=vllm:d1 \
 #   actor.backend=fsdp:d1 \
+#   train_dataset.path=openai/gsm8k \
 #   train_dataset.batch_size=16 \
 #   train_dataset.shuffle=false \
 #   total_train_epochs=1 \
@@ -129,6 +135,7 @@ lora_contexts:
 #   actor.lora_alpha=16 \
 #   actor.optimizer.lr=1.7e-4 \
 #   actor.optimizer.weight_decay=0.01 \
+#   actor.optimizer.lr_scheduler_type=constant \
 #   actor.eps_clip=0.2 \
 #   actor.ppo_n_minibatches=1 \
 #   actor.reward_scaling=1.0 \
@@ -140,7 +147,12 @@ lora_contexts:
 #   actor.rejection_sampling=null \
 #   vllm.max_model_len=2048 \
 #   vllm.gpu_memory_utilization=0.8 \
+#   vllm.max_num_seqs=64 \
+#   +vllm.max_num_batched_tokens=8192 \
+#   vllm.max_loras=1 \
+#   vllm.enforce_eager=false \
 #   valid_dataset=null \
 #   evaluator.freq_epochs=null \
 #   evaluator.freq_steps=null \
-#   evaluator.freq_secs=null
+#   evaluator.freq_secs=null \
+#   stats_logger.tensorboard.path=/tmp/areal/tensorboard/gsm8k-grpo/trial0 
