@@ -93,30 +93,28 @@ lora_contexts:
       packing_algorithm: ffd
 
 
-
-
-# cd /model/ljl/project/remote-git/AReaL
-
 # export VIRTUAL_ENV=/opt/.venv
 # export PATH=/opt/.venv/bin:$PATH
-# export CUDA_VISIBLE_DEVICES=0,1
+# export CUDA_VISIBLE_DEVICES=2,3
 # export AREAL_MODEL_PATH=/nas/disk1/Qwen3-4B
 # export AREAL_ADMIN_API_KEY="$(
 #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 # )"
+# export AREAL_TRIAL="pk-$(date +%Y%m%d-%H%M%S)"
 
 # python3 examples/math/gsm8k_rl.py \
 #   --config examples/math/gsm8k_grpo_lora.yaml \
 #   scheduler.type=local \
-#   rollout.agent.admin_api_key="$AREAL_ADMIN_API_KEY" \
+#   +rollout.agent.admin_api_key="$AREAL_ADMIN_API_KEY" \
 #   seed=1 \
 #   cluster.n_nodes=1 \
 #   cluster.n_gpus_per_node=2 \
 #   actor.path="$AREAL_MODEL_PATH" \
-#   actor.attn_impl=flash_attention_2 \
+#   +actor.attn_impl=flash_attention_2 \
 #   rollout.backend=vllm:d1 \
 #   actor.backend=fsdp:d1 \
-#   train_dataset.path=openai/gsm8k \
+#   train_dataset.path=/model/ljl/project/data/gsm8k \
+#   valid_dataset.path=/model/ljl/project/data/gsm8k \
 #   train_dataset.batch_size=16 \
 #   train_dataset.shuffle=false \
 #   total_train_epochs=1 \
@@ -129,7 +127,8 @@ lora_contexts:
 #   gconfig.max_tokens=2048 \
 #   gconfig.temperature=1.0 \
 #   +gconfig.top_p=1.0 \
-#   actor.mb_spec.max_tokens_per_mb=4096 \
+#   +actor.mb_spec.n_mbs=64 \
+#   ++actor.mb_spec.max_tokens_per_mb=null \
 #   actor.use_lora=true \
 #   actor.lora_rank=16 \
 #   actor.lora_alpha=16 \
@@ -145,13 +144,17 @@ lora_contexts:
 #   actor.recompute_logprob=false \
 #   actor.use_decoupled_loss=false \
 #   actor.rejection_sampling=null \
-#   vllm.max_model_len=2048 \
-#   vllm.gpu_memory_utilization=0.8 \
-#   vllm.max_num_seqs=64 \
-#   vllm.max_loras=1 \
-#   vllm.enforce_eager=false \
-#   valid_dataset=null \
+#   ++vllm.max_model_len=2048 \
+#   ++vllm.gpu_memory_utilization=0.8 \
+#   ++vllm.max_num_seqs=64 \
+#   ++vllm.max_loras=1 \
+#   ++vllm.enforce_eager=false \
 #   evaluator.freq_epochs=null \
 #   evaluator.freq_steps=null \
 #   evaluator.freq_secs=null \
-#   stats_logger.tensorboard.path=/tmp/areal/tensorboard/gsm8k-grpo/trial0
+#   trial_name="$AREAL_TRIAL" \
+#   +stats_logger.tensorboard.path="/tmp/areal/tensorboard/gsm8k-grpo/$AREAL_TRIAL" \
+#   cluster.fileroot=/nas/disk1/areal-experiments \
+#   saver.freq_epochs=null \
+#   saver.freq_steps=125 \
+#   saver.freq_secs=null
