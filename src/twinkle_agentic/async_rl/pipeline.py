@@ -8,7 +8,7 @@ import math
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from .context_manager import LoraContextManager
 from .data_plane import TQDataPlane
@@ -21,6 +21,15 @@ from .workers import AdvantageWorker, RolloutWorker, TrainerWorker
 @dataclass(frozen=True)
 class AsyncMultiLoraGRPOConfig:
     metrics_drain_interval_s: float = 1.0
+
+
+@dataclass(frozen=True)
+class TrainBatchConfig:
+    mini_batch_size: int
+    micro_batch_size: int
+    dynamic_batching: bool = False
+    max_tokens_per_micro_batch: int | None = None
+    packing_algorithm: Literal['ffd', 'kk'] = 'ffd'
 
 
 def _sampler_data_parallel_size(sampler_gpus: int, sampler_tp: int) -> int:
@@ -95,18 +104,15 @@ def _validate_context_batch_config(
     *,
     rollout_groups: int,
     num_generations: int,
-    advantage_groups: int,
-    train_groups: int,
-    micro_batch_size: int,
+    train: TrainBatchConfig,
     sampler_dp: int,
     model_dp: int,
 ) -> None:
     values = {
         'rollout.batch_size': rollout_groups,
         'rollout.num_generations': num_generations,
-        'advantage.groups_per_batch': advantage_groups,
-        'train.groups_per_batch': train_groups,
-        'train.micro_batch_size': micro_batch_size,
+        'train.mini_batch_size': train.mini_batch_size,
+        'train.micro_batch_size': train.micro_batch_size,
     }
     for name, value in values.items():
         if value <= 0:
@@ -114,20 +120,31 @@ def _validate_context_batch_config(
     if rollout_groups % sampler_dp:
         raise ValueError(f'rollout.batch_size for {context_key} must be divisible by sampler DP size '
                          f'({sampler_dp}), got {rollout_groups}')
-    if rollout_groups % advantage_groups:
-        raise ValueError(f'rollout.batch_size for {context_key} must be divisible by '
-                         f'advantage.groups_per_batch: {rollout_groups} % {advantage_groups} != 0')
-    if rollout_groups % train_groups:
-        raise ValueError(f'rollout.batch_size for {context_key} must be divisible by train.groups_per_batch: '
-                         f'{rollout_groups} % {train_groups} != 0')
-    train_samples = train_groups * num_generations
-    if train_samples % model_dp:
-        raise ValueError(f'train batch for {context_key} has {train_samples} samples and must be divisible by '
+    partition_samples = rollout_groups * num_generations
+    if partition_samples % train.mini_batch_size:
+        raise ValueError(
+            f'partition for {context_key} has {partition_samples} samples and must be divisible by '
+            f'train.mini_batch_size={train.mini_batch_size}')
+    if train.mini_batch_size % num_generations:
+        raise ValueError(
+            f'train.mini_batch_size for {context_key} must preserve complete prompt groups: '
+            f'{train.mini_batch_size} % {num_generations} != 0')
+    if train.mini_batch_size % model_dp:
+        raise ValueError(f'train.mini_batch_size for {context_key} must be divisible by '
                          f'model DP size {model_dp}')
-    samples_per_rank = train_samples // model_dp
-    if micro_batch_size > samples_per_rank:
+    samples_per_rank = train.mini_batch_size // model_dp
+    if train.micro_batch_size > samples_per_rank:
         raise ValueError(f'train.micro_batch_size for {context_key} must not exceed the per-rank train batch '
-                         f'({samples_per_rank}), got {micro_batch_size}')
+                         f'({samples_per_rank}), got {train.micro_batch_size}')
+    if train.dynamic_batching:
+        if train.max_tokens_per_micro_batch is None or train.max_tokens_per_micro_batch <= 0:
+            raise ValueError(
+                f'train.max_tokens_per_micro_batch for {context_key} must be positive when '
+                'train.dynamic_batching=true')
+    if train.packing_algorithm not in ('ffd', 'kk'):
+        raise ValueError(
+            f'train.packing_algorithm for {context_key} must be ffd or kk, '
+            f'got {train.packing_algorithm!r}')
 
 
 class AsyncMultiLoraGRPOPipeline:
@@ -246,9 +263,7 @@ class AsyncMultiLoraGRPOPipeline:
         contexts: list[LoraContext] = []
         prompt_sources: dict[str, Any] = {}
         rollout_config: dict[str, dict[str, Any]] = {}
-        advantage_groups_per_batch: dict[str, int] = {}
-        train_groups_per_batch: dict[str, int] = {}
-        micro_batch_sizes: dict[str, int] = {}
+        train_batch_configs: dict[str, TrainBatchConfig] = {}
         rewards: dict[str, Any] = {}
         evaluation_config: dict[str, dict[str, Any]] = {}
         evaluation_rewards: dict[str, Any] = {}
@@ -286,19 +301,23 @@ class AsyncMultiLoraGRPOPipeline:
             )
 
             rollout = item['rollout']
-            advantage = item['advantage']
             rollout_batch_size = int(rollout['batch_size'])
             num_generations = int(rollout['num_generations'])
-            advantage_groups = int(advantage['groups_per_batch'])
-            train_groups = int(train['groups_per_batch'])
-            micro_batch_size = int(train['micro_batch_size'])
+            train_batch_config = TrainBatchConfig(
+                mini_batch_size=int(train['mini_batch_size']),
+                micro_batch_size=int(train['micro_batch_size']),
+                dynamic_batching=bool(train.get('dynamic_batching', False)),
+                max_tokens_per_micro_batch=(
+                    int(train['max_tokens_per_micro_batch'])
+                    if train.get('max_tokens_per_micro_batch') is not None else None
+                ),
+                packing_algorithm=str(train.get('packing_algorithm', 'ffd')),
+            )
             _validate_context_batch_config(
                 context.key,
                 rollout_groups=rollout_batch_size,
                 num_generations=num_generations,
-                advantage_groups=advantage_groups,
-                train_groups=train_groups,
-                micro_batch_size=micro_batch_size,
+                train=train_batch_config,
                 sampler_dp=sampler_dp,
                 model_dp=model_data_parallel_size,
             )
@@ -327,9 +346,7 @@ class AsyncMultiLoraGRPOPipeline:
                     num_samples=1,
                 ),
             }
-            advantage_groups_per_batch[context.key] = advantage_groups
-            train_groups_per_batch[context.key] = train_groups
-            micro_batch_sizes[context.key] = micro_batch_size
+            train_batch_configs[context.key] = train_batch_config
             rewards[context.key] = _reward_for_context(
                 context,
                 reward_config=item.get('reward'),
@@ -388,22 +405,24 @@ class AsyncMultiLoraGRPOPipeline:
             ray.get(manager.register_context.remote(context, adapter_path=initial_paths[context.key]))
 
         from .vllm_sampler_tq import VLLMSamplerTQ
+        sampler_engine_args = {
+            'tensor_parallel_size': sampler_tp,
+            'enable_lora': True,
+            'max_loras': int(runtime['sampler_max_loras']),
+            'max_lora_rank': lora_config_data['r'],
+            'max_model_len': int(sampler_config['max_model_len']),
+            'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
+            'max_num_seqs': int(sampler_config['max_num_seqs']),
+            'enforce_eager': bool(sampler_config['enforce_eager']),
+            'seed': int(runtime.get('seed', 1)),
+        }
+        if sampler_config.get('max_num_batched_tokens') is not None:
+            sampler_engine_args['max_num_batched_tokens'] = int(sampler_config['max_num_batched_tokens'])
         sampler = VLLMSamplerTQ(
             model_id=runtime['model_id'],
             remote_group='sampler',
             device_mesh=sampler_mesh,
-            engine_args={
-                'tensor_parallel_size': sampler_tp,
-                'enable_lora': True,
-                'max_loras': int(runtime['sampler_max_loras']),
-                'max_lora_rank': lora_config_data['r'],
-                'max_model_len': int(sampler_config['max_model_len']),
-                'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
-                'max_num_seqs': int(sampler_config['max_num_seqs']),
-                'max_num_batched_tokens': int(sampler_config['max_num_batched_tokens']),
-                'enforce_eager': bool(sampler_config['enforce_eager']),
-                'seed': int(runtime.get('seed', 1)),
-            },
+            engine_args=sampler_engine_args,
             reward_registry=rewards,
             context_manager=manager,
             rollout_max_retries=int(runtime.get('rollout_max_retries', 2)),
@@ -431,7 +450,6 @@ class AsyncMultiLoraGRPOPipeline:
             context_manager=manager,
             data_plane=TQDataPlane(),
             advantage_fn=_compute_advantages,
-            groups_per_batch=advantage_groups_per_batch,
             scheduler=_scheduler(raw_config['scheduler']['advantage']),
         )
         trainer_worker = create_cpu_actor(
@@ -441,11 +459,13 @@ class AsyncMultiLoraGRPOPipeline:
             train_fn=partial(
                 _train_batch,
                 model,
-                micro_batch_sizes,
+                train_batch_configs,
                 model_data_parallel_size=model_data_parallel_size,
             ),
             save_adapter=partial(_save_adapter, model, runtime['output_dir']),
-            groups_per_batch=train_groups_per_batch,
+            mini_batch_sizes={
+                key: config.mini_batch_size for key, config in train_batch_configs.items()
+            },
             scheduler=_scheduler(raw_config['scheduler']['train']),
             keep_adapter_versions=runtime['keep_adapter_versions'],
             initial_adapter_paths=initial_paths,
@@ -684,7 +704,7 @@ def _compute_advantages(data: Any, admission: PartitionAdmission) -> tuple[list[
 
 def _train_batch(
     model: Any,
-    micro_batch_sizes: dict[str, int],
+    train_batch_configs: dict[str, TrainBatchConfig],
     data: Any,
     admission: PartitionAdmission,
     *,
@@ -696,32 +716,38 @@ def _train_batch(
     inputs = [{name: data[name][index] for name in REQUIRED_MODEL_INPUT_FIELDS} for index in range(size)]
     old_logps = list(data['logprobs'])
     advantages = list(data['advantages'])
-    per_rank_micro_batch_size = micro_batch_sizes[admission.context.key]
-    global_micro_batch_size = per_rank_micro_batch_size * model_data_parallel_size
-    if global_micro_batch_size <= 0:
-        raise ValueError(f'global micro-batch size must be positive, got {global_micro_batch_size}')
+    config = train_batch_configs[admission.context.key]
+    if size != config.mini_batch_size:
+        raise ValueError(
+            f'train batch for {admission.context.key} has {size} samples; '
+            f'expected mini_batch_size={config.mini_batch_size}')
+
     if size % model_data_parallel_size:
         raise ValueError(f'train batch size {size} must be divisible by model DP size '
                          f'{model_data_parallel_size}')
+    outputs = model.forward_backward(
+        inputs=inputs,
+        old_logps=old_logps,
+        advantages=advantages,
+        adapter_name=admission.context.adapter_name,
+        micro_batch_size=config.micro_batch_size,
+        dynamic_batching=config.dynamic_batching,
+        max_tokens_per_micro_batch=config.max_tokens_per_micro_batch,
+        packing_algorithm=config.packing_algorithm,
+        sync_gradients=True,
+        loss_scale=1.0,
+    )
 
-    micro_batch_count = 0
-    for start in range(0, size, global_micro_batch_size):
-        end = min(start + global_micro_batch_size, size)
-        # GRPO loss averages over the samples in each forward. Weight every
-        # micro-batch so accumulated gradients equal the full-batch mean.
-        batch_weight = (end - start) / size
-        model.forward_backward(
-            inputs=inputs[start:end],
-            old_logps=old_logps[start:end],
-            advantages=[float(value) * batch_weight for value in advantages[start:end]],
-            adapter_name=admission.context.adapter_name,
-        )
-        micro_batch_count += 1
     model.clip_grad_and_step(adapter_name=admission.context.adapter_name)
     metrics = dict(model.calculate_metric(is_training=True, adapter_name=admission.context.adapter_name))
-    metrics['reward'] = sum(float(value) for value in data['rewards']) / size
-    metrics['micro_batch_count'] = micro_batch_count
-    metrics['micro_batch_size_per_rank'] = per_rank_micro_batch_size
+    outputs = outputs or {}
+    metrics['micro_batch_count'] = int(outputs.get('micro_batch_count', 1))
+    metrics['mini_batch_size'] = config.mini_batch_size
+    metrics['micro_batch_size_per_rank'] = config.micro_batch_size
+    metrics['micro_batch_samples_mean'] = float(outputs.get('micro_batch_samples_mean', size))
+    metrics['micro_batch_tokens_mean'] = float(outputs.get('micro_batch_tokens_mean', 0))
+    metrics['micro_batch_tokens_max'] = int(outputs.get('micro_batch_tokens_max', 0))
+    metrics['dynamic_batching'] = config.dynamic_batching
     return metrics
 
 

@@ -129,6 +129,15 @@ class ChunkedCrossEntropyLoss(Loss):
         self.reduction = reduction
         self.dft = dft
 
+    def micro_batch_scale(self, inputs, indices):
+        if self.reduction == 'sum':
+            return 1.0
+        return self.token_mean_micro_batch_scale(
+            inputs,
+            indices,
+            ignore_index=self.ignore_index,
+        )
+
     def __call__(self, inputs, outputs, **kwargs):
         labels = inputs['labels']
         logps = outputs.get('logps')

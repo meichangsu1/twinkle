@@ -17,7 +17,7 @@ runtime:
 
 template:
   cls: Template
-  enable_thinking: false
+  enable_thinking: true
 
 model:
   strategy: native_fsdp
@@ -85,11 +85,12 @@ lora_contexts:
       max_tokens: 1024
       temperature: 1.0
       top_p: 1.0
-    advantage:
-      groups_per_batch: 16
     train:
-      groups_per_batch: 16
-      micro_batch_size: 1
+      mini_batch_size: 64
+      micro_batch_size: 64
+      dynamic_batching: true
+      max_tokens_per_micro_batch: 4096
+      packing_algorithm: ffd
 
 
 

@@ -37,7 +37,7 @@ lora:
   learning_rate: 5.0e-5
   lr_scheduler:
     cls: CosineAnnealingLR
-    # One optimizer step per prompt with the current groups_per_batch=1 setup.
+    # One optimizer step per prompt group with mini_batch_size=4.
     T_max: 2000
     eta_min: 0.0
 
@@ -62,11 +62,10 @@ lora_contexts:
       max_tokens: 2048
       temperature: 1.0
       top_p: 0.95
-    advantage:
-      groups_per_batch: 1
     train:
-      groups_per_batch: 1
+      mini_batch_size: 4
       micro_batch_size: 1
+      dynamic_batching: false
 
   - tenant_id: tenant_b
     training_run_id: gsm8k_sync
@@ -88,8 +87,7 @@ lora_contexts:
       max_tokens: 2048
       temperature: 1.0
       top_p: 0.95
-    advantage:
-      groups_per_batch: 1
     train:
-      groups_per_batch: 1
+      mini_batch_size: 4
       micro_batch_size: 1
+      dynamic_batching: false

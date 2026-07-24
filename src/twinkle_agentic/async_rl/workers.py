@@ -202,7 +202,6 @@ class AdvantageWorker(_Worker):
                  context_manager: LoraContextManager,
                  data_plane: TQDataPlane,
                  advantage_fn: Callable[[Any, PartitionAdmission], tuple[Sequence[float], Sequence[float]]],
-                 groups_per_batch: dict[str, int],
                  scheduler: SchedulerConfig,
                  idle_delay_s: float = 0.05):
         super().__init__()
@@ -211,7 +210,6 @@ class AdvantageWorker(_Worker):
         self.idle_delay_s = idle_delay_s
         self.metrics = MetricsBuffer()
         self.advantage_fn = advantage_fn
-        self.groups_per_batch = groups_per_batch
         self.scheduler = ContextScheduler(scheduler)
 
     def drain_metrics(self) -> list[MetricEvent]:
@@ -239,8 +237,7 @@ class AdvantageWorker(_Worker):
                 if candidate is None:
                     break
                 admission = candidate.partition
-                batch = await self.data_plane.claim_advantage_batch(admission,
-                                                                    self.groups_per_batch[admission.context.key])
+                batch = await self.data_plane.claim_advantage_batch(admission, 1)
                 if batch is None:
                     blocked.add(admission.partition_id)
                     self.scheduler.on_blocked(candidate)
@@ -279,7 +276,7 @@ class TrainerWorker(_Worker):
                  data_plane: TQDataPlane,
                  train_fn: Callable[[Any, PartitionAdmission], dict[str, Any] | None],
                  save_adapter: Callable[[PartitionAdmission], str],
-                 groups_per_batch: dict[str, int],
+                 mini_batch_sizes: dict[str, int],
                  scheduler: SchedulerConfig,
                  keep_adapter_versions: int = 0,
                  initial_adapter_paths: dict[str, str] | None = None,
@@ -295,7 +292,7 @@ class TrainerWorker(_Worker):
         self.metrics = MetricsBuffer()
         self.train_fn = train_fn
         self.save_adapter = save_adapter
-        self.groups_per_batch = groups_per_batch
+        self.mini_batch_sizes = mini_batch_sizes
         self.scheduler = ContextScheduler(scheduler)
         self.keep_adapter_versions = max(0, int(keep_adapter_versions))
         self._adapter_history: dict[str, list[str]] = defaultdict(list)
@@ -340,8 +337,11 @@ class TrainerWorker(_Worker):
                 if candidate is None:
                     break
                 admission = candidate.partition
-                batch = await self.data_plane.claim_training_batch(admission,
-                                                                   self.groups_per_batch[admission.context.key])
+                mini_batch_size = self.mini_batch_sizes[admission.context.key]
+                batch = await self.data_plane.claim_training_batch(
+                    admission,
+                    mini_batch_size // admission.num_generations,
+                )
                 if batch is None:
                     if await self.data_plane.is_training_consumed(admission):
                         try:
@@ -360,19 +360,32 @@ class TrainerWorker(_Worker):
                 try:
                     await self.context_manager.on_partition_training_started.remote(admission)
                     policy = await self.context_manager.get_rollout_policy.remote(admission.context)
+                    sample_count = len(batch.data['input_ids'])
+                    if sample_count != mini_batch_size:
+                        raise RuntimeError(
+                            f'training claim for {admission.partition_id} returned {sample_count} samples; '
+                            f'expected mini_batch_size={mini_batch_size}')
                     started = time.perf_counter()
                     metrics = dict(self.train_fn(batch.data, admission) or {})
                 except Exception as exc:
                     self._record('train_failed', admission.context, admission.partition_id, {'error': str(exc)})
                     raise RuntimeError(f'training failed for {admission.partition_id}: {exc}') from exc
-                metrics.setdefault('sample_count', len(batch.data['input_ids']))
+                self.scheduler.on_success(candidate)
+                metrics['sample_count'] = sample_count
+                metrics['reward'] = (
+                    sum(float(value) for value in batch.data['rewards']) / sample_count)
                 metrics['train_latency_s'] = time.perf_counter() - started
                 metrics.update(training_policy_metrics(batch.sample_tags, policy.version))
                 context_key = admission.context.key
                 self._optimizer_steps[context_key] += 1
                 metrics['optimizer_step'] = self._optimizer_steps[context_key]
-                self.scheduler.on_success(candidate)
-                self._record('train_step_done', admission.context, admission.partition_id, metrics, policy.version)
+                self._record(
+                    'train_step_done',
+                    admission.context,
+                    admission.partition_id,
+                    metrics,
+                    policy.version,
+                )
                 progressed = True
                 break
             if not progressed:

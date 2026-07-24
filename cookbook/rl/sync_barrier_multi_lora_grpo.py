@@ -23,6 +23,7 @@ from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, 
                                                 _context_learning_rate, _native_fsdp_model_kwargs,
                                                 _reward_for_context, _sampler_data_parallel_size,
                                                 _sequence_parallel_size, _train_batch, _validate_context_batch_config,
+                                                TrainBatchConfig,
                                                 configure_lora_lr_scheduler)
 from twinkle_agentic.async_rl.tq_utils import REQUIRED_MODEL_INPUT_FIELDS, columns_to_tq_fields
 from twinkle_agentic.async_rl.types import LoraContext, PartitionAdmission
@@ -37,8 +38,7 @@ class SyncContextState:
     rollout_batch_size: int
     num_generations: int
     sampling_params: Any
-    advantage_groups_per_batch: int
-    train_groups_per_batch: int
+    mini_batch_size: int
     reward_fn: Any
     adapter_path: str
     adapter_history: list[str]
@@ -134,7 +134,7 @@ class SyncBarrierMultiLoraGRPO:
             lora_alpha=lora_data['alpha'],
             lora_dropout=lora_data['dropout'],
         )
-        self.micro_batch_sizes: dict[str, int] = {}
+        self.train_batch_configs: dict[str, TrainBatchConfig] = {}
         self.states: list[SyncContextState] = []
         for item in raw_config['lora_contexts']:
             context = LoraContext(
@@ -145,20 +145,24 @@ class SyncBarrierMultiLoraGRPO:
                 item.get('reward_type', 'gsm8k_accuracy'),
             )
             rollout = item['rollout']
-            advantage = item['advantage']
             train = item['train']
             rollout_batch_size = int(rollout['batch_size'])
             num_generations = int(rollout['num_generations'])
-            advantage_groups = int(advantage['groups_per_batch'])
-            train_groups = int(train['groups_per_batch'])
-            micro_batch_size = int(train['micro_batch_size'])
+            train_batch_config = TrainBatchConfig(
+                mini_batch_size=int(train['mini_batch_size']),
+                micro_batch_size=int(train['micro_batch_size']),
+                dynamic_batching=bool(train.get('dynamic_batching', False)),
+                max_tokens_per_micro_batch=(
+                    int(train['max_tokens_per_micro_batch'])
+                    if train.get('max_tokens_per_micro_batch') is not None else None
+                ),
+                packing_algorithm=str(train.get('packing_algorithm', 'ffd')),
+            )
             _validate_context_batch_config(
                 context.key,
                 rollout_groups=rollout_batch_size,
                 num_generations=num_generations,
-                advantage_groups=advantage_groups,
-                train_groups=train_groups,
-                micro_batch_size=micro_batch_size,
+                train=train_batch_config,
                 sampler_dp=sampler_dp,
                 model_dp=model_data_parallel_size,
             )
@@ -207,8 +211,7 @@ class SyncBarrierMultiLoraGRPO:
                     logprobs=1,
                     num_samples=1,
                 ),
-                advantage_groups_per_batch=advantage_groups,
-                train_groups_per_batch=train_groups,
+                mini_batch_size=train_batch_config.mini_batch_size,
                 reward_fn=_reward_for_context(
                     context,
                     reward_config=item.get('reward'),
@@ -218,23 +221,25 @@ class SyncBarrierMultiLoraGRPO:
                 adapter_history=[initial_path],
             )
             self.states.append(state)
-            self.micro_batch_sizes[context.key] = micro_batch_size
+            self.train_batch_configs[context.key] = train_batch_config
 
+        sampler_engine_args = {
+            'tensor_parallel_size': sampler_tp,
+            'enable_lora': True,
+            'max_loras': int(runtime['sampler_max_loras']),
+            'max_lora_rank': lora_data['r'],
+            'max_model_len': int(sampler_config['max_model_len']),
+            'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
+            'max_num_seqs': int(sampler_config['max_num_seqs']),
+            'enforce_eager': bool(sampler_config['enforce_eager']),
+        }
+        if sampler_config.get('max_num_batched_tokens') is not None:
+            sampler_engine_args['max_num_batched_tokens'] = int(sampler_config['max_num_batched_tokens'])
         self.sampler = vLLMSampler(
             model_id=runtime['model_id'],
             remote_group='sampler',
             device_mesh=sampler_mesh,
-            engine_args={
-                'tensor_parallel_size': sampler_tp,
-                'enable_lora': True,
-                'max_loras': int(runtime['sampler_max_loras']),
-                'max_lora_rank': lora_data['r'],
-                'max_model_len': int(sampler_config['max_model_len']),
-                'gpu_memory_utilization': float(sampler_config['gpu_memory_utilization']),
-                'max_num_seqs': int(sampler_config['max_num_seqs']),
-                'max_num_batched_tokens': int(sampler_config['max_num_batched_tokens']),
-                'enforce_eager': bool(sampler_config['enforce_eager']),
-            },
+            engine_args=sampler_engine_args,
         )
         self.sampler.set_template(
             template_cls,
@@ -433,8 +438,7 @@ class SyncBarrierMultiLoraGRPO:
                 num_generations=admission.num_generations,
                 scale='group',
             ).tolist()
-            groups = partition.state.advantage_groups_per_batch
-            samples_per_batch = groups * admission.num_generations
+            samples_per_batch = admission.num_generations
             for start in range(0, len(partition.rows), samples_per_batch):
                 end = min(start + samples_per_batch, len(partition.rows))
                 self.metrics.record(
@@ -457,7 +461,7 @@ class SyncBarrierMultiLoraGRPO:
             admission = partition.admission
             state = partition.state
             assert partition.advantages is not None
-            samples_per_batch = state.train_groups_per_batch * admission.num_generations
+            samples_per_batch = state.mini_batch_size
             for start in range(0, len(partition.rows), samples_per_batch):
                 end = start + samples_per_batch
                 batch = self._training_batch(
@@ -468,7 +472,7 @@ class SyncBarrierMultiLoraGRPO:
                 train_started = time.perf_counter()
                 metrics = _train_batch(
                     self.model,
-                    self.micro_batch_sizes,
+                    self.train_batch_configs,
                     batch,
                     admission,
                     model_data_parallel_size=self.model_data_parallel_size,

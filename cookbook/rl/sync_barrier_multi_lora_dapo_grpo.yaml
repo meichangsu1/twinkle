@@ -63,12 +63,11 @@ lora_contexts:
       max_tokens: 8192
       temperature: 1.0
       top_p: 0.95
-    advantage:
-      groups_per_batch: 1
     train:
       # Keep the effective optimizer batch aligned with the async run.
-      groups_per_batch: 4
+      mini_batch_size: 32
       micro_batch_size: 1
+      dynamic_batching: false
 
   - tenant_id: tenant_b
     training_run_id: dapo_sync
@@ -91,11 +90,10 @@ lora_contexts:
       max_tokens: 8192
       temperature: 1.0
       top_p: 0.95
-    advantage:
-      groups_per_batch: 1
     train:
-      groups_per_batch: 4
+      mini_batch_size: 32
       micro_batch_size: 1
+      dynamic_batching: false
 
 
 # python cookbook/rl/sync_barrier_multi_lora_grpo.py \

@@ -96,6 +96,8 @@ class FakeTQ:
             if len(selected) + group_size > batch_size:
                 break
             selected.extend(group)
+        if len(selected) != batch_size:
+            selected = []
         if selected:
             self.cursors[key] = start + len(selected)
         return FakeMeta(selected, self)
@@ -166,7 +168,12 @@ class FakeSampler:
 
 
 def prompt_batches(count, batch_size):
-    prompts = [{'input_ids': [index, 1], 'labels': [index, 1], 'attention_mask': [1, 1]} for index in range(count)]
+    prompts = [{
+        'input_ids': [index, 1],
+        'labels': [index, 1],
+        'attention_mask': [1, 1],
+        'position_ids': [0, 1],
+    } for index in range(count)]
     return [prompts[index:index + batch_size] for index in range(0, len(prompts), batch_size)]
 
 
@@ -176,7 +183,7 @@ async def run(path: Path):
     data_plane, recorder = TQDataPlane(client), JSONLMetricsRecorder(
         Path(config['runtime']['output_dir']) / 'metrics.jsonl', run_id='native_tq_smoke', mode='fake')
     sources, rollout_config = {}, {}
-    advantage_groups_per_batch, train_groups_per_batch = {}, {}
+    mini_batch_sizes = {}
     for item in config['contexts']:
         context = LoraContext(item['tenant_id'], item['training_run_id'], config['runtime']['model_id'],
                               item['adapter_name'])
@@ -189,8 +196,7 @@ async def run(path: Path):
             'num_generations': rollout['num_generations'],
             'sampling_params': {},
         }
-        advantage_groups_per_batch[key] = item['advantage']['groups_per_batch']
-        train_groups_per_batch[key] = item['train']['groups_per_batch']
+        mini_batch_sizes[key] = item['train']['mini_batch_size']
     rollout = LocalActorHandle(
         RolloutWorker(
             context_manager=manager,
@@ -207,7 +213,6 @@ async def run(path: Path):
             advantage_fn=lambda data, _lease:
             ([float(x) - sum(map(float, data['rewards'])) / len(data['rewards'])
               for x in data['rewards']], list(map(float, data['rewards']))),
-            groups_per_batch=advantage_groups_per_batch,
             scheduler=SchedulerConfig(ContextSchedulePolicy.OLDEST_PARTITION, 1),
             idle_delay_s=.001))
     trainer = LocalActorHandle(
@@ -219,7 +224,7 @@ async def run(path: Path):
                 'loss': sum(abs(float(x)) for x in data['advantages']) / len(data['advantages'])
             },
             save_adapter=lambda admission: f'fake/{admission.context.adapter_name}/v{admission.step + 1}',
-            groups_per_batch=train_groups_per_batch,
+            mini_batch_sizes=mini_batch_sizes,
             scheduler=SchedulerConfig(ContextSchedulePolicy.STICKY, None),
             idle_delay_s=.001))
     result = await AsyncMultiLoraGRPOPipeline(

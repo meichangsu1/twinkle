@@ -210,8 +210,8 @@ class TQDataPlane:
         await set_sample_tags(self.client, group.storage, completed_tags)
         await append_fields(self.client, rows_to_tq_fields(sample_fields), group.storage)
 
-    async def claim_advantage_batch(self, admission: PartitionAdmission, groups_per_batch: int) -> ClaimedBatch | None:
-        metadata = await self._claim(admission, groups_per_batch, ['input_ids', 'logprobs', 'rewards'],
+    async def claim_advantage_batch(self, admission: PartitionAdmission, group_count: int) -> ClaimedBatch | None:
+        metadata = await self._claim(admission, group_count, ['input_ids', 'logprobs', 'rewards'],
                                      self._advantage_task(admission))
         if metadata is None:
             return None
@@ -222,10 +222,10 @@ class TQDataPlane:
         fields = columns_to_tq_fields({'advantages': list(advantages), 'returns': list(returns)}, size)
         await append_fields(self.client, fields, batch.storage)
 
-    async def claim_training_batch(self, admission: PartitionAdmission, groups_per_batch: int) -> ClaimedBatch | None:
+    async def claim_training_batch(self, admission: PartitionAdmission, group_count: int) -> ClaimedBatch | None:
         metadata = await self._claim(
             admission,
-            groups_per_batch,
+            group_count,
             [*REQUIRED_MODEL_INPUT_FIELDS, 'logprobs', 'rewards', 'advantages', 'returns'],
             self._trainer_task(admission),
         )

@@ -94,12 +94,11 @@ lora_contexts:
       max_tokens: 8192
       temperature: 1.0
       top_p: 0.95
-    advantage:
-      groups_per_batch: 1
     train:
       # Four prompt groups x eight generations = 32 samples per optimizer step.
-      groups_per_batch: 4
+      mini_batch_size: 32
       micro_batch_size: 1
+      dynamic_batching: false
 
   - tenant_id: tenant_b
     training_run_id: dapo_async
@@ -131,11 +130,10 @@ lora_contexts:
       max_tokens: 8192
       temperature: 1.0
       top_p: 0.95
-    advantage:
-      groups_per_batch: 1
     train:
-      groups_per_batch: 4
+      mini_batch_size: 32
       micro_batch_size: 1
+      dynamic_batching: false
 
 
 # export MODEL_ID=/nas/disk1/Qwen3.5-4B

@@ -21,11 +21,10 @@ contexts:
     rollout:
       batch_size: 2
       num_generations: 2
-    advantage:
-      groups_per_batch: 1
     train:
-      groups_per_batch: 1
+      mini_batch_size: 2
       micro_batch_size: 1
+      dynamic_batching: false
     dataset:
       prompt_count: 4
 
@@ -36,10 +35,9 @@ contexts:
     rollout:
       batch_size: 2
       num_generations: 2
-    advantage:
-      groups_per_batch: 1
     train:
-      groups_per_batch: 1
+      mini_batch_size: 2
       micro_batch_size: 1
+      dynamic_batching: false
     dataset:
       prompt_count: 4

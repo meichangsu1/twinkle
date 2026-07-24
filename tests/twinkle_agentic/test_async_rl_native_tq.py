@@ -16,12 +16,13 @@ from twinkle_agentic.async_rl import (AsyncMultiLoraGRPOPipeline, ContextSchedul
 from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
 from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _model_attention_implementation,
                                                 _context_learning_rate, _native_fsdp_model_kwargs,
                                                 _reward_for_context, _sampler_data_parallel_size,
                                                 _sequence_parallel_size,
                                                 _train_batch, _validate_context_batch_config,
-                                                configure_lora_lr_scheduler)
+                                                configure_lora_lr_scheduler, TrainBatchConfig)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
 from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ, _PromptGroupRolloutStats
 from twinkle_agentic.async_rl.workers import RolloutWorker
@@ -122,7 +123,7 @@ def test_train_batch_preserves_position_ids_from_tq():
     })
     model = Model()
 
-    _train_batch(model, {context.key: 1}, data, admission)
+    _train_batch(model, {context.key: TrainBatchConfig(1, 1)}, data, admission)
 
     assert model.inputs == [{
         'input_ids': [1, 2],
@@ -143,6 +144,12 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
 
         def forward_backward(self, **kwargs):
             self.calls.append(kwargs)
+            return {
+                'micro_batch_count': 4,
+                'micro_batch_samples_mean': 1.0,
+                'micro_batch_tokens_mean': 1.0,
+                'micro_batch_tokens_max': 1,
+            }
 
         def clip_grad_and_step(self, **_kwargs):
             self.optimizer_steps += 1
@@ -163,13 +170,39 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
     })
     model = Model()
 
-    metrics = _train_batch(model, {context.key: 1}, data, admission, model_data_parallel_size=1)
+    metrics = _train_batch(
+        model,
+        {context.key: TrainBatchConfig(4, 1)},
+        data,
+        admission,
+        model_data_parallel_size=1,
+    )
 
-    assert [len(call['inputs']) for call in model.calls] == [1, 1, 1, 1]
-    assert [call['advantages'] for call in model.calls] == [[.25], [.5], [.75], [1.]]
+    assert [len(call['inputs']) for call in model.calls] == [4]
+    assert model.calls[0]['advantages'] == [1., 2., 3., 4.]
+    assert model.calls[0]['micro_batch_size'] == 1
+    assert model.calls[0]['loss_scale'] == 1.0
     assert model.optimizer_steps == 1
     assert metrics['micro_batch_count'] == 4
     assert metrics['micro_batch_size_per_rank'] == 1
+
+
+def test_dynamic_micro_batch_planner_honors_per_rank_sample_and_token_limits():
+    lengths = [10, 9, 8, 7, 4, 3, 2, 1]
+    inputs = [{'input_ids': list(range(length))} for length in lengths]
+    config = MicroBatchConfig(
+        micro_batch_size=3,
+        dynamic_batching=True,
+        max_tokens_per_micro_batch=18,
+    )
+
+    batches = plan_micro_batches(inputs, config, padding_free=False)
+
+    assert sorted(index for batch in batches for index in batch) == list(range(8))
+    for batch in batches:
+        assert len(batch) <= 3
+        padded_tokens = max(lengths[index] for index in batch) * len(batch)
+        assert padded_tokens <= 18
 
 
 def test_sync_training_batch_preserves_position_ids():
@@ -323,11 +356,20 @@ def test_context_batch_config_accepts_group_aligned_dp_batches():
         'tenant/run/adapter',
         rollout_groups=8,
         num_generations=4,
-        advantage_groups=2,
-        train_groups=2,
-        micro_batch_size=2,
+        train=TrainBatchConfig(mini_batch_size=8, micro_batch_size=2),
         sampler_dp=2,
         model_dp=2,
+    )
+
+
+def test_context_batch_config_allows_training_group_to_span_model_dp_ranks():
+    _validate_context_batch_config(
+        'tenant/run/adapter',
+        rollout_groups=8,
+        num_generations=4,
+        train=TrainBatchConfig(mini_batch_size=16, micro_batch_size=2),
+        sampler_dp=1,
+        model_dp=8,
     )
 
 
@@ -335,27 +377,23 @@ def test_context_batch_config_rejects_partition_tail_and_undersized_rank_batch()
     try:
         _validate_context_batch_config(
             'tenant/run/adapter',
-            rollout_groups=8,
+            rollout_groups=6,
             num_generations=4,
-            advantage_groups=3,
-            train_groups=2,
-            micro_batch_size=1,
+            train=TrainBatchConfig(mini_batch_size=6, micro_batch_size=1),
             sampler_dp=2,
             model_dp=2,
         )
     except ValueError as exc:
-        assert 'advantage.groups_per_batch' in str(exc)
+        assert 'complete prompt groups' in str(exc)
     else:
-        raise AssertionError('expected a non-divisible advantage batch to fail')
+        raise AssertionError('expected a split prompt group to fail')
 
     try:
         _validate_context_batch_config(
             'tenant/run/adapter',
             rollout_groups=8,
             num_generations=2,
-            advantage_groups=1,
-            train_groups=1,
-            micro_batch_size=2,
+            train=TrainBatchConfig(mini_batch_size=2, micro_batch_size=2),
             sampler_dp=2,
             model_dp=2,
         )
@@ -363,6 +401,22 @@ def test_context_batch_config_rejects_partition_tail_and_undersized_rank_batch()
         assert 'per-rank train batch' in str(exc)
     else:
         raise AssertionError('expected an oversized micro batch to fail')
+
+
+def test_context_batch_config_requires_token_limit_for_dynamic_batching():
+    with pytest.raises(ValueError, match='max_tokens_per_micro_batch'):
+        _validate_context_batch_config(
+            'tenant/run/adapter',
+            rollout_groups=8,
+            num_generations=4,
+            train=TrainBatchConfig(
+                mini_batch_size=8,
+                micro_batch_size=2,
+                dynamic_batching=True,
+            ),
+            sampler_dp=1,
+            model_dp=1,
+        )
 
 
 def test_sampler_dp_dispatch_slices_complete_groups_without_duplication():
@@ -934,7 +988,7 @@ def test_checkpoint_retention_preserves_current_policy_and_history_window():
         data_plane=TQDataPlane(),
         train_fn=lambda _data, _admission: {},
         save_adapter=lambda _admission: 'unused',
-        groups_per_batch={context.key: 1},
+        mini_batch_sizes={context.key: 2},
         scheduler=SchedulerConfig(ContextSchedulePolicy.STICKY, None),
         keep_adapter_versions=1,
         initial_adapter_paths={context.key: 'initial'},
@@ -978,7 +1032,7 @@ def test_trainer_periodically_evaluates_published_policy():
         data_plane=TQDataPlane(),
         train_fn=lambda _data, _admission: {},
         save_adapter=lambda _admission: 'unused',
-        groups_per_batch={context.key: 1},
+        mini_batch_sizes={context.key: 2},
         scheduler=SchedulerConfig(ContextSchedulePolicy.STICKY, None),
         evaluation_config={
             context.key: {
