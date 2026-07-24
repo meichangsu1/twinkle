@@ -144,7 +144,7 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
 
         def forward_backward(self, **kwargs):
             self.calls.append(kwargs)
-            return {
+            return lambda: {
                 'micro_batch_count': 4,
                 'micro_batch_samples_mean': 1.0,
                 'micro_batch_tokens_mean': 1.0,
@@ -183,8 +183,8 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
     assert model.calls[0]['micro_batch_size'] == 1
     assert model.calls[0]['loss_scale'] == 1.0
     assert model.optimizer_steps == 1
-    assert metrics['micro_batch_count'] == 4
     assert metrics['micro_batch_size_per_rank'] == 1
+    assert 'micro_batch_count' not in metrics
 
 
 def test_dynamic_micro_batch_planner_honors_per_rank_sample_and_token_limits():

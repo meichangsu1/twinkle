@@ -725,7 +725,7 @@ def _train_batch(
     if size % model_data_parallel_size:
         raise ValueError(f'train batch size {size} must be divisible by model DP size '
                          f'{model_data_parallel_size}')
-    outputs = model.forward_backward(
+    model.forward_backward(
         inputs=inputs,
         old_logps=old_logps,
         advantages=advantages,
@@ -740,13 +740,8 @@ def _train_batch(
 
     model.clip_grad_and_step(adapter_name=admission.context.adapter_name)
     metrics = dict(model.calculate_metric(is_training=True, adapter_name=admission.context.adapter_name))
-    outputs = outputs or {}
-    metrics['micro_batch_count'] = int(outputs.get('micro_batch_count', 1))
     metrics['mini_batch_size'] = config.mini_batch_size
     metrics['micro_batch_size_per_rank'] = config.micro_batch_size
-    metrics['micro_batch_samples_mean'] = float(outputs.get('micro_batch_samples_mean', size))
-    metrics['micro_batch_tokens_mean'] = float(outputs.get('micro_batch_tokens_mean', 0))
-    metrics['micro_batch_tokens_max'] = int(outputs.get('micro_batch_tokens_max', 0))
     metrics['dynamic_batching'] = config.dynamic_batching
     return metrics
 
