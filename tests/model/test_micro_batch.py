@@ -68,6 +68,7 @@ def test_sample_mean_and_token_sum_micro_batch_scales():
     ]
 
     assert GRPOLoss().micro_batch_scale(inputs, [0]) == .25
+    assert GRPOLoss(normalization='token_mean').micro_batch_scale(inputs, [0]) == 1 / 6
     assert CrossEntropyLoss(reduction='sum').micro_batch_scale(inputs, [0]) == 1.0
 
 

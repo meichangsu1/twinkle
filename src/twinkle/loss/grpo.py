@@ -23,6 +23,8 @@ class GRPOLoss(Loss):
             prevent mode-collapse / repetition. Requires the model forward to supply
             ``outputs['entropies']`` — enabled automatically via ``require_entropy``.
         ignore_index: Index to ignore in labels (default: -100)
+        normalization: ``sequence_mean`` gives every completion equal weight;
+            ``token_mean`` gives every valid completion token equal weight.
     """
 
     def __init__(
@@ -32,8 +34,12 @@ class GRPOLoss(Loss):
         beta: float = 0.0,
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
+        normalization: str = 'sequence_mean',
         **kwargs,
     ):
+        if normalization not in ('sequence_mean', 'token_mean'):
+            raise ValueError(
+                f'normalization must be sequence_mean or token_mean, got {normalization!r}')
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
         self.beta = beta
@@ -41,8 +47,15 @@ class GRPOLoss(Loss):
         # Gate the expensive entropy compute path in the model forward.
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
+        self.normalization = normalization
 
     def micro_batch_scale(self, inputs, indices):
+        if self.normalization == 'token_mean':
+            return self.token_mean_micro_batch_scale(
+                inputs,
+                indices,
+                ignore_index=self.ignore_index,
+            )
         return len(indices) / len(inputs)
 
     def _compute_log_importance_weights(
@@ -116,7 +129,9 @@ class GRPOLoss(Loss):
         Returns:
             loss: scalar loss value
         """
-        # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
+        if self.normalization == 'token_mean':
+            return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+
         # Each sequence contributes equally regardless of length.
         return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 

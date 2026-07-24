@@ -82,6 +82,36 @@ class TestGRPOLoss:
         result = loss_fn(inputs, outputs, old_logps=old_logps, advantages=adv_list)
         assert torch.isfinite(result['loss'])
 
+    def test_grpo_token_mean_weights_valid_tokens(self):
+        labels = torch.tensor([
+            [1, -100, -100],
+            [1, 1, 1],
+        ])
+        logps = torch.zeros_like(labels, dtype=torch.float32)
+        inputs = {'labels': labels}
+        outputs = {'logps': logps}
+        advantages = torch.tensor([[1.0], [3.0]])
+
+        sequence_mean = GRPOLoss(normalization='sequence_mean')(
+            inputs,
+            outputs,
+            old_logps=logps,
+            advantages=advantages,
+        )
+        token_mean = GRPOLoss(normalization='token_mean')(
+            inputs,
+            outputs,
+            old_logps=logps,
+            advantages=advantages,
+        )
+
+        assert sequence_mean['loss'].item() == pytest.approx(-2.0)
+        assert token_mean['loss'].item() == pytest.approx(-2.5)
+
+    def test_grpo_rejects_unknown_normalization(self):
+        with pytest.raises(ValueError, match='normalization'):
+            GRPOLoss(normalization='batch_mean')
+
     def test_grpo_entropy_coef(self):
         loss_fn = GRPOLoss(epsilon=0.2, entropy_coef=0.01)
         inputs, outputs, old_logps, _, advantages = _make_rl_batch()

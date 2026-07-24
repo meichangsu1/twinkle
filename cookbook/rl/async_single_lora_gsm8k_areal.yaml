@@ -56,7 +56,7 @@ lora:
   r: 16
   alpha: 16
   dropout: 0.0
-  learning_rate: 1.7e-4
+  learning_rate: 1.7e-5
 
 lora_contexts:
   - tenant_id: tenant_single
@@ -88,6 +88,7 @@ lora_contexts:
     train:
       mini_batch_size: 64
       micro_batch_size: 64
+      loss_normalization: token_mean
       dynamic_batching: true
       max_tokens_per_micro_batch: 4096
       packing_algorithm: ffd

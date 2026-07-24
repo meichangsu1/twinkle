@@ -99,6 +99,15 @@ def _context_learning_rate(train_config: dict[str, Any], lora_config: dict[str, 
     return learning_rate
 
 
+def _context_loss_normalization(train_config: dict[str, Any]) -> str:
+    normalization = str(train_config.get('loss_normalization', 'sequence_mean'))
+    if normalization not in ('sequence_mean', 'token_mean'):
+        raise ValueError(
+            'train.loss_normalization must be sequence_mean or token_mean, '
+            f'got {normalization!r}')
+    return normalization
+
+
 def _validate_context_batch_config(
     context_key: str,
     *,
@@ -286,7 +295,12 @@ class AsyncMultiLoraGRPOPipeline:
                 adapter_name=context.adapter_name,
             )
             configure_lora_lr_scheduler(model, context.adapter_name, lora_config_data)
-            model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
+            model.set_loss(
+                'GRPOLoss',
+                epsilon=.2,
+                normalization=_context_loss_normalization(train),
+                adapter_name=context.adapter_name,
+            )
             model.set_processor(
                 InputProcessor,
                 adapter_name=context.adapter_name,

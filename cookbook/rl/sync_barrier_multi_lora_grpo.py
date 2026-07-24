@@ -20,7 +20,8 @@ from omegaconf import OmegaConf
 from twinkle_agentic.async_rl.metrics import (JSONLMetricsRecorder, advantage_signal_metrics,
                                               rollout_performance_metrics)
 from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, _prompt_batches,
-                                                _context_learning_rate, _native_fsdp_model_kwargs,
+                                                _context_learning_rate, _context_loss_normalization,
+                                                _native_fsdp_model_kwargs,
                                                 _reward_for_context, _sampler_data_parallel_size,
                                                 _sequence_parallel_size, _train_batch, _validate_context_batch_config,
                                                 TrainBatchConfig,
@@ -173,7 +174,12 @@ class SyncBarrierMultiLoraGRPO:
                 adapter_name=context.adapter_name,
             )
             configure_lora_lr_scheduler(self.model, context.adapter_name, lora_data)
-            self.model.set_loss('GRPOLoss', epsilon=.2, adapter_name=context.adapter_name)
+            self.model.set_loss(
+                'GRPOLoss',
+                epsilon=.2,
+                normalization=_context_loss_normalization(train),
+                adapter_name=context.adapter_name,
+            )
             self.model.set_processor(
                 InputProcessor,
                 adapter_name=context.adapter_name,
