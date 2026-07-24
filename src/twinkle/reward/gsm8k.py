@@ -84,8 +84,18 @@ class GSM8KAccuracyReward(Reward):
 class MathVerifyAccuracyReward(Reward):
     """Use the same math-verify parsing and equivalence check as AReaL."""
 
+    def __init__(self, *, precision: int = 6, try_extract_without_anchor: bool = True):
+        self.precision = precision
+        self.try_extract_without_anchor = try_extract_without_anchor
+
     def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
-        from math_verify import parse, verify
+        from math_verify.grader import verify
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
+
+        extraction_config = (
+            ExprExtractionConfig(try_extract_without_anchor=self.try_extract_without_anchor),
+            LatexExtractionConfig(),
+        )
 
         rewards = []
         for trajectory in trajectories:
@@ -95,12 +105,31 @@ class MathVerifyAccuracyReward(Reward):
                     completion = str(message.get('content', ''))
                     break
             ground_truth = str(user_data_get(trajectory.get('user_data'), 'ground_truth', ''))
-            # Rollout rewards run on the sampler's background event-loop
-            # thread. math-verify's default parser timeout uses signal.alarm,
-            # which is only legal on the Python main thread.
-            answer = parse(completion, parsing_timeout=None)
-            gold = parse(ground_truth, parsing_timeout=None)
-            rewards.append(float(verify(answer, gold, timeout_seconds=None)))
+            try:
+                # Disable signal-based timeouts because rollout rewards run on
+                # the sampler's background event-loop thread.
+                gold = parse(
+                    ground_truth,
+                    extraction_config=extraction_config,
+                    parsing_timeout=None,
+                )
+                answer = parse(
+                    completion,
+                    extraction_config=extraction_config,
+                    parsing_timeout=None,
+                )
+                if not gold or not answer:
+                    rewards.append(0.0)
+                    continue
+                correct = verify(
+                    gold,
+                    answer,
+                    float_rounding=self.precision,
+                    timeout_seconds=None,
+                )
+                rewards.append(1.0 if correct else 0.0)
+            except Exception:
+                rewards.append(0.0)
         return rewards
 
     def metric_payload(

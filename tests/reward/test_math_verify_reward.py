@@ -1,5 +1,5 @@
 import sys
-from types import SimpleNamespace
+from types import ModuleType
 
 from twinkle.reward import MathVerifyAccuracyReward
 
@@ -7,15 +7,35 @@ from twinkle.reward import MathVerifyAccuracyReward
 def test_math_verify_reward_uses_complete_completion_and_ground_truth(monkeypatch):
     calls = []
 
-    def parse(value, *, parsing_timeout):
-        calls.append(('parse', value, parsing_timeout))
+    class ExprExtractionConfig:
+        def __init__(self, *, try_extract_without_anchor):
+            self.try_extract_without_anchor = try_extract_without_anchor
+
+    class LatexExtractionConfig:
+        pass
+
+    def parse(value, *, extraction_config, parsing_timeout):
+        calls.append((
+            'parse',
+            value,
+            tuple(type(config).__name__ for config in extraction_config),
+            extraction_config[0].try_extract_without_anchor,
+            parsing_timeout,
+        ))
         return f'parsed:{value}'
 
-    def verify(answer, gold, *, timeout_seconds):
-        calls.append(('verify', answer, gold, timeout_seconds))
+    def verify(gold, answer, *, float_rounding, timeout_seconds):
+        calls.append(('verify', gold, answer, float_rounding, timeout_seconds))
         return True
 
-    monkeypatch.setitem(sys.modules, 'math_verify', SimpleNamespace(parse=parse, verify=verify))
+    parser_module = ModuleType('math_verify.parser')
+    parser_module.ExprExtractionConfig = ExprExtractionConfig
+    parser_module.LatexExtractionConfig = LatexExtractionConfig
+    parser_module.parse = parse
+    grader_module = ModuleType('math_verify.grader')
+    grader_module.verify = verify
+    monkeypatch.setitem(sys.modules, 'math_verify.parser', parser_module)
+    monkeypatch.setitem(sys.modules, 'math_verify.grader', grader_module)
     trajectory = {
         'messages': [
             {'role': 'user', 'content': 'question'},
@@ -27,7 +47,25 @@ def test_math_verify_reward_uses_complete_completion_and_ground_truth(monkeypatc
     reward = MathVerifyAccuracyReward()
     assert reward([trajectory]) == [1.0]
     assert calls == [
-        ('parse', 'reasoning \\boxed{33}', None),
-        ('parse', 'reference reasoning\n#### 33', None),
-        ('verify', 'parsed:reasoning \\boxed{33}', 'parsed:reference reasoning\n#### 33', None),
+        (
+            'parse',
+            'reference reasoning\n#### 33',
+            ('ExprExtractionConfig', 'LatexExtractionConfig'),
+            True,
+            None,
+        ),
+        (
+            'parse',
+            'reasoning \\boxed{33}',
+            ('ExprExtractionConfig', 'LatexExtractionConfig'),
+            True,
+            None,
+        ),
+        (
+            'verify',
+            'parsed:reference reasoning\n#### 33',
+            'parsed:reasoning \\boxed{33}',
+            6,
+            None,
+        ),
     ]
