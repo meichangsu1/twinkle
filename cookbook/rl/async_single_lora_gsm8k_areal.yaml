@@ -34,6 +34,11 @@ sampler:
   max_num_seqs: 64
   enforce_eager: false
 
+rollout_output:
+  enabled: true
+  output_dir: ${runtime.output_dir}/rollouts
+  include_token_ids: false
+
 tq:
   polling_mode: true
   storage_units: 2

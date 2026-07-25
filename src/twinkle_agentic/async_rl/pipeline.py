@@ -204,6 +204,7 @@ class AsyncMultiLoraGRPOPipeline:
         template_config = raw_config.get('template', {})
         template_cls = template_config.get('cls', 'Qwen3_5Template')
         enable_thinking = bool(template_config.get('enable_thinking', False))
+        rollout_output_config = dict(raw_config.get('rollout_output') or {})
         sampler_gpus = int(runtime['sampler_gpus'])
         sampler_tp = int(runtime['sampler_tp'])
         sampler_dp = _sampler_data_parallel_size(sampler_gpus, sampler_tp)
@@ -441,6 +442,13 @@ class AsyncMultiLoraGRPOPipeline:
             context_manager=manager,
             rollout_max_retries=int(runtime.get('rollout_max_retries', 2)),
             rollout_retry_delay_s=float(runtime.get('rollout_retry_delay_s', 0.5)),
+            rollout_output_dir=(
+                rollout_output_config.get('output_dir')
+                if bool(rollout_output_config.get('enabled', False)) else None
+            ),
+            rollout_output_include_token_ids=bool(
+                rollout_output_config.get('include_token_ids', False)
+            ),
         )
         sampler.set_template(
             template_cls,

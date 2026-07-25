@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import time
 
 import pytest
@@ -24,7 +25,11 @@ from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _model_attentio
                                                 _train_batch, _validate_context_batch_config,
                                                 configure_lora_lr_scheduler, TrainBatchConfig)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
-from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ, _PromptGroupRolloutStats
+from twinkle_agentic.async_rl.vllm_sampler_tq import (
+    VLLMSamplerTQ,
+    _GeneratedSample,
+    _PromptGroupRolloutStats,
+)
 from twinkle_agentic.async_rl.workers import RolloutWorker
 
 
@@ -485,6 +490,77 @@ def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_si
     assert metrics['policy_version_max'] == 2
     assert metrics['sampler_dp_size'] == dp_size
     assert metrics['output_tokens_per_s'] == pytest.approx(100 / metrics['rollout_latency_s'])
+
+
+def test_sampler_writes_one_atomic_rollout_file_per_prompt_group(tmp_path):
+    context = _context()
+    admission = PartitionAdmission(context, context.partition_id(3), 3, 1, 2, 0)
+    group = PromptGroup(
+        context,
+        admission,
+        f'{admission.partition_id}/group_0',
+        {'user_data': [('ground_truth', '"42"')]},
+        object(),
+    )
+    policy = RolloutPolicy(context.key, context.adapter_name, 7, '/tmp/adapter-v7')
+    generated = [
+        _GeneratedSample(
+            SampleResponse(
+                sequences=[SampledSequence('stop', [20 + index], decoded=f'completion-{index}')],
+                prompt_token_ids=[10, 11],
+            ),
+            (policy,),
+            attempts=1,
+            was_aborted=False,
+            resumed_partial_output=False,
+        )
+        for index in range(2)
+    ]
+    rows = [
+        {
+            'generation_idx': index,
+            'rollout_policy_version': 7,
+            'initial_policy_version': 7,
+            'final_policy_version': 7,
+            'rollout_policy_versions': [7],
+            'rollout_adapter_path': '/tmp/adapter-v7',
+            'stop_reason': 'stop',
+            'logprobs': [-0.1],
+        }
+        for index in range(2)
+    ]
+
+    class Template:
+        @staticmethod
+        def decode(token_ids, **_kwargs):
+            return ' '.join(map(str, token_ids))
+
+    sampler = object.__new__(VLLMSamplerTQ)
+    sampler.rollout_output_dir = tmp_path
+    sampler.rollout_output_include_token_ids = False
+    sampler.template = Template()
+
+    sampler._write_rollout_group('submission-1', group, generated, rows, [1.0, 0.0])
+    sampler._write_rollout_group('submission-2', group, generated, rows, [1.0, 0.0])
+
+    output_path = (
+        tmp_path
+        / context.tenant_id
+        / context.training_run_id
+        / context.adapter_name
+        / 'policy_7'
+        / 'train_3-group_0.jsonl'
+    )
+    records = [json.loads(line) for line in output_path.read_text().splitlines()]
+    assert len(records) == 2
+    assert records[0]['submission_id'] == 'submission-2'
+    assert records[0]['prompt'] == '10 11'
+    assert records[0]['completion'] == '20'
+    assert records[0]['ground_truth'] == '42'
+    assert records[0]['reward'] == 1.0
+    assert records[0]['head_version'] == 7
+    assert records[0]['tail_version'] == 7
+    assert 'prompt_token_ids' not in records[0]
 
 
 def test_aborted_generation_restarts_from_original_prompt_when_partial_is_disabled():

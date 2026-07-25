@@ -2,23 +2,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import time
 import uuid
 from concurrent.futures import Future
 from copy import copy
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import Any
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function
-from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
+from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams, user_data_get
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
 from .metrics import rollout_performance_metrics
 from .types import LoraContext, MetricEvent, PromptGroup, RolloutOutput, RolloutPolicy
 
 logger = get_logger()
+
+
+def _path_component(value: str) -> str:
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._') or 'unknown'
 
 
 def _extract_sampled_token_logps(logprobs: Any) -> list[float]:
@@ -124,6 +131,8 @@ class VLLMSamplerTQ(vLLMSampler):
         reward_registry: dict[str, Any] | None = None,
         rollout_max_retries: int = 2,
         rollout_retry_delay_s: float = 0.5,
+        rollout_output_dir: str | None = None,
+        rollout_output_include_token_ids: bool = False,
         **kwargs,
     ):
         self.context_manager = context_manager
@@ -132,6 +141,11 @@ class VLLMSamplerTQ(vLLMSampler):
         self.reward_registry = dict(reward_registry or {})
         self.rollout_max_retries = int(rollout_max_retries)
         self.rollout_retry_delay_s = float(rollout_retry_delay_s)
+        self.rollout_output_dir = (
+            Path(rollout_output_dir).expanduser().resolve()
+            if rollout_output_dir is not None else None
+        )
+        self.rollout_output_include_token_ids = bool(rollout_output_include_token_ids)
         if self.rollout_max_retries < 0:
             raise ValueError(f'rollout_max_retries must be non-negative, got {self.rollout_max_retries}')
         if self.rollout_retry_delay_s < 0:
@@ -327,6 +341,18 @@ class VLLMSamplerTQ(vLLMSampler):
 
         rollout_latency_s = asyncio.get_running_loop().time() - started
         policy_versions = [policy.version for sample in generated_samples for policy in sample.policies]
+        if self.rollout_output_dir is not None:
+            try:
+                await asyncio.to_thread(
+                    self._write_rollout_group,
+                    submission_id,
+                    group,
+                    generated_samples,
+                    rows,
+                    rewards,
+                )
+            except Exception as error:
+                logger.warning('Failed to write rollout output for %s: %s', group.group_id, error)
         await self._emit(
             'rollout_done',
             group.context,
@@ -354,6 +380,68 @@ class VLLMSamplerTQ(vLLMSampler):
             stop_reasons=tuple(row.get('stop_reason') for row in rows),
             policy_versions=tuple(policy_versions),
         )
+
+    def _write_rollout_group(
+        self,
+        submission_id: str,
+        group: PromptGroup,
+        generated_samples: list[_GeneratedSample],
+        rows: list[RolloutOutput],
+        rewards: list[float],
+    ) -> None:
+        policy_version = max(int(row['rollout_policy_version']) for row in rows)
+        partition_name = _path_component(group.partition_id.rsplit('/', 1)[-1])
+        group_name = _path_component(group.group_id.rsplit('/', 1)[-1])
+        output_dir = self.rollout_output_dir.joinpath(
+            _path_component(group.context.tenant_id),
+            _path_component(group.context.training_run_id),
+            _path_component(group.context.adapter_name),
+            f'policy_{policy_version}',
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f'{partition_name}-{group_name}.jsonl'
+        temporary_path = output_path.with_suffix(f'.jsonl.{uuid.uuid4().hex}.tmp')
+        ground_truth = user_data_get(group.prompt.get('user_data'), 'ground_truth')
+
+        with temporary_path.open('w', encoding='utf-8') as stream:
+            for generated, row, reward in zip(generated_samples, rows, rewards):
+                response = generated.response
+                sequence = response.sequences[0]
+                prompt_token_ids = list(response.prompt_token_ids or [])
+                completion_token_ids = list(sequence.tokens)
+                record = {
+                    'submission_id': submission_id,
+                    'context_key': group.context.key,
+                    'tenant_id': group.context.tenant_id,
+                    'training_run_id': group.context.training_run_id,
+                    'adapter_name': group.context.adapter_name,
+                    'partition_id': group.partition_id,
+                    'group_id': group.group_id,
+                    'sample_idx': int(row['generation_idx']),
+                    'seqlen': len(prompt_token_ids) + len(completion_token_ids),
+                    'prompt_len': len(prompt_token_ids),
+                    'completion_len': len(completion_token_ids),
+                    'head_version': int(row['initial_policy_version']),
+                    'tail_version': int(row['final_policy_version']),
+                    'policy_versions': list(row['rollout_policy_versions']),
+                    'adapter_path': row.get('rollout_adapter_path'),
+                    'reward': float(reward),
+                    'ground_truth': ground_truth,
+                    'stop_reason': row.get('stop_reason'),
+                    'retry_count': generated.retry_count,
+                    'was_aborted': generated.was_aborted,
+                    'resumed_partial_output': generated.resumed_partial_output,
+                    'prompt': self.template.decode(prompt_token_ids, skip_special_tokens=False),
+                    'completion': self.template.decode(completion_token_ids, skip_special_tokens=False),
+                }
+                if self.rollout_output_include_token_ids:
+                    record.update({
+                        'prompt_token_ids': prompt_token_ids,
+                        'completion_token_ids': completion_token_ids,
+                        'logprobs': list(row['logprobs']),
+                    })
+                stream.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+        os.replace(temporary_path, output_path)
 
     async def _load_lora_for_policy(self, policy: RolloutPolicy) -> Any:
         """Load the adapter selected for one group's rollout snapshot."""
