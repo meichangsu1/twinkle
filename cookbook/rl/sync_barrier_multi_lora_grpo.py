@@ -31,11 +31,11 @@ from twinkle_agentic.async_rl.utils import (
     resolve_context_loss_config,
     resolve_model_attention_implementation,
     resolve_sequence_parallel_size,
+    sample_responses_to_rollout_rows,
     sampler_data_parallel_size,
     validate_context_batch_config,
 )
-from twinkle_agentic.async_rl.vllm_sampler_tq import (_compute_reward_metrics,
-                                                      _sample_responses_to_rollout_rows)
+from twinkle_agentic.async_rl.vllm_sampler_tq import _compute_reward_metrics
 
 
 @dataclass
@@ -395,7 +395,7 @@ class SyncBarrierMultiLoraGRPO:
                 adapter_name=state.context.adapter_name,
                 adapter_path=state.adapter_path,
             )
-            rows = _sample_responses_to_rollout_rows(
+            rows = sample_responses_to_rollout_rows(
                 sources,
                 responses,
                 policy_version=state.policy_version,

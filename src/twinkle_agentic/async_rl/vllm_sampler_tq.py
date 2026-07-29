@@ -20,38 +20,13 @@ from .metrics import rollout_metrics
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
 from .types import LoraContext, PromptGroup, RolloutOutput, RolloutPolicy
-from .utils import resolve_adapter_path
+from .utils import resolve_adapter_path, sample_responses_to_rollout_rows
 
 logger = get_logger()
 
 
 def _path_component(value: str) -> str:
     return re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._') or 'unknown'
-
-
-def _extract_sampled_token_logps(logprobs: Any) -> list[float]:
-    return [0.0 if not item else float(item[0][1]) for item in logprobs or []]
-
-
-def _sample_responses_to_rollout_rows(
-    sources: list[dict[str, Any]],
-    responses: list[SampleResponse],
-    *,
-    policy_version: int | None,
-) -> list[RolloutOutput]:
-    rows: list[RolloutOutput] = []
-    for source, response in zip(sources, responses):
-        for sequence in response.sequences:
-            row = dict(source)
-            row.update(sequence.new_input_feature or {})
-            row.setdefault('group_id', source['group_id'])
-            row.setdefault('generation_idx', source['generation_idx'])
-            row['logprobs'] = _extract_sampled_token_logps(sequence.logprobs)
-            row['stop_reason'] = sequence.stop_reason
-            row['completion_length'] = len(sequence.tokens)
-            row['rollout_policy_version'] = policy_version
-            rows.append(row)
-    return rows
 
 
 def _compute_rewards(
@@ -176,6 +151,21 @@ class VLLMSamplerTQ(vLLMSampler):
     def check_health(self) -> None:
         if self._failure is not None:
             raise RuntimeError(self._failure)
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def register_reward(self, context_key: str, reward: Any) -> None:
+        if context_key in self.reward_registry:
+            raise KeyError(f'reward already registered for {context_key}')
+        self.reward_registry[context_key] = reward
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def unregister_reward(self, context_key: str) -> None:
+        self.reward_registry.pop(context_key, None)
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def unload_lora_paths(self, adapter_paths: list[str]) -> None:
+        local_paths = [resolve_adapter_path(path) for path in adapter_paths]
+        self._submit_in_loop(self.engine.remove_loras(local_paths)).result()
 
     @remote_function(dispatch='slice_dp', collect='none', lazy_collect=False)
     def sample(
@@ -310,8 +300,8 @@ class VLLMSamplerTQ(vLLMSampler):
             group.context, sources, sampling_params, allow_partial_rollout=allow_partial_rollout)
         rows = []
         for source, generated in zip(sources, generated_samples):
-            sample_rows = _sample_responses_to_rollout_rows([source], [generated.response],
-                                                            policy_version=generated.final_policy.version)
+            sample_rows = sample_responses_to_rollout_rows([source], [generated.response],
+                                                           policy_version=generated.final_policy.version)
             if len(sample_rows) != 1:
                 raise ValueError(f'generation {source["generation_idx"]} produced {len(sample_rows)} samples')
             row = sample_rows[0]

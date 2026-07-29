@@ -58,7 +58,12 @@ class AsyncMultiLoraGRPOPipeline:
         self.config = config
 
     @classmethod
-    def from_config(cls, raw_config: dict[str, Any]) -> AsyncMultiLoraGRPOPipeline:
+    def from_config(
+        cls,
+        raw_config: dict[str, Any],
+        *,
+        persistent: bool = False,
+    ) -> AsyncMultiLoraGRPOPipeline:
         """Build the complete Ray/TQ runtime from the async-RL YAML mapping."""
         from omegaconf import OmegaConf
 
@@ -344,6 +349,7 @@ class AsyncMultiLoraGRPOPipeline:
             rollout_config=rollout_config,
             scheduler=_scheduler(raw_config['scheduler']['rollout']),
             allow_partial_rollout=runtime['allow_partial_rollout'],
+            persistent=persistent,
         )
         advantage_worker = create_cpu_actor(
             AdvantageWorker,
@@ -351,6 +357,7 @@ class AsyncMultiLoraGRPOPipeline:
             data_plane=TQDataPlane(),
             advantage_fn=_compute_advantages,
             scheduler=_scheduler(raw_config['scheduler']['advantage']),
+            persistent=persistent,
         )
         trainer_worker = create_cpu_actor(
             TrainerWorker,
@@ -362,6 +369,12 @@ class AsyncMultiLoraGRPOPipeline:
                 train_batch_configs,
                 model_data_parallel_size=model_data_parallel_size,
             ),
+            train_with_config_fn=partial(
+                _train_batch_with_config,
+                model,
+                model_data_parallel_size=model_data_parallel_size,
+            ),
+            train_batch_configs=train_batch_configs,
             save_adapter=partial(_save_adapter, model, runtime['output_dir']),
             mini_batch_sizes={
                 key: config.mini_batch_size for key, config in train_batch_configs.items()
@@ -371,6 +384,9 @@ class AsyncMultiLoraGRPOPipeline:
             initial_adapter_paths=initial_paths,
             evaluation_config=evaluation_config,
             evaluate_batch=partial(_evaluate_batch, sampler, evaluation_rewards) if evaluation_config else None,
+            evaluate_with_reward_fn=partial(_evaluate_batch_with_reward, sampler),
+            evaluation_rewards=evaluation_rewards,
+            persistent=persistent,
         )
         raw_metrics_config = raw_config.get('metrics')
         metrics_config = dict(raw_metrics_config or {})
@@ -534,7 +550,28 @@ def _evaluate_batch(
     policy_version: int,
     sampling_params: Any,
 ) -> dict[str, Any]:
-    from .vllm_sampler_tq import _sample_responses_to_rollout_rows
+    reward_fn = reward_registry[admission.context.key]
+    return _evaluate_batch_with_reward(
+        sampler,
+        prompts,
+        admission,
+        adapter_path,
+        policy_version,
+        sampling_params,
+        reward_fn,
+    )
+
+
+def _evaluate_batch_with_reward(
+    sampler: Any,
+    prompts: Sequence[dict[str, Any]],
+    admission: PartitionAdmission,
+    adapter_path: str,
+    policy_version: int,
+    sampling_params: Any,
+    reward_fn: Any,
+) -> dict[str, Any]:
+    from .utils import sample_responses_to_rollout_rows
 
     responses = sampler.evaluate(
         list(prompts),
@@ -542,8 +579,7 @@ def _evaluate_batch(
         admission.context.adapter_name,
         adapter_path,
     )
-    rows = _sample_responses_to_rollout_rows(list(prompts), responses, policy_version=policy_version)
-    reward_fn = reward_registry[admission.context.key]
+    rows = sample_responses_to_rollout_rows(list(prompts), responses, policy_version=policy_version)
     rewards = list(reward_fn(rows, context=admission.context))
     return {
         'rewards': rewards,
@@ -581,13 +617,30 @@ def _train_batch(
     *,
     model_data_parallel_size: int = 1,
 ) -> dict[str, Any]:
+    config = train_batch_configs[admission.context.key]
+    return _train_batch_with_config(
+        model,
+        data,
+        admission,
+        config,
+        model_data_parallel_size=model_data_parallel_size,
+    )
+
+
+def _train_batch_with_config(
+    model: Any,
+    data: Any,
+    admission: PartitionAdmission,
+    config: TrainBatchConfig,
+    *,
+    model_data_parallel_size: int = 1,
+) -> dict[str, Any]:
     from .tq_utils import REQUIRED_MODEL_INPUT_FIELDS
 
     size = int(data.batch_size[0])
     inputs = [{name: data[name][index] for name in REQUIRED_MODEL_INPUT_FIELDS} for index in range(size)]
     old_logps = list(data['logprobs'])
     advantages = list(data['advantages'])
-    config = train_batch_configs[admission.context.key]
     if size != config.mini_batch_size:
         raise ValueError(
             f'train batch for {admission.context.key} has {size} samples; '

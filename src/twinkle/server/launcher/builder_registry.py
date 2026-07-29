@@ -19,6 +19,7 @@ BUILDERS: dict[str, str] = {
     'model': 'build_model_app',
     'sampler': 'build_sampler_app',
     'processor': 'build_processor_app',
+    'async_rl': 'build_async_rl_app',
 }
 
 
@@ -32,12 +33,14 @@ def get_builders() -> dict[str, Callable]:
     from twinkle.server.model import build_model_app
     from twinkle.server.processor import build_processor_app
     from twinkle.server.sampler import build_sampler_app
+    from twinkle.server.async_rl import build_async_rl_app
 
     return {
         'build_gateway_app': build_gateway_app,
         'build_model_app': build_model_app,
         'build_sampler_app': build_sampler_app,
         'build_processor_app': build_processor_app,
+        'build_async_rl_app': build_async_rl_app,
     }
 
 

@@ -104,6 +104,7 @@ class RolloutWorker(_Worker):
                  rollout_config: dict[str, dict[str, Any]],
                  scheduler: SchedulerConfig,
                  allow_partial_rollout: bool = False,
+                 persistent: bool = False,
                  idle_delay_s: float = 0.05):
         super().__init__()
         self.data_plane = data_plane
@@ -113,14 +114,47 @@ class RolloutWorker(_Worker):
         self.rollout_config = rollout_config
         self.scheduler = ContextScheduler(scheduler)
         self.allow_partial_rollout = allow_partial_rollout
+        self.persistent = persistent
         self._prompt_batch_iterators = {
             key: iter(value() if callable(value) else value)
             for key, value in prompt_batches.items()
         }
         self._next_batch_tasks: dict[str, asyncio.Task[Sequence[dict[str, Any]] | None]] = {}
+        self._exhausted: set[str] = set()
+        self._contexts_changed = asyncio.Event()
+
+    async def register_context(
+        self,
+        context: LoraContext,
+        prompt_batches: Iterable[Sequence[dict[str, Any]]] | Callable[[], Iterable[Sequence[dict[str, Any]]]],
+        rollout_config: dict[str, Any],
+    ) -> None:
+        key = context.key
+        if key in self._prompt_batch_iterators:
+            raise KeyError(f'rollout context already exists: {key}')
+        self._prompt_batch_iterators[key] = iter(prompt_batches() if callable(prompt_batches) else prompt_batches)
+        self.rollout_config[key] = dict(rollout_config)
+        self._exhausted.discard(key)
+        if self._service_task is not None and not self._service_task.done():
+            self._start_next_batch(key)
+        self._contexts_changed.set()
+
+    async def unregister_context(self, context: LoraContext | str) -> None:
+        key = context if isinstance(context, str) else context.key
+        task = self._next_batch_tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        iterator = self._prompt_batch_iterators.pop(key, None)
+        self.rollout_config.pop(key, None)
+        self._exhausted.discard(key)
+        close = getattr(iterator, 'close', None)
+        if callable(close):
+            await asyncio.to_thread(close)
+        self._contexts_changed.set()
 
     def _start_next_batch(self, key: str) -> None:
-        if key not in self._next_batch_tasks:
+        if key in self._prompt_batch_iterators and key not in self._next_batch_tasks:
             self._next_batch_tasks[key] = asyncio.create_task(
                 asyncio.to_thread(next, self._prompt_batch_iterators[key], None))
 
@@ -134,27 +168,36 @@ class RolloutWorker(_Worker):
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def _serve(self) -> None:
-        exhausted: set[str] = set()
         for key in self._prompt_batch_iterators:
             self._start_next_batch(key)
         while not self._stop_requested:
-            if await self.context_manager.is_rollout_admission_closed.remote():
+            if not self.persistent and await self.context_manager.is_rollout_admission_closed.remote():
                 return
             candidates = []
-            for key in self._prompt_batch_iterators:
-                if key in exhausted:
+            for key in list(self._prompt_batch_iterators):
+                if key in self._exhausted:
                     continue
-                if await self.context_manager.context_status.remote(key) is not ContextStatus.ACTIVE:
-                    exhausted.add(key)
+                status = await self.context_manager.context_status.remote(key)
+                if status is not ContextStatus.ACTIVE:
+                    if status in (ContextStatus.EXHAUSTED, ContextStatus.FINISHED):
+                        self._exhausted.add(key)
                     continue
                 config = self.rollout_config[key]
-                if self._next_batch_tasks[key].done():
+                task = self._next_batch_tasks.get(key)
+                if task is None:
+                    self._start_next_batch(key)
+                    task = self._next_batch_tasks.get(key)
+                if task is not None and task.done():
                     candidates.append(ScheduleCandidate(config['context']))
             candidate = self.scheduler.choose(candidates)
             if candidate is None:
-                if len(exhausted) == len(self._prompt_batch_iterators):
+                if not self.persistent and len(self._exhausted) == len(self._prompt_batch_iterators):
                     return
-                await asyncio.sleep(self.idle_delay_s)
+                self._contexts_changed.clear()
+                try:
+                    await asyncio.wait_for(self._contexts_changed.wait(), timeout=self.idle_delay_s)
+                except TimeoutError:
+                    pass
                 continue
             key = candidate.context.key
             config = self.rollout_config[key]
@@ -172,7 +215,7 @@ class RolloutWorker(_Worker):
                 raise RuntimeError(f'prompt loading failed for {key}: {exc}') from exc
             if batch is None or len(batch) != int(config['batch_size']):
                 self._next_batch_tasks.pop(key)
-                exhausted.add(key)
+                self._exhausted.add(key)
                 await self.context_manager.on_dataset_exhausted.remote(candidate.context)
                 self.scheduler.on_blocked(candidate)
                 continue
@@ -233,6 +276,7 @@ class AdvantageWorker(_Worker):
                  data_plane: TQDataPlane,
                  advantage_fn: Callable[[Any, PartitionAdmission], tuple[Sequence[float], Sequence[float]]],
                  scheduler: SchedulerConfig,
+                 persistent: bool = False,
                  idle_delay_s: float = 0.05):
         super().__init__()
         self.data_plane = data_plane
@@ -240,9 +284,12 @@ class AdvantageWorker(_Worker):
         self.idle_delay_s = idle_delay_s
         self.advantage_fn = advantage_fn
         self.scheduler = ContextScheduler(scheduler)
+        self.persistent = persistent
 
     async def _serve(self) -> None:
-        while not self._stop_requested and not await self.context_manager.is_run_finished.remote():
+        while not self._stop_requested:
+            if not self.persistent and await self.context_manager.is_run_finished.remote():
+                return
             admissions = await self.context_manager.list_live_partitions.remote()
             blocked: set[str] = set()
             progressed = False
@@ -307,18 +354,26 @@ class TrainerWorker(_Worker):
                  save_adapter: Callable[[PartitionAdmission], str],
                  mini_batch_sizes: dict[str, int],
                  scheduler: SchedulerConfig,
+                 train_with_config_fn: Callable[[Any, PartitionAdmission, Any], dict[str, Any] | None] | None = None,
+                 train_batch_configs: dict[str, Any] | None = None,
                  keep_adapter_versions: int = 0,
                  initial_adapter_paths: dict[str, str] | None = None,
                  remove_adapter: Callable[[str], None] | None = None,
                  evaluation_config: dict[str, dict[str, Any]] | None = None,
                  evaluate_batch: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any],
                                           dict[str, Any]] | None = None,
+                 evaluate_with_reward_fn: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any,
+                                                    Any], dict[str, Any]] | None = None,
+                 evaluation_rewards: dict[str, Any] | None = None,
+                 persistent: bool = False,
                  idle_delay_s: float = 0.05):
         super().__init__()
         self.data_plane = data_plane
         self.context_manager = context_manager
         self.idle_delay_s = idle_delay_s
         self.train_fn = train_fn
+        self.train_with_config_fn = train_with_config_fn
+        self.train_batch_configs = dict(train_batch_configs or {})
         self.save_adapter = save_adapter
         self.mini_batch_sizes = mini_batch_sizes
         self.scheduler = ContextScheduler(scheduler)
@@ -331,8 +386,44 @@ class TrainerWorker(_Worker):
         self._adapter_removal_tasks: set[asyncio.Task[None]] = set()
         self.evaluation_config = dict(evaluation_config or {})
         self.evaluate_batch = evaluate_batch
+        self.evaluate_with_reward_fn = evaluate_with_reward_fn
+        self.evaluation_rewards = dict(evaluation_rewards or {})
         self._evaluation_batches: dict[str, list[Sequence[dict[str, Any]]]] = {}
         self._optimizer_steps: dict[str, int] = defaultdict(int)
+        self.persistent = persistent
+
+    async def register_context(
+        self,
+        context: LoraContext,
+        *,
+        mini_batch_size: int,
+        train_batch_config: Any | None = None,
+        initial_adapter_path: str | None = None,
+        evaluation_config: dict[str, Any] | None = None,
+        evaluation_reward: Any | None = None,
+    ) -> None:
+        key = context.key
+        if key in self.mini_batch_sizes:
+            raise KeyError(f'trainer context already exists: {key}')
+        self.mini_batch_sizes[key] = int(mini_batch_size)
+        if train_batch_config is not None:
+            self.train_batch_configs[key] = train_batch_config
+        if initial_adapter_path:
+            self._adapter_history[key].append(initial_adapter_path)
+        if evaluation_config is not None:
+            self.evaluation_config[key] = dict(evaluation_config)
+        if evaluation_reward is not None:
+            self.evaluation_rewards[key] = evaluation_reward
+
+    async def unregister_context(self, context: LoraContext | str) -> None:
+        key = context if isinstance(context, str) else context.key
+        self.mini_batch_sizes.pop(key, None)
+        self.train_batch_configs.pop(key, None)
+        self.evaluation_config.pop(key, None)
+        self.evaluation_rewards.pop(key, None)
+        self._evaluation_batches.pop(key, None)
+        self._adapter_history.pop(key, None)
+        self._optimizer_steps.pop(key, None)
 
     async def stop(self) -> None:
         await super().stop()
@@ -341,7 +432,9 @@ class TrainerWorker(_Worker):
             await asyncio.gather(*pending)
 
     async def _serve(self) -> None:
-        while not self._stop_requested and not await self.context_manager.is_run_finished.remote():
+        while not self._stop_requested:
+            if not self.persistent and await self.context_manager.is_run_finished.remote():
+                return
             admissions = await self.context_manager.list_trainable_partitions.remote()
             blocked: set[str] = set()
             progressed = False
@@ -389,7 +482,11 @@ class TrainerWorker(_Worker):
                             f'training claim for {admission.partition_id} returned {sample_count} samples; '
                             f'expected mini_batch_size={mini_batch_size}')
                     started = time.perf_counter()
-                    metrics = dict(self.train_fn(batch.data, admission) or {})
+                    if self.train_with_config_fn is not None:
+                        config = self.train_batch_configs[admission.context.key]
+                        metrics = dict(self.train_with_config_fn(batch.data, admission, config) or {})
+                    else:
+                        metrics = dict(self.train_fn(batch.data, admission) or {})
                 except Exception as exc:
                     self._record_metric(
                         'train',
@@ -470,7 +567,7 @@ class TrainerWorker(_Worker):
 
     async def _evaluate_policy(self, admission: PartitionAdmission, adapter_path: str, policy_version: int) -> None:
         config = self.evaluation_config.get(admission.context.key)
-        if config is None or self.evaluate_batch is None:
+        if config is None or (self.evaluate_batch is None and self.evaluate_with_reward_fn is None):
             return
         interval = int(config['interval'])
         if policy_version % interval:
@@ -486,14 +583,25 @@ class TrainerWorker(_Worker):
         completion_lengths: list[int] = []
         prompt_count = 0
         for batch in batches:
-            result = await asyncio.to_thread(
-                self.evaluate_batch,
-                batch,
-                admission,
-                adapter_path,
-                policy_version,
-                config['sampling_params'],
-            )
+            if self.evaluate_with_reward_fn is not None:
+                result = await asyncio.to_thread(
+                    self.evaluate_with_reward_fn,
+                    batch,
+                    admission,
+                    adapter_path,
+                    policy_version,
+                    config['sampling_params'],
+                    self.evaluation_rewards[context_key],
+                )
+            else:
+                result = await asyncio.to_thread(
+                    self.evaluate_batch,
+                    batch,
+                    admission,
+                    adapter_path,
+                    policy_version,
+                    config['sampling_params'],
+                )
             rewards.extend(float(value) for value in result['rewards'])
             completion_lengths.extend(int(value) for value in result['completion_lengths'])
             prompt_count += len(batch)

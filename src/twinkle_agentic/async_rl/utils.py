@@ -9,6 +9,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from twinkle.data_format import SampleResponse
+
+from .types import RolloutOutput
+
 
 @dataclass(frozen=True)
 class TrainBatchConfig:
@@ -17,6 +21,31 @@ class TrainBatchConfig:
     dynamic_batching: bool = False
     max_tokens_per_micro_batch: int | None = None
     packing_algorithm: Literal['ffd', 'kk'] = 'ffd'
+
+
+def _extract_sampled_token_logps(logprobs: Any) -> list[float]:
+    return [0.0 if not item else float(item[0][1]) for item in logprobs or []]
+
+
+def sample_responses_to_rollout_rows(
+    sources: list[dict[str, Any]],
+    responses: list[SampleResponse],
+    *,
+    policy_version: int | None,
+) -> list[RolloutOutput]:
+    rows: list[RolloutOutput] = []
+    for source, response in zip(sources, responses):
+        for sequence in response.sequences:
+            row = dict(source)
+            row.update(sequence.new_input_feature or {})
+            row.setdefault('group_id', source['group_id'])
+            row.setdefault('generation_idx', source['generation_idx'])
+            row['logprobs'] = _extract_sampled_token_logps(sequence.logprobs)
+            row['stop_reason'] = sequence.stop_reason
+            row['completion_length'] = len(sequence.tokens)
+            row['rollout_policy_version'] = policy_version
+            rows.append(row)
+    return rows
 
 
 def resolve_adapter_path(adapter_path: str) -> str:

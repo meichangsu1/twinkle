@@ -111,11 +111,19 @@ class ProcessorArgs(_ArgsBase):
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
 
 
+class AsyncRLArgs(_ArgsBase):
+    """Args for the long-lived async-RL tenant service."""
+
+    config: dict[str, Any]
+    initial_owner_token: str | None = None
+
+
 _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
     'server': ServerArgs,
     'model': ModelArgs,
     'sampler': SamplerArgs,
     'processor': ProcessorArgs,
+    'async_rl': AsyncRLArgs,
 }
 
 # ---------- ApplicationSpec ------------------------------------------------ #
@@ -137,12 +145,12 @@ class ApplicationSpec(BaseModel):
 
     name: str
     route_prefix: str = '/'
-    import_path: Literal['server', 'model', 'sampler', 'processor']
+    import_path: Literal['server', 'model', 'sampler', 'processor', 'async_rl']
     # ``args`` is always populated by the ``mode='before'`` validator below
     # (which validates the raw block against the schema selected by
     # ``import_path`` and defaults a missing block to ``{}``), so the field is
     # required here — the validator runs first and fills it.
-    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | AsyncRLArgs
     deployments: list[dict[str, Any]] = Field(default_factory=list)
 
     @model_validator(mode='before')
