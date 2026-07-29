@@ -19,9 +19,6 @@ TRANSFORMERS_INPUT_FIELDS = (
     'feature_attention_mask',
 )
 REQUIRED_MODEL_INPUT_FIELDS = ('input_ids', 'labels', 'attention_mask', 'position_ids')
-TRAIN_LOSS_FIELDS = ('logprobs', 'advantages', 'rewards')
-REQUIRED_TRAIN_LOSS_FIELDS = ('logprobs', 'advantages')
-REWARD_FIELD = 'rewards'
 ROLLOUT_TRAIN_FIELDS = (*TRANSFORMERS_INPUT_FIELDS, 'logprobs', 'rewards', 'advantages', 'returns')
 
 

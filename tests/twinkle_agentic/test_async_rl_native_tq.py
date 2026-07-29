@@ -11,20 +11,28 @@ from cookbook.rl.sync_barrier_multi_lora_grpo import SyncBarrierMultiLoraGRPO
 from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import _dispatch_args
+from twinkle.metric import MetricRecord
 from twinkle_agentic.async_rl import (AsyncMultiLoraGRPOPipeline, ContextSchedulePolicy, ContextScheduler,
-                                      ContextStatus, LoraContext, LoraContextManager, PartitionStatus, ScheduleCandidate,
+                                      ContextStatus, LoraContext, LoraContextManager, ScheduleCandidate,
                                       SchedulerConfig, TQDataPlane, TrainerWorker)
 from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
-from twinkle_agentic.async_rl.group_sampler import ContextGRPOGroupNSampler
+from twinkle_agentic.async_rl.native_tq import ContextGRPOGroupNSampler
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
-from twinkle_agentic.async_rl.pipeline import (create_cpu_actor, _model_attention_implementation,
-                                                _context_learning_rate, _native_fsdp_model_kwargs,
-                                                _reward_for_context, _sampler_data_parallel_size,
-                                                _sequence_parallel_size,
-                                                _train_batch, _validate_context_batch_config,
-                                                configure_lora_lr_scheduler, TrainBatchConfig)
+from twinkle_agentic.async_rl.pipeline import create_cpu_actor, _reward_for_context, _train_batch
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
+from twinkle_agentic.async_rl.utils import (
+    TrainBatchConfig,
+    build_native_fsdp_model_kwargs,
+    configure_lora_lr_scheduler,
+    resolve_context_learning_rate,
+    resolve_context_lora_target_modules,
+    resolve_context_loss_config,
+    resolve_model_attention_implementation,
+    resolve_sequence_parallel_size,
+    sampler_data_parallel_size,
+    validate_context_batch_config,
+)
 from twinkle_agentic.async_rl.vllm_sampler_tq import (
     VLLMSamplerTQ,
     _GeneratedSample,
@@ -81,22 +89,22 @@ def test_cpu_service_actor_uses_twinkle_ray_mode(monkeypatch):
 
 
 def test_sequence_parallel_size_must_divide_model_gpus():
-    assert _sequence_parallel_size(2, 1) == 1
-    assert _sequence_parallel_size(2, 2) == 2
+    assert resolve_sequence_parallel_size(2, 1) == 1
+    assert resolve_sequence_parallel_size(2, 2) == 2
 
     with pytest.raises(ValueError, match='must be divisible'):
-        _sequence_parallel_size(2, 3)
+        resolve_sequence_parallel_size(2, 3)
 
 
 def test_padding_free_sequence_parallel_requires_flash_attention():
-    assert _model_attention_implementation(
+    assert resolve_model_attention_implementation(
         {'attn_implementation': 'flash_attention_2'},
         padding_free=True,
         sequence_parallel_size=2,
     ) == 'flash_attention_2'
 
     with pytest.raises(ValueError, match='model.attn_implementation'):
-        _model_attention_implementation({}, padding_free=True, sequence_parallel_size=2)
+        resolve_model_attention_implementation({}, padding_free=True, sequence_parallel_size=2)
 
 
 def test_train_batch_preserves_position_ids_from_tq():
@@ -275,13 +283,13 @@ def _sample_response(tokens, stop_reason, input_ids):
 
 
 def test_sampler_data_parallel_size_is_derived_from_gpu_and_tp_sizes():
-    assert _sampler_data_parallel_size(8, 2) == 4
-    assert _sampler_data_parallel_size(1, 1) == 1
+    assert sampler_data_parallel_size(8, 2) == 4
+    assert sampler_data_parallel_size(1, 1) == 1
 
 
 def test_sampler_parallelism_rejects_incomplete_tp_group():
     try:
-        _sampler_data_parallel_size(3, 2)
+        sampler_data_parallel_size(3, 2)
     except ValueError as exc:
         assert 'must be divisible' in str(exc)
     else:
@@ -315,22 +323,78 @@ def test_lora_lr_scheduler_uses_shared_adapter_config():
 
 
 def test_context_learning_rate_overrides_global_default():
-    assert _context_learning_rate({'learning_rate': 5e-6}, {'learning_rate': 1e-6}) == pytest.approx(5e-6)
-    assert _context_learning_rate({}, {'learning_rate': 1e-6}) == pytest.approx(1e-6)
+    assert resolve_context_learning_rate({'learning_rate': 5e-6}, {'learning_rate': 1e-6}) == pytest.approx(5e-6)
+    assert resolve_context_learning_rate({}, {'learning_rate': 1e-6}) == pytest.approx(1e-6)
+
+
+def test_context_lora_target_modules_override_global_default():
+    defaults = {'target_modules': 'all-linear'}
+
+    assert resolve_context_lora_target_modules({}, defaults) == 'all-linear'
+    assert resolve_context_lora_target_modules(
+        {'lora': {'target_modules': ['q_proj', 'v_proj']}},
+        defaults,
+    ) == ['q_proj', 'v_proj']
+
+
+@pytest.mark.parametrize('value', ['', [], [None], {'q_proj': True}])
+def test_context_lora_target_modules_reject_invalid_values(value):
+    with pytest.raises(ValueError, match='target_modules'):
+        resolve_context_lora_target_modules(
+            {'lora': {'target_modules': value}},
+            {'target_modules': 'all-linear'},
+        )
+
+
+def test_context_loss_config_overrides_global_defaults():
+    loss_cls, loss_kwargs = resolve_context_loss_config(
+        {
+            'loss': {
+                'cls': 'GSPOLoss',
+                'normalization': 'token_mean',
+            }
+        },
+        {
+            'cls': 'GRPOLoss',
+            'epsilon': 0.2,
+            'normalization': 'sequence_mean',
+        },
+    )
+
+    assert loss_cls == 'GSPOLoss'
+    assert loss_kwargs == {
+        'epsilon': 0.2,
+        'normalization': 'token_mean',
+    }
+
+
+def test_context_loss_config_uses_grpo_defaults():
+    assert resolve_context_loss_config({}) == (
+        'GRPOLoss',
+        {
+            'epsilon': 0.2,
+            'normalization': 'sequence_mean',
+        },
+    )
+
+
+def test_context_loss_config_rejects_empty_class_name():
+    with pytest.raises(ValueError, match='loss.cls'):
+        resolve_context_loss_config({'loss': {'cls': ''}})
 
 
 @pytest.mark.parametrize('value', [0, -1e-6, float('inf')])
 def test_context_learning_rate_rejects_invalid_values(value):
     with pytest.raises(ValueError, match='positive finite'):
-        _context_learning_rate({'learning_rate': value}, {'learning_rate': 1e-6})
+        resolve_context_learning_rate({'learning_rate': value}, {'learning_rate': 1e-6})
 
 
 def test_rl_model_kwargs_enforce_native_fsdp():
-    assert _native_fsdp_model_kwargs({}) == {
+    assert build_native_fsdp_model_kwargs({}) == {
         'strategy': 'native_fsdp',
         'fsdp_config': {},
     }
-    assert _native_fsdp_model_kwargs({
+    assert build_native_fsdp_model_kwargs({
         'strategy': 'native_fsdp',
         'fsdp_config': {'reshard_after_forward': False},
     }) == {
@@ -338,26 +402,37 @@ def test_rl_model_kwargs_enforce_native_fsdp():
         'fsdp_config': {'reshard_after_forward': False},
     }
     with pytest.raises(ValueError, match='must be native_fsdp'):
-        _native_fsdp_model_kwargs({'strategy': 'accelerate'})
+        build_native_fsdp_model_kwargs({'strategy': 'accelerate'})
 
 
-def test_dapo_reward_factory_uses_rollout_token_limit():
+def test_reward_factory_loads_class_and_resolved_kwargs():
     reward = _reward_for_context(
-        LoraContext('tenant', 'run', 'model', 'adapter', reward_type='dapo_math'),
-        reward_config={
-            'overlong_buffer_length': 4096,
-            'overlong_penalty_factor': 1.0,
-            'score_tail_chars': 300,
+        {
+            'class_path': 'twinkle.reward.DAPOMathReward',
+            'kwargs': {
+                'max_response_length': 8192,
+                'overlong_buffer_length': 4096,
+                'overlong_penalty_factor': 1.0,
+                'score_tail_chars': 300,
+            },
         },
-        rollout_config={'max_tokens': 8192},
+        context_key='tenant/run/adapter',
     )
 
     assert reward.max_response_length == 8192
     assert reward.overlong_buffer_length == 4096
 
 
+def test_reward_factory_rejects_non_reward_class():
+    with pytest.raises(TypeError, match='Reward subclass'):
+        _reward_for_context(
+            {'class_path': 'collections.Counter'},
+            context_key='tenant/run/adapter',
+        )
+
+
 def test_context_batch_config_accepts_group_aligned_dp_batches():
-    _validate_context_batch_config(
+    validate_context_batch_config(
         'tenant/run/adapter',
         rollout_groups=8,
         num_generations=4,
@@ -368,7 +443,7 @@ def test_context_batch_config_accepts_group_aligned_dp_batches():
 
 
 def test_context_batch_config_allows_training_group_to_span_model_dp_ranks():
-    _validate_context_batch_config(
+    validate_context_batch_config(
         'tenant/run/adapter',
         rollout_groups=8,
         num_generations=4,
@@ -380,7 +455,7 @@ def test_context_batch_config_allows_training_group_to_span_model_dp_ranks():
 
 def test_context_batch_config_rejects_partition_tail_and_undersized_rank_batch():
     try:
-        _validate_context_batch_config(
+        validate_context_batch_config(
             'tenant/run/adapter',
             rollout_groups=6,
             num_generations=4,
@@ -394,7 +469,7 @@ def test_context_batch_config_rejects_partition_tail_and_undersized_rank_batch()
         raise AssertionError('expected a split prompt group to fail')
 
     try:
-        _validate_context_batch_config(
+        validate_context_batch_config(
             'tenant/run/adapter',
             rollout_groups=8,
             num_generations=2,
@@ -410,7 +485,7 @@ def test_context_batch_config_rejects_partition_tail_and_undersized_rank_batch()
 
 def test_context_batch_config_requires_token_limit_for_dynamic_batching():
     with pytest.raises(ValueError, match='max_tokens_per_micro_batch'):
-        _validate_context_batch_config(
+        validate_context_batch_config(
             'tenant/run/adapter',
             rollout_groups=8,
             num_generations=4,
@@ -426,25 +501,23 @@ def test_context_batch_config_requires_token_limit_for_dynamic_batching():
 
 def test_sampler_dp_dispatch_slices_complete_groups_without_duplication():
     mesh = DeviceMesh.from_sizes(world_size=4, dp_size=2, tp_size=2)
-    admission = object()
     groups = ['group_0', 'group_1', 'group_2', 'group_3']
     dispatched = _dispatch_args(
         workers=['dp_0', 'dp_1'],
         dispatch='slice_dp',
         execute='all',
         device_mesh=mesh,
-        args=(admission, groups, 'sampling_params', False),
+        args=(groups, 'sampling_params', False),
         kwargs={},
     )
 
     assert [worker for worker, _, _ in dispatched] == ['dp_0', 'dp_1']
-    assert [args[1] for _, args, _ in dispatched] == [groups[:2], groups[2:]]
-    assert all(args[0] is admission for _, args, _ in dispatched)
-    assert [group for _, args, _ in dispatched for group in args[1]] == groups
+    assert [args[0] for _, args, _ in dispatched] == [groups[:2], groups[2:]]
+    assert [group for _, args, _ in dispatched for group in args[0]] == groups
 
 
-@pytest.mark.parametrize(('dp_size', 'expected_event'), [(1, 'rollout_partition_done'), (2, 'rollout_shard_done')])
-def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_size, expected_event):
+@pytest.mark.parametrize(('dp_size', 'expected_scope'), [(1, 'partition'), (2, 'shard')])
+def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_size, expected_scope):
     context = _context()
     admission = PartitionAdmission(context, context.partition_id(0), 0, 2, 2, 0)
     groups = [
@@ -463,8 +536,8 @@ def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_si
             reasons = (('stop', 'length'), ('stop', 'stop'))[index]
             return _PromptGroupRolloutStats(lengths, reasons, (index + 1, index + 1))
 
-        async def _emit(self, event, event_context, partition_id, metrics):
-            self.events.append((event, event_context, partition_id, metrics))
+        def _record_metrics(self, group, values, **kwargs):
+            self.events.append((group, values, kwargs))
 
     sampler = RolloutMetricsHarness()
     asyncio.run(
@@ -477,15 +550,15 @@ def test_sampler_reports_submission_throughput_at_partition_or_shard_scope(dp_si
             time.perf_counter() - 1,
         ))
 
-    event, event_context, partition_id, metrics = sampler.events[-1]
-    assert event == expected_event
-    assert event_context == context
-    assert partition_id == admission.partition_id
+    recorded_group, metrics, record_options = sampler.events[-1]
+    assert recorded_group.context == context
+    assert recorded_group.partition_id == admission.partition_id
+    assert record_options['attributes']['scope'] == expected_scope
     assert metrics['prompt_group_count'] == 2
     assert metrics['sample_count'] == 4
     assert metrics['output_tokens'] == 100
     assert metrics['completion_length_mean'] == 25
-    assert metrics['completion_truncated_samples'] == 1
+    assert metrics['completion_truncated_count'] == 1
     assert metrics['policy_version_min'] == 1
     assert metrics['policy_version_max'] == 2
     assert metrics['sampler_dp_size'] == dp_size
@@ -628,6 +701,8 @@ def test_aborted_generation_continues_from_partial_tokens_when_enabled():
     assert sampler.calls == [([1, 2], 4, 3), ([1, 2, 7], 3, 4)]
     assert generated.response.sequences[0].tokens == [7, 8]
     assert [policy.version for policy in generated.policies] == [3, 4]
+    assert generated.initial_policy.version == 3
+    assert generated.final_policy.version == 4
     assert generated.retry_count == 1
     assert generated.was_aborted
     assert generated.resumed_partial_output
@@ -856,14 +931,6 @@ def test_context_group_sampler_uses_request_generation_count():
     assert consumed == selected
 
 
-def test_partition_status_only_represents_normal_lifecycle():
-    assert set(PartitionStatus) == {
-        PartitionStatus.ROLLOUT,
-        PartitionStatus.TRAINING,
-        PartitionStatus.PUBLISHED,
-    }
-
-
 def test_context_finishes_after_exhaustion_and_clear():
     context = _context()
     manager = LoraContextManager()
@@ -892,7 +959,7 @@ def test_pipeline_fails_fast_when_a_worker_service_fails():
         async def get_service_state(self):
             return {'running': False, 'failure': 'CUDA out of memory'}
 
-        def drain_metrics(self):
+        def drain_metric_records(self):
             return []
 
     worker = LocalActorHandle(FailedWorker())
@@ -909,6 +976,40 @@ def test_pipeline_fails_fast_when_a_worker_service_fails():
         assert 'CUDA out of memory' in str(exc)
     else:
         raise AssertionError('expected worker failure to fail the pipeline')
+
+
+def test_pipeline_drains_actor_metric_buffers_when_reporting_is_disabled():
+    class BufferedWorker:
+        def __init__(self):
+            self.drain_count = 0
+
+        def drain_metric_records(self):
+            self.drain_count += 1
+            return [MetricRecord(stage='train', values={'loss': 1.0})]
+
+    class BufferedSampler:
+        def __init__(self):
+            self.drain_count = 0
+
+        def drain_metric_records(self):
+            self.drain_count += 1
+            return [MetricRecord(stage='rollout', values={'sample_count': 1})]
+
+    workers = [BufferedWorker() for _ in range(3)]
+    sampler = BufferedSampler()
+    pipeline = AsyncMultiLoraGRPOPipeline(
+        context_manager=object(),
+        rollout_worker=LocalActorHandle(workers[0]),
+        advantage_worker=LocalActorHandle(workers[1]),
+        trainer_worker=LocalActorHandle(workers[2]),
+        sampler=sampler,
+        metrics=None,
+    )
+
+    asyncio.run(pipeline._drain_metrics())
+
+    assert [worker.drain_count for worker in workers] == [1, 1, 1]
+    assert sampler.drain_count == 1
 
 
 def test_global_max_steps_limits_admission_and_closes_after_completion():
@@ -937,7 +1038,7 @@ def test_zero_max_steps_finishes_without_admission():
 def test_rollout_sample_tags_use_new_context_descriptor_only():
     context = _context()
     admission = PartitionAdmission(context, context.partition_id(0), 0, 1, 2, 0)
-    group = PromptGroup(context, admission, f'{admission.partition_id}/group_0', {}, storage=None)
+    group = PromptGroup(context, admission, f'{admission.partition_id}/group_0', {}, batch_meta=None)
     fields, tags = build_rollout_group_sample_write(
         group,
         [
@@ -1082,11 +1183,14 @@ def test_checkpoint_retention_preserves_current_policy_and_history_window():
     asyncio.run(prune())
     assert removed == ['initial']
     assert worker._adapter_history[context.key] == ['current']
-    prune_events = [event for event in worker.drain_metrics() if event.event == 'adapter_pruned']
+    prune_events = [
+        record for record in worker.drain_metric_records()
+        if record.stage == 'policy' and record.attributes.get('operation') == 'adapter_prune'
+    ]
     assert len(prune_events) == 1
-    assert prune_events[0].context == context
-    assert prune_events[0].metrics['adapter_path'] == 'initial'
-    assert prune_events[0].metrics['adapter_prune_latency_s'] >= 0
+    assert prune_events[0].context_key == context.key
+    assert prune_events[0].attributes['adapter_path'] == 'initial'
+    assert prune_events[0].values['adapter_prune_latency_s'] >= 0
 
 
 def test_trainer_periodically_evaluates_published_policy():
@@ -1128,11 +1232,11 @@ def test_trainer_periodically_evaluates_published_policy():
 
     asyncio.run(evaluate())
     assert len(calls) == 2
-    events = [event for event in worker.drain_metrics() if event.event == 'eval_done']
-    assert len(events) == 1
-    assert events[0].policy_version == 5
-    assert events[0].metrics['accuracy'] == 1.0
-    assert events[0].metrics['prompt_count'] == 2
-    assert events[0].metrics['sample_count'] == 2
-    assert events[0].metrics['completion_length'] == 10
-    assert events[0].metrics['optimizer_step'] == 50
+    records = [record for record in worker.drain_metric_records() if record.stage == 'evaluation']
+    assert len(records) == 1
+    assert records[0].policy_version == 5
+    assert records[0].optimizer_step == 50
+    assert records[0].values['accuracy'] == 1.0
+    assert records[0].values['prompt_count'] == 2
+    assert records[0].values['sample_count'] == 2
+    assert records[0].values['completion_length'] == 10

@@ -8,8 +8,25 @@ runtime:
   max_steps: null
   keep_adapter_versions: 2
   output_dir: output/sync_barrier_multi_lora_dapo_grpo
-  metrics_path: outputs/sync_barrier_rl/dapo_metrics.jsonl
   run_id: sync_barrier_multi_lora_dapo_grpo
+
+metrics:
+  enabled: true
+  drain_interval_s: 1.0
+  queue_capacity: 10000
+  close_timeout_s: 10
+  jsonl:
+    enabled: true
+    path: outputs/sync_barrier_rl/dapo_metrics.jsonl
+    summary_path: outputs/sync_barrier_rl/dapo_summary.json
+    batch_size: 64
+    flush_interval_s: 2.0
+  swanlab:
+    enabled: false
+    mode: local
+    project: twinkle-rl
+    name: ${runtime.run_id}
+    log_dir: outputs/swanlab
 
 template:
   cls: Template
@@ -34,22 +51,30 @@ sampler:
   enforce_eager: true
 
 lora:
+  target_modules: all-linear
   r: 16
   alpha: 32
   dropout: 0.0
   # Match the async DAPO baseline exactly. No scheduler means constant LR.
   learning_rate: 1.0e-6
 
+loss:
+  cls: GRPOLoss
+  epsilon: 0.2
+  normalization: sequence_mean
+
 lora_contexts:
   # Set both environment variables to the same files used by the async experiment.
   - tenant_id: tenant_a
     training_run_id: dapo_sync
     adapter_name: tenant_a_dapo_math_lora
-    reward_type: dapo_math
     reward:
-      overlong_buffer_length: 4096
-      overlong_penalty_factor: 1.0
-      score_tail_chars: 300
+      class_path: twinkle.reward.DAPOMathReward
+      kwargs:
+        max_response_length: ${...rollout.max_tokens}
+        overlong_buffer_length: 4096
+        overlong_penalty_factor: 1.0
+        score_tail_chars: 300
     dataset:
       dataset_id: ${oc.env:TENANT_A_DAPO_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
       subset_name: default
@@ -72,11 +97,13 @@ lora_contexts:
   - tenant_id: tenant_b
     training_run_id: dapo_sync
     adapter_name: tenant_b_dapo_math_lora
-    reward_type: dapo_math
     reward:
-      overlong_buffer_length: 4096
-      overlong_penalty_factor: 1.0
-      score_tail_chars: 300
+      class_path: twinkle.reward.DAPOMathReward
+      kwargs:
+        max_response_length: ${...rollout.max_tokens}
+        overlong_buffer_length: 4096
+        overlong_penalty_factor: 1.0
+        score_tail_chars: 300
     dataset:
       dataset_id: ${oc.env:TENANT_B_DAPO_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
       subset_name: default

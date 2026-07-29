@@ -36,6 +36,7 @@ async-rl = [
   "ray[serve]",
   "TransferQueue>=0.1.9.dev0",
   "math-verify==0.8.0",
+  "swanlab>=0.8",
 ]
 client = [
   "textual>=1.0.0",

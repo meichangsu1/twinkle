@@ -11,11 +11,12 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
+from twinkle.metric import MetricBuffer, MetricRecord
 from .context_manager import ContextStatus, LoraContextManager
 from .data_plane import TQDataPlane
-from .metrics import MetricsBuffer, advantage_signal_metrics, training_policy_metrics
+from .metrics import advantage_signal_metrics, training_policy_metrics
 from .scheduler import ContextScheduler, ScheduleCandidate, SchedulerConfig
-from .types import LoraContext, MetricEvent, PartitionAdmission, PreparedPartition
+from .types import LoraContext, PartitionAdmission
 
 
 class _Worker:
@@ -25,6 +26,7 @@ class _Worker:
         self._service_task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._failure: str | None = None
+        self.metric_buffer = MetricBuffer()
 
     async def start(self) -> None:
         if self._service_task is not None and not self._service_task.done():
@@ -48,6 +50,34 @@ class _Worker:
             'running': self._service_task is not None and not self._service_task.done(),
             'failure': self._failure,
         }
+
+    def drain_metric_records(self) -> list[MetricRecord]:
+        return self.metric_buffer.drain()
+
+    def _record_metric(
+        self,
+        stage: str,
+        *,
+        context: LoraContext | None = None,
+        admission: PartitionAdmission | None = None,
+        partition_id: str | None = None,
+        values: dict[str, Any] | None = None,
+        status: str = 'completed',
+        attributes: dict[str, Any] | None = None,
+        optimizer_step: int | None = None,
+        policy_version: int | None = None,
+    ) -> None:
+        self.metric_buffer.record(MetricRecord(
+            stage=stage,
+            values=dict(values or {}),
+            context_key=context.key if context is not None else None,
+            partition_id=admission.partition_id if admission is not None else partition_id,
+            partition_index=admission.step if admission is not None else None,
+            optimizer_step=optimizer_step,
+            policy_version=policy_version,
+            status=status,
+            attributes=dict(attributes or {}),
+        ))
 
     async def _run_service(self) -> None:
         try:
@@ -80,7 +110,6 @@ class RolloutWorker(_Worker):
         self.sampler = sampler
         self.context_manager = context_manager
         self.idle_delay_s = idle_delay_s
-        self.metrics = MetricsBuffer()
         self.rollout_config = rollout_config
         self.scheduler = ContextScheduler(scheduler)
         self.allow_partial_rollout = allow_partial_rollout
@@ -89,17 +118,6 @@ class RolloutWorker(_Worker):
             for key, value in prompt_batches.items()
         }
         self._next_batch_tasks: dict[str, asyncio.Task[Sequence[dict[str, Any]] | None]] = {}
-
-    def drain_metrics(self) -> list[MetricEvent]:
-        return self.metrics.drain()
-
-    def _record(self,
-                event: str,
-                context: LoraContext | None,
-                partition_id: str | None,
-                metrics: dict[str, Any],
-                policy_version: int | None = None) -> None:
-        self.metrics.record(event, context, partition_id, metrics, policy_version)
 
     def _start_next_batch(self, key: str) -> None:
         if key not in self._next_batch_tasks:
@@ -145,7 +163,12 @@ class RolloutWorker(_Worker):
                 batch = batch_task.result()
             except Exception as exc:
                 self._next_batch_tasks.pop(key)
-                self._record('rollout_failed', candidate.context, None, {'error': f'prompt loading failed: {exc}'})
+                self._record_metric(
+                    'rollout',
+                    context=candidate.context,
+                    status='failed',
+                    attributes={'error': f'prompt loading failed: {exc}'},
+                )
                 raise RuntimeError(f'prompt loading failed for {key}: {exc}') from exc
             if batch is None or len(batch) != int(config['batch_size']):
                 self._next_batch_tasks.pop(key)
@@ -177,22 +200,29 @@ class RolloutWorker(_Worker):
                     self.allow_partial_rollout,
                 )
             except Exception as exc:
-                self._record(
-                    'rollout_failed',
-                    admission.context,
-                    admission.partition_id,
-                    {'error': str(exc)},
+                self._record_metric(
+                    'rollout',
+                    context=admission.context,
+                    admission=admission,
+                    status='failed',
+                    attributes={'error': str(exc)},
                 )
                 raise RuntimeError(f'rollout submission failed for {admission.partition_id}: {exc}') from exc
             self._start_next_batch(key)
             self.scheduler.on_success(candidate)
-            self._record(
-                'rollout_submitted', admission.context, admission.partition_id, {
+            self._record_metric(
+                'rollout',
+                context=admission.context,
+                admission=admission,
+                status='submitted',
+                values={
                     'prompt_count': admission.target_groups,
                     'sample_count': admission.sample_count,
                     'num_generations': admission.num_generations,
                     'rollout_submission_latency_s': time.perf_counter() - submission_started,
-                })
+                },
+                attributes={'scope': 'partition'},
+            )
 
 
 class AdvantageWorker(_Worker):
@@ -208,29 +238,17 @@ class AdvantageWorker(_Worker):
         self.data_plane = data_plane
         self.context_manager = context_manager
         self.idle_delay_s = idle_delay_s
-        self.metrics = MetricsBuffer()
         self.advantage_fn = advantage_fn
         self.scheduler = ContextScheduler(scheduler)
 
-    def drain_metrics(self) -> list[MetricEvent]:
-        return self.metrics.drain()
-
-    def _record(self,
-                event: str,
-                context: LoraContext | None,
-                partition_id: str | None,
-                metrics: dict[str, Any],
-                policy_version: int | None = None) -> None:
-        self.metrics.record(event, context, partition_id, metrics, policy_version)
-
     async def _serve(self) -> None:
         while not self._stop_requested and not await self.context_manager.is_run_finished.remote():
-            leases = await self.context_manager.list_live_partitions.remote()
+            admissions = await self.context_manager.list_live_partitions.remote()
             blocked: set[str] = set()
             progressed = False
-            for _ in range(len(leases)):
+            for _ in range(len(admissions)):
                 candidates = [
-                    ScheduleCandidate(admission.context, admission) for admission in leases
+                    ScheduleCandidate(admission.context, admission) for admission in admissions
                     if admission.partition_id not in blocked
                 ]
                 candidate = self.scheduler.choose(candidates)
@@ -247,7 +265,13 @@ class AdvantageWorker(_Worker):
                     advantages, returns = self.advantage_fn(batch.data, admission)
                     await self.data_plane.write_advantages(batch, advantages=advantages, returns=returns)
                 except Exception as exc:
-                    self._record('advantage_failed', admission.context, admission.partition_id, {'error': str(exc)})
+                    self._record_metric(
+                        'advantage',
+                        context=admission.context,
+                        admission=admission,
+                        status='failed',
+                        attributes={'error': str(exc)},
+                    )
                     raise RuntimeError(f'advantage failed for {admission.partition_id}: {exc}') from exc
                 self.scheduler.on_success(candidate)
                 policy = await self.context_manager.get_rollout_policy.remote(admission.context)
@@ -260,8 +284,13 @@ class AdvantageWorker(_Worker):
                     'sample_count': len(advantages),
                     'advantage_latency_s': time.perf_counter() - started,
                 })
-                self._record(
-                    'advantage_done', admission.context, admission.partition_id, advantage_metrics, policy.version)
+                self._record_metric(
+                    'advantage',
+                    context=admission.context,
+                    admission=admission,
+                    values=advantage_metrics,
+                    policy_version=policy.version,
+                )
                 progressed = True
                 break
             if not progressed:
@@ -289,7 +318,6 @@ class TrainerWorker(_Worker):
         self.data_plane = data_plane
         self.context_manager = context_manager
         self.idle_delay_s = idle_delay_s
-        self.metrics = MetricsBuffer()
         self.train_fn = train_fn
         self.save_adapter = save_adapter
         self.mini_batch_sizes = mini_batch_sizes
@@ -306,17 +334,6 @@ class TrainerWorker(_Worker):
         self._evaluation_batches: dict[str, list[Sequence[dict[str, Any]]]] = {}
         self._optimizer_steps: dict[str, int] = defaultdict(int)
 
-    def drain_metrics(self) -> list[MetricEvent]:
-        return self.metrics.drain()
-
-    def _record(self,
-                event: str,
-                context: LoraContext | None,
-                partition_id: str | None,
-                metrics: dict[str, Any],
-                policy_version: int | None = None) -> None:
-        self.metrics.record(event, context, partition_id, metrics, policy_version)
-
     async def stop(self) -> None:
         await super().stop()
         pending = tuple(self._adapter_removal_tasks)
@@ -325,12 +342,12 @@ class TrainerWorker(_Worker):
 
     async def _serve(self) -> None:
         while not self._stop_requested and not await self.context_manager.is_run_finished.remote():
-            leases = await self.context_manager.list_trainable_partitions.remote()
+            admissions = await self.context_manager.list_trainable_partitions.remote()
             blocked: set[str] = set()
             progressed = False
-            for _ in range(len(leases)):
+            for _ in range(len(admissions)):
                 candidates = [
-                    ScheduleCandidate(admission.context, admission) for admission in leases
+                    ScheduleCandidate(admission.context, admission) for admission in admissions
                     if admission.partition_id not in blocked
                 ]
                 candidate = self.scheduler.choose(candidates)
@@ -351,7 +368,13 @@ class TrainerWorker(_Worker):
                             progressed = True
                             break
                         except Exception as exc:
-                            self._record('train_failed', admission.context, admission.partition_id, {'error': str(exc)})
+                            self._record_metric(
+                                'train',
+                                context=admission.context,
+                                admission=admission,
+                                status='failed',
+                                attributes={'error': str(exc)},
+                            )
                             raise RuntimeError(
                                 f'training completion failed for {admission.partition_id}: {exc}') from exc
                     blocked.add(admission.partition_id)
@@ -368,7 +391,13 @@ class TrainerWorker(_Worker):
                     started = time.perf_counter()
                     metrics = dict(self.train_fn(batch.data, admission) or {})
                 except Exception as exc:
-                    self._record('train_failed', admission.context, admission.partition_id, {'error': str(exc)})
+                    self._record_metric(
+                        'train',
+                        context=admission.context,
+                        admission=admission,
+                        status='failed',
+                        attributes={'error': str(exc)},
+                    )
                     raise RuntimeError(f'training failed for {admission.partition_id}: {exc}') from exc
                 self.scheduler.on_success(candidate)
                 metrics['sample_count'] = sample_count
@@ -378,13 +407,14 @@ class TrainerWorker(_Worker):
                 metrics.update(training_policy_metrics(batch.sample_tags, policy.version))
                 context_key = admission.context.key
                 self._optimizer_steps[context_key] += 1
-                metrics['optimizer_step'] = self._optimizer_steps[context_key]
-                self._record(
-                    'train_step_done',
-                    admission.context,
-                    admission.partition_id,
-                    metrics,
-                    policy.version,
+                optimizer_step = self._optimizer_steps[context_key]
+                self._record_metric(
+                    'train',
+                    context=admission.context,
+                    admission=admission,
+                    values=metrics,
+                    optimizer_step=optimizer_step,
+                    policy_version=policy.version,
                 )
                 progressed = True
                 break
@@ -399,16 +429,17 @@ class TrainerWorker(_Worker):
         publish_started = time.perf_counter()
         policy = await self.context_manager.on_partition_trained.remote(admission, adapter_path=adapter_path)
         policy_publish_latency_s = time.perf_counter() - publish_started
-        self._record(
-            'policy_published',
-            admission.context,
-            admission.partition_id,
-            {
-                'adapter_path': adapter_path,
+        self._record_metric(
+            'policy',
+            context=admission.context,
+            admission=admission,
+            values={
                 'adapter_save_latency_s': adapter_save_latency_s,
                 'policy_publish_latency_s': policy_publish_latency_s,
             },
-            policy.version,
+            attributes={'operation': 'publish', 'adapter_path': adapter_path},
+            optimizer_step=self._optimizer_steps[admission.context.key],
+            policy_version=policy.version,
         )
         await self._evaluate_policy(admission, adapter_path, policy.version)
         clear_started = time.perf_counter()
@@ -421,11 +452,11 @@ class TrainerWorker(_Worker):
         prune_started = time.perf_counter()
         await self._prune_adapter_history(admission.context)
         adapter_prune_schedule_latency_s = time.perf_counter() - prune_started
-        self._record(
-            'partition_done',
-            admission.context,
-            admission.partition_id,
-            {
+        self._record_metric(
+            'partition',
+            context=admission.context,
+            admission=admission,
+            values={
                 'adapter_save_latency_s': adapter_save_latency_s,
                 'policy_publish_latency_s': policy_publish_latency_s,
                 'tq_clear_latency_s': tq_clear_latency_s,
@@ -433,7 +464,8 @@ class TrainerWorker(_Worker):
                 'adapter_prune_schedule_latency_s': adapter_prune_schedule_latency_s,
                 'partition_finalize_latency_s': time.perf_counter() - finalize_started,
             },
-            policy.version,
+            optimizer_step=self._optimizer_steps[admission.context.key],
+            policy_version=policy.version,
         )
 
     async def _evaluate_policy(self, admission: PartitionAdmission, adapter_path: str, policy_version: int) -> None:
@@ -467,20 +499,20 @@ class TrainerWorker(_Worker):
             prompt_count += len(batch)
         if not rewards:
             raise ValueError(f'evaluation dataset is empty for {context_key}')
-        self._record(
-            'eval_done',
-            admission.context,
-            admission.partition_id,
-            {
+        self._record_metric(
+            'evaluation',
+            context=admission.context,
+            admission=admission,
+            values={
                 'accuracy': sum(rewards) / len(rewards),
                 'sample_count': len(rewards),
                 'prompt_count': prompt_count,
                 'completion_length': sum(completion_lengths) / len(completion_lengths),
                 'eval_latency_s': time.perf_counter() - started,
-                'eval_dataset': config['dataset_name'],
-                'optimizer_step': self._optimizer_steps[context_key],
             },
-            policy_version,
+            attributes={'eval_dataset': config['dataset_name']},
+            optimizer_step=self._optimizer_steps[context_key],
+            policy_version=policy_version,
         )
 
     async def _prune_adapter_history(self, context: LoraContext) -> None:
@@ -501,25 +533,23 @@ class TrainerWorker(_Worker):
         try:
             await asyncio.to_thread(self.remove_adapter, path)
         except OSError as exc:
-            self._record(
-                'adapter_prune_failed',
-                context,
-                None,
-                {
-                    'adapter_path': path,
+            self._record_metric(
+                'policy',
+                context=context,
+                status='failed',
+                values={
                     'adapter_prune_latency_s': time.perf_counter() - started,
-                    'error': str(exc),
                 },
+                attributes={'operation': 'adapter_prune', 'adapter_path': path, 'error': str(exc)},
             )
             return
-        self._record(
-            'adapter_pruned',
-            context,
-            None,
-            {
-                'adapter_path': path,
+        self._record_metric(
+            'policy',
+            context=context,
+            values={
                 'adapter_prune_latency_s': time.perf_counter() - started,
             },
+            attributes={'operation': 'adapter_prune', 'adapter_path': path},
         )
 
 

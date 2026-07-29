@@ -168,16 +168,22 @@ class TQDataPlane:
         rows = [dict(prompt) for prompt in prompts for _ in range(admission.num_generations)]
         metadata = await preallocate_partition(
             self.client, partition_id=admission.partition_id, prompt_fields=rows_to_tq_fields(rows))
-        group_storage = split_batch_meta(metadata, admission.num_generations)
+        group_batch_metas = split_batch_meta(metadata, admission.num_generations)
         groups = []
-        for index, (prompt, storage) in enumerate(zip(prompts, group_storage)):
+        for index, (prompt, batch_meta) in enumerate(zip(prompts, group_batch_metas)):
             group_id = f'{admission.partition_id}/group_{index}'
-            await set_sample_tags(self.client, storage, [{
+            await set_sample_tags(self.client, batch_meta, [{
                 'group_id': group_id,
                 'generation_idx': generation_idx,
                 'rollout_status': 'PENDING',
             } for generation_idx in range(admission.num_generations)])
-            groups.append(PromptGroup(admission.context, admission, group_id, dict(prompt), storage))
+            groups.append(PromptGroup(
+                context=admission.context,
+                partition=admission,
+                group_id=group_id,
+                prompt=dict(prompt),
+                batch_meta=batch_meta,
+            ))
         return PreparedPartition(admission, tuple(groups), sampling_params)
 
     async def complete_rollout_group(
@@ -207,20 +213,24 @@ class TQDataPlane:
             completed_tag.update(metrics)
             completed_tag.update({'rollout_status': 'ROLLOUT_DONE', 'submission_id': submission_id})
             completed_tags.append(completed_tag)
-        await set_sample_tags(self.client, group.storage, completed_tags)
-        await append_fields(self.client, rows_to_tq_fields(sample_fields), group.storage)
+        await set_sample_tags(self.client, group.batch_meta, completed_tags)
+        await append_fields(self.client, rows_to_tq_fields(sample_fields), group.batch_meta)
 
     async def claim_advantage_batch(self, admission: PartitionAdmission, group_count: int) -> ClaimedBatch | None:
         metadata = await self._claim(admission, group_count, ['input_ids', 'logprobs', 'rewards'],
                                      self._advantage_task(admission))
         if metadata is None:
             return None
-        return ClaimedBatch(admission, await self.client.async_get_data(metadata.select_fields(['rewards'])), metadata)
+        return ClaimedBatch(
+            admission=admission,
+            data=await self.client.async_get_data(metadata.select_fields(['rewards'])),
+            batch_meta=metadata,
+        )
 
     async def write_advantages(self, batch: ClaimedBatch, *, advantages: Any, returns: Any) -> None:
-        size = metadata_size(batch.storage)
+        size = metadata_size(batch.batch_meta)
         fields = columns_to_tq_fields({'advantages': list(advantages), 'returns': list(returns)}, size)
-        await append_fields(self.client, fields, batch.storage)
+        await append_fields(self.client, fields, batch.batch_meta)
 
     async def claim_training_batch(self, admission: PartitionAdmission, group_count: int) -> ClaimedBatch | None:
         metadata = await self._claim(
@@ -232,10 +242,10 @@ class TQDataPlane:
         if metadata is None:
             return None
         return ClaimedBatch(
-            admission,
-            await self.client.async_get_data(metadata),
-            metadata,
-            tuple(metadata.get_all_custom_meta()),
+            admission=admission,
+            data=await self.client.async_get_data(metadata),
+            batch_meta=metadata,
+            sample_tags=tuple(metadata.get_all_custom_meta()),
         )
 
     async def is_training_consumed(self, admission: PartitionAdmission) -> bool:

@@ -15,12 +15,6 @@ class ContextStatus(StrEnum):
     FINISHED = 'FINISHED'
 
 
-class PartitionStatus(StrEnum):
-    ROLLOUT = 'ROLLOUT'
-    TRAINING = 'TRAINING'
-    PUBLISHED = 'PUBLISHED'
-
-
 @dataclass
 class _ContextState:
     context: LoraContext
@@ -32,7 +26,6 @@ class _ContextState:
     dataset_exhausted: bool = False
     training_partition_id: str | None = None
     live_partitions: dict[str, PartitionAdmission] = field(default_factory=dict)
-    partition_status: dict[str, PartitionStatus] = field(default_factory=dict)
 
 
 class LoraContextManager:
@@ -91,7 +84,6 @@ class LoraContextManager:
         self._creation_order += 1
         state.next_step += 1
         state.live_partitions[admission.partition_id] = admission
-        state.partition_status[admission.partition_id] = PartitionStatus.ROLLOUT
         return admission
 
     def list_live_partitions(self) -> list[PartitionAdmission]:
@@ -128,7 +120,6 @@ class LoraContextManager:
         if oldest_partition.partition_id != admission.partition_id:
             raise RuntimeError(f'{admission.partition_id} cannot train before {oldest_partition.partition_id}')
         state.training_partition_id = admission.partition_id
-        state.partition_status[admission.partition_id] = PartitionStatus.TRAINING
 
     def on_partition_trained(self, admission: PartitionAdmission, *, adapter_path: str) -> RolloutPolicy:
         state = self._state(admission.context)
@@ -137,14 +128,12 @@ class LoraContextManager:
                                     adapter_path)
         state.policy = next_policy
         state.policy_history.append(next_policy)
-        state.partition_status[admission.partition_id] = PartitionStatus.PUBLISHED
         return next_policy
 
     def on_partition_cleared(self, admission: PartitionAdmission) -> None:
         state = self._state(admission.context)
         self._require_live(state, admission)
         state.live_partitions.pop(admission.partition_id)
-        state.partition_status.pop(admission.partition_id, None)
         if state.training_partition_id == admission.partition_id:
             state.training_partition_id = None
         state.completed_partitions += 1

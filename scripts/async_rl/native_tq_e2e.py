@@ -11,9 +11,11 @@ import yaml
 from pathlib import Path
 from typing import Any
 
+from twinkle.metric import MetricBuffer, MetricRecord, create_metrics_reporter
+from twinkle_agentic.async_rl.metrics import rollout_metrics
 from twinkle_agentic.async_rl import (AdvantageWorker, AsyncMultiLoraGRPOConfig, AsyncMultiLoraGRPOPipeline,
-                                      ContextSchedulePolicy, JSONLMetricsRecorder, LoraContext, LoraContextManager,
-                                      RolloutWorker, SchedulerConfig, TQDataPlane, TrainerWorker)
+                                      ContextSchedulePolicy, LoraContext, LoraContextManager, RolloutWorker,
+                                      SchedulerConfig, TQDataPlane, TrainerWorker)
 from twinkle_agentic.async_rl.tq_utils import columns_to_tq_fields
 
 
@@ -129,6 +131,7 @@ class FakeSampler:
         self.context_manager = context_manager
         self.loop = loop
         self._submissions = set()
+        self.metric_buffer = MetricBuffer()
 
     def sample(self, groups, sampling_params, allow_partial_rollout):
         future = asyncio.run_coroutine_threadsafe(self._sample(groups), self.loop)
@@ -142,7 +145,7 @@ class FakeSampler:
     async def _sample(self, groups):
         for group in groups:
             policy = await self.context_manager.get_rollout_policy.remote(group.context)
-            ids = group.storage.global_indexes
+            ids = group.batch_meta.global_indexes
             rewards = [float((index + 1) % 3) / 2 for index in ids]
             rollout_rows = [{
                 **group.prompt,
@@ -162,9 +165,24 @@ class FakeSampler:
                 rewards=rewards,
                 submission_id='fake',
             )
+            self.metric_buffer.record(MetricRecord(
+                stage='rollout',
+                context_key=group.context.key,
+                partition_id=group.partition_id,
+                partition_index=group.partition.step,
+                policy_version=policy.version,
+                values=rollout_metrics(
+                    rewards={'reward': rewards},
+                    completion_lengths=[row['completion_length'] for row in rollout_rows],
+                ),
+                attributes={'scope': 'group', 'group_id': group.group_id},
+            ))
 
-    def drain_metrics(self):
-        return []
+    def drain_metric_records(self):
+        return self.metric_buffer.drain()
+
+    def check_health(self):
+        return None
 
 
 def prompt_batches(count, batch_size):
@@ -180,8 +198,14 @@ def prompt_batches(count, batch_size):
 async def run(path: Path):
     config, client = yaml.safe_load(path.read_text()), FakeTQ()
     manager = LocalActorHandle(LoraContextManager(max_staleness=config['runtime']['max_staleness']))
-    data_plane, recorder = TQDataPlane(client), JSONLMetricsRecorder(
-        Path(config['runtime']['output_dir']) / 'metrics.jsonl', run_id='native_tq_smoke', mode='fake')
+    output_dir = Path(config['runtime']['output_dir'])
+    data_plane = TQDataPlane(client)
+    reporter = create_metrics_reporter({
+        'jsonl': {
+            'path': output_dir / 'metrics.jsonl',
+            'summary_path': output_dir / 'summary.json',
+        }
+    }, run_id='native_tq_smoke')
     sources, rollout_config = {}, {}
     mini_batch_sizes = {}
     for item in config['contexts']:
@@ -197,11 +221,12 @@ async def run(path: Path):
             'sampling_params': {},
         }
         mini_batch_sizes[key] = item['train']['mini_batch_size']
+    sampler = FakeSampler(client, manager, asyncio.get_running_loop())
     rollout = LocalActorHandle(
         RolloutWorker(
             context_manager=manager,
             data_plane=data_plane,
-            sampler=FakeSampler(client, manager, asyncio.get_running_loop()),
+            sampler=sampler,
             prompt_batches=sources,
             rollout_config=rollout_config,
             scheduler=SchedulerConfig(ContextSchedulePolicy.ROUND_ROBIN, 1),
@@ -232,8 +257,10 @@ async def run(path: Path):
         rollout_worker=rollout,
         advantage_worker=advantage,
         trainer_worker=trainer,
-        metrics=recorder,
+        sampler=sampler,
+        metrics=reporter,
         config=AsyncMultiLoraGRPOConfig(metrics_drain_interval_s=.001)).run_async()
+    reporter.close()
     result['remaining_partitions'] = len(client.partitions)
     print(json.dumps(result, indent=2))
     return result

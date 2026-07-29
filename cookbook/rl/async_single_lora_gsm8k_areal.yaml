@@ -1,4 +1,5 @@
 runtime:
+  run_id: async_single_lora_gsm8k_areal
   model_id: ${oc.env:MODEL_ID,/nas/disk1/Qwen3-4B}
   mode: ray
   model_gpus: 1
@@ -13,7 +14,24 @@ runtime:
   rollout_retry_delay_s: 0.5
   keep_adapter_versions: 2
   output_dir: output/async_single_lora_gsm8k_areal
-  metrics_path: outputs/async_rl/single_lora_gsm8k_areal_metrics.jsonl
+
+metrics:
+  enabled: true
+  drain_interval_s: 1.0
+  queue_capacity: 10000
+  close_timeout_s: 10
+  jsonl:
+    enabled: true
+    path: outputs/async_rl/single_lora_gsm8k_areal_metrics.jsonl
+    summary_path: outputs/async_rl/single_lora_gsm8k_areal_summary.json
+    batch_size: 64
+    flush_interval_s: 2.0
+  swanlab:
+    enabled: false
+    mode: local
+    project: twinkle-rl
+    name: ${runtime.run_id}
+    log_dir: outputs/swanlab
 
 template:
   cls: Template
@@ -58,16 +76,23 @@ evaluation:
     top_p: 1.0
 
 lora:
+  target_modules: all-linear
   r: 16
   alpha: 16
   dropout: 0.0
   learning_rate: 1.7e-5
 
+loss:
+  cls: GRPOLoss
+  epsilon: 0.2
+  normalization: token_mean
+
 lora_contexts:
   - tenant_id: tenant_single
     training_run_id: gsm8k_areal_pk
     adapter_name: gsm8k_areal_pk_lora
-    reward_type: math_verify_accuracy
+    reward:
+      class_path: twinkle.reward.MathVerifyAccuracyReward
     dataset:
       dataset_id: ${oc.env:GSM8K_TRAIN_DATASET_ID}
       subset_name: main
@@ -83,7 +108,8 @@ lora_contexts:
       data_num: null
       max_length: 1024
       processor: AReaLGSM8KProcessor
-      reward_type: math_verify_accuracy
+      reward:
+        class_path: twinkle.reward.MathVerifyAccuracyReward
     rollout:
       batch_size: 16
       num_generations: 4
@@ -93,7 +119,6 @@ lora_contexts:
     train:
       mini_batch_size: 64
       micro_batch_size: 64
-      loss_normalization: token_mean
       dynamic_batching: true
       max_tokens_per_micro_batch: 4096
       packing_algorithm: ffd

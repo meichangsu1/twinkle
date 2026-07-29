@@ -8,8 +8,25 @@ runtime:
   max_steps: null
   keep_adapter_versions: 2
   output_dir: output/sync_barrier_multi_lora_grpo
-  metrics_path: outputs/sync_barrier_rl/metrics.jsonl
   run_id: sync_barrier_multi_lora_grpo
+
+metrics:
+  enabled: true
+  drain_interval_s: 1.0
+  queue_capacity: 10000
+  close_timeout_s: 10
+  jsonl:
+    enabled: true
+    path: outputs/sync_barrier_rl/metrics.jsonl
+    summary_path: outputs/sync_barrier_rl/summary.json
+    batch_size: 64
+    flush_interval_s: 2.0
+  swanlab:
+    enabled: false
+    mode: local
+    project: twinkle-rl
+    name: ${runtime.run_id}
+    log_dir: outputs/swanlab
 
 template:
   cls: Qwen3_5Template
@@ -31,6 +48,7 @@ sampler:
   enforce_eager: false
 
 lora:
+  target_modules: all-linear
   r: 16
   alpha: 32
   dropout: 0.05
@@ -41,11 +59,17 @@ lora:
     T_max: 2000
     eta_min: 0.0
 
+loss:
+  cls: GRPOLoss
+  epsilon: 0.2
+  normalization: sequence_mean
+
 lora_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_sync
     adapter_name: tenant_a_gsm8k_lora
-    reward_type: gsm8k_accuracy_brevity
+    reward:
+      class_path: twinkle.reward.GSM8KAccuracyBrevityReward
     dataset:
       dataset_id: ${oc.env:TENANT_A_DATASET_ID}
       subset_name: main
@@ -70,7 +94,8 @@ lora_contexts:
   - tenant_id: tenant_b
     training_run_id: gsm8k_sync
     adapter_name: tenant_b_gsm8k_lora
-    reward_type: gsm8k_accuracy
+    reward:
+      class_path: twinkle.reward.GSM8KAccuracyReward
     dataset:
       dataset_id: ${oc.env:TENANT_B_DATASET_ID}
       subset_name: main

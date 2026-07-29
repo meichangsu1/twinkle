@@ -17,17 +17,23 @@ from typing import Any, Iterator, Sequence
 
 from omegaconf import OmegaConf
 
-from twinkle_agentic.async_rl.metrics import (JSONLMetricsRecorder, advantage_signal_metrics,
-                                              rollout_performance_metrics)
-from twinkle_agentic.async_rl.pipeline import (_model_attention_implementation, _prompt_batches,
-                                                _context_learning_rate, _context_loss_normalization,
-                                                _native_fsdp_model_kwargs,
-                                                _reward_for_context, _sampler_data_parallel_size,
-                                                _sequence_parallel_size, _train_batch, _validate_context_batch_config,
-                                                TrainBatchConfig,
-                                                configure_lora_lr_scheduler)
+from twinkle.metric import MetricRecord, create_metrics_reporter
+from twinkle_agentic.async_rl.metrics import advantage_signal_metrics, rollout_metrics
+from twinkle_agentic.async_rl.pipeline import (_prompt_batches, _reward_for_context, _train_batch)
 from twinkle_agentic.async_rl.tq_utils import REQUIRED_MODEL_INPUT_FIELDS, columns_to_tq_fields
 from twinkle_agentic.async_rl.types import LoraContext, PartitionAdmission
+from twinkle_agentic.async_rl.utils import (
+    TrainBatchConfig,
+    build_native_fsdp_model_kwargs,
+    configure_lora_lr_scheduler,
+    resolve_context_learning_rate,
+    resolve_context_lora_target_modules,
+    resolve_context_loss_config,
+    resolve_model_attention_implementation,
+    resolve_sequence_parallel_size,
+    sampler_data_parallel_size,
+    validate_context_batch_config,
+)
 from twinkle_agentic.async_rl.vllm_sampler_tq import (_compute_reward_metrics,
                                                       _sample_responses_to_rollout_rows)
 
@@ -69,22 +75,27 @@ class SyncBarrierMultiLoraGRPO:
         from twinkle.processor import InputProcessor
         from twinkle.sampler import vLLMSampler
 
+        raw_config = OmegaConf.to_container(OmegaConf.create(raw_config), resolve=True)
+        if not isinstance(raw_config, dict):
+            raise TypeError('sync RL config must resolve to a mapping')
+
         runtime = raw_config['runtime']
         model_config = raw_config['model']
         lora_data = raw_config['lora']
+        loss_data = raw_config.get('loss')
         template_data = raw_config.get('template', {})
         template_cls = template_data.get('cls', 'Qwen3_5Template')
         enable_thinking = bool(template_data.get('enable_thinking', False))
         model_gpus = int(runtime['model_gpus'])
         sampler_gpus = int(runtime['sampler_gpus'])
         sampler_tp = int(runtime['sampler_tp'])
-        sampler_dp = _sampler_data_parallel_size(sampler_gpus, sampler_tp)
-        sequence_parallel_size = _sequence_parallel_size(
+        sampler_dp = sampler_data_parallel_size(sampler_gpus, sampler_tp)
+        sequence_parallel_size = resolve_sequence_parallel_size(
             model_gpus,
             int(model_config['sequence_parallel_size']),
         )
         padding_free = bool(model_config['padding_free'])
-        attn_implementation = _model_attention_implementation(
+        attn_implementation = resolve_model_attention_implementation(
             model_config,
             padding_free=padding_free,
             sequence_parallel_size=sequence_parallel_size,
@@ -119,7 +130,7 @@ class SyncBarrierMultiLoraGRPO:
             dp_size=sampler_dp,
             tp_size=sampler_tp,
         )
-        model_kwargs = _native_fsdp_model_kwargs(model_config)
+        model_kwargs = build_native_fsdp_model_kwargs(model_config)
         if attn_implementation is not None:
             model_kwargs['attn_implementation'] = attn_implementation
         self.model = MultiLoraTransformersModel(
@@ -129,12 +140,6 @@ class SyncBarrierMultiLoraGRPO:
             max_length=model_max_length,
             **model_kwargs,
         )
-        lora_config = LoraConfig(
-            target_modules='all-linear',
-            r=lora_data['r'],
-            lora_alpha=lora_data['alpha'],
-            lora_dropout=lora_data['dropout'],
-        )
         self.train_batch_configs: dict[str, TrainBatchConfig] = {}
         self.states: list[SyncContextState] = []
         for item in raw_config['lora_contexts']:
@@ -143,7 +148,6 @@ class SyncBarrierMultiLoraGRPO:
                 item['training_run_id'],
                 runtime['model_id'],
                 item['adapter_name'],
-                item.get('reward_type', 'gsm8k_accuracy'),
             )
             rollout = item['rollout']
             train = item['train']
@@ -159,7 +163,7 @@ class SyncBarrierMultiLoraGRPO:
                 ),
                 packing_algorithm=str(train.get('packing_algorithm', 'ffd')),
             )
-            _validate_context_batch_config(
+            validate_context_batch_config(
                 context.key,
                 rollout_groups=rollout_batch_size,
                 num_generations=num_generations,
@@ -167,18 +171,28 @@ class SyncBarrierMultiLoraGRPO:
                 sampler_dp=sampler_dp,
                 model_dp=model_data_parallel_size,
             )
-            self.model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
+            adapter_lora_config = LoraConfig(
+                target_modules=resolve_context_lora_target_modules(item, lora_data),
+                r=lora_data['r'],
+                lora_alpha=lora_data['alpha'],
+                lora_dropout=lora_data['dropout'],
+            )
+            self.model.add_adapter_to_model(
+                context.adapter_name,
+                adapter_lora_config,
+                gradient_accumulation_steps=1,
+            )
             self.model.set_optimizer(
                 'AdamW',
-                lr=_context_learning_rate(train, lora_data),
+                lr=resolve_context_learning_rate(train, lora_data),
                 adapter_name=context.adapter_name,
             )
             configure_lora_lr_scheduler(self.model, context.adapter_name, lora_data)
+            loss_cls, loss_kwargs = resolve_context_loss_config(item, loss_data)
             self.model.set_loss(
-                'GRPOLoss',
-                epsilon=.2,
-                normalization=_context_loss_normalization(train),
+                loss_cls,
                 adapter_name=context.adapter_name,
+                **loss_kwargs,
             )
             self.model.set_processor(
                 InputProcessor,
@@ -219,9 +233,8 @@ class SyncBarrierMultiLoraGRPO:
                 ),
                 mini_batch_size=train_batch_config.mini_batch_size,
                 reward_fn=_reward_for_context(
-                    context,
-                    reward_config=item.get('reward'),
-                    rollout_config=rollout,
+                    item.get('reward'),
+                    context_key=context.key,
                 ),
                 adapter_path=initial_path,
                 adapter_history=[initial_path],
@@ -257,48 +270,60 @@ class SyncBarrierMultiLoraGRPO:
         self.max_steps = runtime.get('max_steps')
         self.max_steps = None if self.max_steps is None else int(self.max_steps)
         self.keep_adapter_versions = max(0, int(runtime.get('keep_adapter_versions', 0)))
-        self.metrics = JSONLMetricsRecorder(
-            runtime['metrics_path'],
-            run_id=runtime.get('run_id', 'sync_barrier_multi_lora_grpo'),
-            mode='sync_barrier',
+        self.metrics = create_metrics_reporter(
+            raw_config.get('metrics'),
+            run_id=str(runtime.get('run_id', 'sync_barrier_multi_lora_grpo')),
         )
         self.completed_partitions = 0
         self._creation_order = 0
 
+    def _record_metric(
+        self,
+        stage: str,
+        *,
+        admission: PartitionAdmission | None = None,
+        context: LoraContext | None = None,
+        values: dict[str, Any] | None = None,
+        status: str = 'completed',
+        attributes: dict[str, Any] | None = None,
+        optimizer_step: int | None = None,
+        policy_version: int | None = None,
+    ) -> None:
+        if self.metrics is None:
+            return
+        self.metrics.record(MetricRecord(
+            stage=stage,
+            values=dict(values or {}),
+            context_key=(
+                admission.context.key if admission is not None
+                else context.key if context is not None else None
+            ),
+            partition_id=admission.partition_id if admission is not None else None,
+            partition_index=admission.step if admission is not None else None,
+            optimizer_step=optimizer_step,
+            policy_version=policy_version,
+            status=status,
+            attributes=dict(attributes or {}),
+        ))
+
     def run(self) -> dict[str, Any]:
         started = time.perf_counter()
-        round_index = 0
         try:
             while self.max_steps is None or self.completed_partitions < self.max_steps:
-                self.metrics.record(
-                    event='barrier_round_started',
-                    metrics={'round_index': round_index, 'trained_partitions': self.completed_partitions},
-                )
                 partitions = self._rollout_round()
                 if not partitions:
                     break
                 self._advantage_round(partitions)
                 self._train_round(partitions)
-                self.metrics.record(
-                    event='barrier_round_done',
-                    metrics={
-                        'round_index': round_index,
-                        'trained_partitions': self.completed_partitions,
-                        'overlap_ratio': 0.0,
-                    },
-                )
-                round_index += 1
         except Exception as exc:
-            self.metrics.flush()
-            self.metrics.record(
-                event='run_failed',
-                metrics={
-                    'error': f'{type(exc).__name__}: {exc}',
-                    'wall_time_s': time.perf_counter() - started,
-                    **self.metrics.stats(),
-                },
+            self._record_metric(
+                'run',
+                status='failed',
+                values={'wall_time_s': time.perf_counter() - started},
+                attributes={'error': f'{type(exc).__name__}: {exc}'},
             )
-            self.metrics.close()
+            if self.metrics is not None:
+                self.metrics.close()
             raise
         result = {
             'trained_partitions': self.completed_partitions,
@@ -312,10 +337,17 @@ class SyncBarrierMultiLoraGRPO:
                 for state in self.states
             },
         }
-        self.metrics.flush()
-        result.update(self.metrics.stats())
-        self.metrics.record(event='run_completed', metrics=result)
-        self.metrics.close()
+        self._record_metric(
+            'run',
+            values={
+                'trained_partitions': result['trained_partitions'],
+                'wall_time_s': result['wall_time_s'],
+            },
+        )
+        if self.metrics is not None:
+            self.metrics.flush()
+            result['metrics_health'] = self.metrics.health()
+            self.metrics.close()
         return result
 
     def _rollout_round(self) -> list[SyncPartition]:
@@ -338,16 +370,17 @@ class SyncBarrierMultiLoraGRPO:
                 created_order=self._creation_order,
             )
             self._creation_order += 1
-            self.metrics.record(
-                event='rollout_submitted',
-                context=state.context,
-                partition_id=admission.partition_id,
+            self._record_metric(
+                'rollout',
+                admission=admission,
+                status='submitted',
                 policy_version=state.policy_version,
-                metrics={
+                values={
                     'prompt_count': admission.target_groups,
                     'sample_count': admission.sample_count,
                     'num_generations': admission.num_generations,
                 },
+                attributes={'scope': 'partition'},
             )
             rollout_started = time.perf_counter()
             sources = [{
@@ -382,21 +415,20 @@ class SyncBarrierMultiLoraGRPO:
             if len(rewards) != len(rows):
                 raise ValueError(f'{admission.partition_id} reward count does not match sample count')
             rollout_latency_s = time.perf_counter() - rollout_started
-            self._record_rollout_groups(state, admission, rows, rewards, rollout_latency_s)
-            self.metrics.record(
-                event='rollout_partition_done',
-                context=admission.context,
-                partition_id=admission.partition_id,
+            self._record_rollout_groups(state, admission, rows, rewards)
+            self._record_metric(
+                'rollout',
+                admission=admission,
                 policy_version=state.policy_version,
-                metrics=rollout_performance_metrics(rows, rollout_latency_s=rollout_latency_s),
+                values=rollout_metrics(
+                    completion_lengths=[int(row['completion_length']) for row in rows],
+                    stop_reasons=[row.get('stop_reason') for row in rows],
+                    rollout_latency_s=rollout_latency_s,
+                ),
+                attributes={'scope': 'partition'},
             )
             partitions.append(SyncPartition(admission, state, rows, rewards))
             state.partition_step += 1
-        if partitions:
-            self.metrics.record(
-                event='rollout_barrier_reached',
-                metrics={'partitions': len(partitions), 'trained_partitions': self.completed_partitions},
-            )
         return partitions
 
     def _record_rollout_groups(
@@ -405,7 +437,6 @@ class SyncBarrierMultiLoraGRPO:
         admission: PartitionAdmission,
         rows: list[dict[str, Any]],
         rewards: list[float],
-        rollout_latency_s: float,
     ) -> None:
         for group_index in range(admission.target_groups):
             start = group_index * admission.num_generations
@@ -419,18 +450,21 @@ class SyncBarrierMultiLoraGRPO:
                     group_rows,
                     group_rewards,
                 ),
-                'group_id': f'{admission.partition_id}/group_{group_index}',
-                'reward': sum(group_rewards) / len(group_rows),
-                **rollout_performance_metrics(group_rows),
-                'rollout_latency_s': rollout_latency_s,
-                'policy_version': state.policy_version,
+                **rollout_metrics(
+                    rewards={'reward': group_rewards},
+                    completion_lengths=[int(row['completion_length']) for row in group_rows],
+                    stop_reasons=[row.get('stop_reason') for row in group_rows],
+                ),
             }
-            self.metrics.record(
-                event='rollout_done',
-                context=admission.context,
-                partition_id=admission.partition_id,
+            self._record_metric(
+                'rollout',
+                admission=admission,
                 policy_version=state.policy_version,
-                metrics=metrics,
+                values=metrics,
+                attributes={
+                    'scope': 'group',
+                    'group_id': f'{admission.partition_id}/group_{group_index}',
+                },
             )
 
     def _advantage_round(self, partitions: list[SyncPartition]) -> None:
@@ -447,12 +481,11 @@ class SyncBarrierMultiLoraGRPO:
             samples_per_batch = admission.num_generations
             for start in range(0, len(partition.rows), samples_per_batch):
                 end = min(start + samples_per_batch, len(partition.rows))
-                self.metrics.record(
-                    event='advantage_done',
-                    context=admission.context,
-                    partition_id=admission.partition_id,
+                self._record_metric(
+                    'advantage',
+                    admission=admission,
                     policy_version=partition.state.policy_version,
-                    metrics={
+                    values={
                         'sample_count': end - start,
                         **advantage_signal_metrics(
                             partition.rewards[start:end],
@@ -492,14 +525,13 @@ class SyncBarrierMultiLoraGRPO:
                     'policy_version_gap_max': 0,
                     'rollout_policy_span_mean': 0.0,
                     'rollout_policy_span_max': 0,
-                    'optimizer_step': state.optimizer_steps,
                 })
-                self.metrics.record(
-                    event='train_step_done',
-                    context=state.context,
-                    partition_id=admission.partition_id,
+                self._record_metric(
+                    'train',
+                    admission=admission,
+                    optimizer_step=state.optimizer_steps,
                     policy_version=state.policy_version,
-                    metrics=metrics,
+                    values=metrics,
                 )
             finalize_started = time.perf_counter()
             next_policy_version = state.policy_version + 1
@@ -514,27 +546,27 @@ class SyncBarrierMultiLoraGRPO:
             state.policy_version = next_policy_version
             policy_publish_latency_s = time.perf_counter() - publish_started
             state.adapter_history.append(state.adapter_path)
-            self.metrics.record(
-                event='policy_published',
-                context=state.context,
-                partition_id=admission.partition_id,
+            self._record_metric(
+                'policy',
+                admission=admission,
+                optimizer_step=state.optimizer_steps,
                 policy_version=state.policy_version,
-                metrics={
-                    'adapter_path': state.adapter_path,
+                values={
                     'adapter_save_latency_s': adapter_save_latency_s,
                     'policy_publish_latency_s': policy_publish_latency_s,
                 },
+                attributes={'operation': 'publish', 'adapter_path': state.adapter_path},
             )
             prune_started = time.perf_counter()
             self._prune_adapter_history(state)
             adapter_prune_latency_s = time.perf_counter() - prune_started
             self.completed_partitions += 1
-            self.metrics.record(
-                event='partition_done',
-                context=state.context,
-                partition_id=admission.partition_id,
+            self._record_metric(
+                'partition',
+                admission=admission,
+                optimizer_step=state.optimizer_steps,
                 policy_version=state.policy_version,
-                metrics={
+                values={
                     'adapter_save_latency_s': adapter_save_latency_s,
                     'policy_publish_latency_s': policy_publish_latency_s,
                     'adapter_prune_latency_s': adapter_prune_latency_s,

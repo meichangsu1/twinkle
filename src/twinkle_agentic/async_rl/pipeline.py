@@ -4,156 +4,28 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Literal, Sequence
+from pydoc import locate
+from typing import Any, Sequence
 
+from twinkle.metric import MetricRecord, MetricsReporter, create_metrics_reporter
 from .context_manager import LoraContextManager
 from .data_plane import TQDataPlane
-from .metrics import JSONLMetricsRecorder
 from .scheduler import ContextSchedulePolicy, SchedulerConfig
 from .types import LoraContext, PartitionAdmission
+from .utils import (TrainBatchConfig, build_native_fsdp_model_kwargs,
+                    configure_lora_lr_scheduler, resolve_context_learning_rate,
+                    resolve_context_lora_target_modules, resolve_context_loss_config,
+                    resolve_model_attention_implementation, sampler_data_parallel_size,
+                    resolve_sequence_parallel_size, validate_context_batch_config)
 from .workers import AdvantageWorker, RolloutWorker, TrainerWorker
 
 
 @dataclass(frozen=True)
 class AsyncMultiLoraGRPOConfig:
     metrics_drain_interval_s: float = 1.0
-
-
-@dataclass(frozen=True)
-class TrainBatchConfig:
-    mini_batch_size: int
-    micro_batch_size: int
-    dynamic_batching: bool = False
-    max_tokens_per_micro_batch: int | None = None
-    packing_algorithm: Literal['ffd', 'kk'] = 'ffd'
-
-
-def _sampler_data_parallel_size(sampler_gpus: int, sampler_tp: int) -> int:
-    if sampler_gpus <= 0:
-        raise ValueError(f'sampler_gpus must be positive, got {sampler_gpus}')
-    if sampler_tp <= 0:
-        raise ValueError(f'sampler_tp must be positive, got {sampler_tp}')
-    if sampler_gpus % sampler_tp != 0:
-        raise ValueError(f'sampler_gpus ({sampler_gpus}) must be divisible by sampler_tp ({sampler_tp})')
-    return sampler_gpus // sampler_tp
-
-
-def _sequence_parallel_size(model_gpus: int, configured_size: int) -> int:
-    if configured_size <= 0:
-        raise ValueError(f'model.sequence_parallel_size must be positive, got {configured_size}')
-    if model_gpus % configured_size:
-        raise ValueError(f'runtime.model_gpus ({model_gpus}) must be divisible by '
-                         f'model.sequence_parallel_size ({configured_size})')
-    return configured_size
-
-
-def _model_attention_implementation(model_config: Any, *, padding_free: bool,
-                                    sequence_parallel_size: int) -> str | None:
-    implementation = model_config.get('attn_implementation')
-    if implementation is not None:
-        implementation = str(implementation)
-    if padding_free and sequence_parallel_size > 1 and implementation != 'flash_attention_2':
-        raise ValueError(
-            'model.attn_implementation must be flash_attention_2 when '
-            'model.padding_free=true and model.sequence_parallel_size>1')
-    return implementation
-
-
-def _native_fsdp_model_kwargs(model_config: dict[str, Any]) -> dict[str, Any]:
-    """Build model kwargs while enforcing FSDP for all RL training entrypoints."""
-    strategy = str(model_config.get('strategy', 'native_fsdp'))
-    if strategy != 'native_fsdp':
-        raise ValueError(f'model.strategy must be native_fsdp for RL training, got {strategy!r}')
-    return {
-        'strategy': strategy,
-        'fsdp_config': dict(model_config.get('fsdp_config') or {}),
-    }
-
-
-def configure_lora_lr_scheduler(model: Any, adapter_name: str, lora_config: dict[str, Any]) -> None:
-    """Configure one adapter's learning-rate scheduler from the shared LoRA config."""
-    scheduler_config = lora_config.get('lr_scheduler')
-    if scheduler_config is None:
-        return
-    scheduler_config = dict(scheduler_config)
-    scheduler_cls = scheduler_config.pop('cls')
-    model.set_lr_scheduler(
-        scheduler_cls,
-        adapter_name=adapter_name,
-        **scheduler_config,
-    )
-
-
-def _context_learning_rate(train_config: dict[str, Any], lora_config: dict[str, Any]) -> float:
-    """Resolve one adapter's learning rate, falling back to the global LoRA default."""
-    configured = train_config.get('learning_rate', lora_config.get('learning_rate'))
-    if configured is None:
-        raise ValueError('train.learning_rate or lora.learning_rate must be configured')
-    learning_rate = float(configured)
-    if not math.isfinite(learning_rate) or learning_rate <= 0:
-        raise ValueError(f'train.learning_rate must be a positive finite value, got {configured!r}')
-    return learning_rate
-
-
-def _context_loss_normalization(train_config: dict[str, Any]) -> str:
-    normalization = str(train_config.get('loss_normalization', 'sequence_mean'))
-    if normalization not in ('sequence_mean', 'token_mean'):
-        raise ValueError(
-            'train.loss_normalization must be sequence_mean or token_mean, '
-            f'got {normalization!r}')
-    return normalization
-
-
-def _validate_context_batch_config(
-    context_key: str,
-    *,
-    rollout_groups: int,
-    num_generations: int,
-    train: TrainBatchConfig,
-    sampler_dp: int,
-    model_dp: int,
-) -> None:
-    values = {
-        'rollout.batch_size': rollout_groups,
-        'rollout.num_generations': num_generations,
-        'train.mini_batch_size': train.mini_batch_size,
-        'train.micro_batch_size': train.micro_batch_size,
-    }
-    for name, value in values.items():
-        if value <= 0:
-            raise ValueError(f'{name} for {context_key} must be positive, got {value}')
-    if rollout_groups % sampler_dp:
-        raise ValueError(f'rollout.batch_size for {context_key} must be divisible by sampler DP size '
-                         f'({sampler_dp}), got {rollout_groups}')
-    partition_samples = rollout_groups * num_generations
-    if partition_samples % train.mini_batch_size:
-        raise ValueError(
-            f'partition for {context_key} has {partition_samples} samples and must be divisible by '
-            f'train.mini_batch_size={train.mini_batch_size}')
-    if train.mini_batch_size % num_generations:
-        raise ValueError(
-            f'train.mini_batch_size for {context_key} must preserve complete prompt groups: '
-            f'{train.mini_batch_size} % {num_generations} != 0')
-    if train.mini_batch_size % model_dp:
-        raise ValueError(f'train.mini_batch_size for {context_key} must be divisible by '
-                         f'model DP size {model_dp}')
-    samples_per_rank = train.mini_batch_size // model_dp
-    if train.micro_batch_size > samples_per_rank:
-        raise ValueError(f'train.micro_batch_size for {context_key} must not exceed the per-rank train batch '
-                         f'({samples_per_rank}), got {train.micro_batch_size}')
-    if train.dynamic_batching:
-        if train.max_tokens_per_micro_batch is None or train.max_tokens_per_micro_batch <= 0:
-            raise ValueError(
-                f'train.max_tokens_per_micro_batch for {context_key} must be positive when '
-                'train.dynamic_batching=true')
-    if train.packing_algorithm not in ('ffd', 'kk'):
-        raise ValueError(
-            f'train.packing_algorithm for {context_key} must be ffd or kk, '
-            f'got {train.packing_algorithm!r}')
 
 
 class AsyncMultiLoraGRPOPipeline:
@@ -170,25 +42,32 @@ class AsyncMultiLoraGRPOPipeline:
                  rollout_worker: RolloutWorker,
                  advantage_worker: AdvantageWorker,
                  trainer_worker: TrainerWorker,
-                 metrics: JSONLMetricsRecorder | None = None,
+                 metrics: MetricsReporter | None = None,
                  config: AsyncMultiLoraGRPOConfig = AsyncMultiLoraGRPOConfig(),
                  sampler: Any | None = None,
-                 resources: dict[str, Any] | None = None):
+                 model: Any | None = None,
+                 contexts: Sequence[LoraContext] = ()):
         self.context_manager = context_manager
         self.rollout_worker = rollout_worker
         self.advantage_worker = advantage_worker
         self.trainer_worker = trainer_worker
         self.sampler = sampler
+        self.model = model
+        self.contexts = tuple(contexts)
         self.metrics = metrics
         self.config = config
-        self._resources = dict(resources or {})
 
     @classmethod
     def from_config(cls, raw_config: dict[str, Any]) -> AsyncMultiLoraGRPOPipeline:
         """Build the complete Ray/TQ runtime from the async-RL YAML mapping."""
+        from omegaconf import OmegaConf
+
+        raw_config = OmegaConf.to_container(OmegaConf.create(raw_config), resolve=True)
+        if not isinstance(raw_config, dict):
+            raise TypeError('async-RL config must resolve to a mapping')
+
         import ray
         import transfer_queue as tq
-        from omegaconf import OmegaConf
         from peft import LoraConfig
 
         import twinkle
@@ -196,25 +75,26 @@ class AsyncMultiLoraGRPOPipeline:
         from twinkle.data_format import SamplingParams
         from twinkle.model import MultiLoraTransformersModel
         from twinkle.processor import InputProcessor
-        from .group_sampler import ContextGRPOGroupNSampler
+        from .native_tq import ContextGRPOGroupNSampler
 
         runtime = raw_config['runtime']
         model_config = raw_config['model']
         lora_config_data = raw_config['lora']
+        loss_config_data = raw_config.get('loss')
         template_config = raw_config.get('template', {})
         template_cls = template_config.get('cls', 'Qwen3_5Template')
         enable_thinking = bool(template_config.get('enable_thinking', False))
         rollout_output_config = dict(raw_config.get('rollout_output') or {})
         sampler_gpus = int(runtime['sampler_gpus'])
         sampler_tp = int(runtime['sampler_tp'])
-        sampler_dp = _sampler_data_parallel_size(sampler_gpus, sampler_tp)
+        sampler_dp = sampler_data_parallel_size(sampler_gpus, sampler_tp)
         model_dp = int(runtime['model_gpus'])
-        sequence_parallel_size = _sequence_parallel_size(
+        sequence_parallel_size = resolve_sequence_parallel_size(
             model_dp,
             int(model_config['sequence_parallel_size']),
         )
         padding_free = bool(model_config['padding_free'])
-        attn_implementation = _model_attention_implementation(
+        attn_implementation = resolve_model_attention_implementation(
             model_config,
             padding_free=padding_free,
             sequence_parallel_size=sequence_parallel_size,
@@ -254,7 +134,7 @@ class AsyncMultiLoraGRPOPipeline:
         )
         model_data_parallel_size = model_mesh.data_world_size
         sampler_mesh = DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_dp, tp_size=sampler_tp)
-        model_kwargs = _native_fsdp_model_kwargs(model_config)
+        model_kwargs = build_native_fsdp_model_kwargs(model_config)
         if attn_implementation is not None:
             model_kwargs['attn_implementation'] = attn_implementation
         model = MultiLoraTransformersModel(
@@ -263,12 +143,6 @@ class AsyncMultiLoraGRPOPipeline:
             remote_group='model',
             max_length=model_max_length,
             **model_kwargs,
-        )
-        lora_config = LoraConfig(
-            target_modules='all-linear',
-            r=lora_config_data['r'],
-            lora_alpha=lora_config_data['alpha'],
-            lora_dropout=lora_config_data['dropout'],
         )
         contexts: list[LoraContext] = []
         prompt_sources: dict[str, Any] = {}
@@ -286,21 +160,30 @@ class AsyncMultiLoraGRPOPipeline:
                 item['training_run_id'],
                 runtime['model_id'],
                 item['adapter_name'],
-                item.get('reward_type', 'gsm8k_accuracy'),
             )
             contexts.append(context)
-            model.add_adapter_to_model(context.adapter_name, lora_config, gradient_accumulation_steps=1)
+            adapter_lora_config = LoraConfig(
+                target_modules=resolve_context_lora_target_modules(item, lora_config_data),
+                r=lora_config_data['r'],
+                lora_alpha=lora_config_data['alpha'],
+                lora_dropout=lora_config_data['dropout'],
+            )
+            model.add_adapter_to_model(
+                context.adapter_name,
+                adapter_lora_config,
+                gradient_accumulation_steps=1,
+            )
             model.set_optimizer(
                 'AdamW',
-                lr=_context_learning_rate(train, lora_config_data),
+                lr=resolve_context_learning_rate(train, lora_config_data),
                 adapter_name=context.adapter_name,
             )
             configure_lora_lr_scheduler(model, context.adapter_name, lora_config_data)
+            loss_cls, loss_kwargs = resolve_context_loss_config(item, loss_config_data)
             model.set_loss(
-                'GRPOLoss',
-                epsilon=.2,
-                normalization=_context_loss_normalization(train),
+                loss_cls,
                 adapter_name=context.adapter_name,
+                **loss_kwargs,
             )
             model.set_processor(
                 InputProcessor,
@@ -328,7 +211,7 @@ class AsyncMultiLoraGRPOPipeline:
                 ),
                 packing_algorithm=str(train.get('packing_algorithm', 'ffd')),
             )
-            _validate_context_batch_config(
+            validate_context_batch_config(
                 context.key,
                 rollout_groups=rollout_batch_size,
                 num_generations=num_generations,
@@ -363,9 +246,8 @@ class AsyncMultiLoraGRPOPipeline:
             }
             train_batch_configs[context.key] = train_batch_config
             rewards[context.key] = _reward_for_context(
-                context,
-                reward_config=item.get('reward'),
-                rollout_config=rollout,
+                item.get('reward'),
+                context_key=context.key,
             )
             if bool(global_evaluation.get('enabled', False)):
                 eval_dataset = item.get('eval_dataset')
@@ -397,14 +279,10 @@ class AsyncMultiLoraGRPOPipeline:
                         num_samples=1,
                     ),
                 }
-                eval_context = LoraContext(
-                    context.tenant_id,
-                    context.training_run_id,
-                    context.base_model_id,
-                    context.adapter_name,
-                    eval_dataset['reward_type'],
+                evaluation_rewards[context.key] = _reward_for_context(
+                    eval_dataset.get('reward'),
+                    context_key=f'{context.key} evaluation',
                 )
-                evaluation_rewards[context.key] = _reward_for_context(eval_context)
             initial_paths[context.key] = model.save(
                 f'async-{context.adapter_name}-initial',
                 output_dir=runtime['output_dir'],
@@ -494,7 +372,12 @@ class AsyncMultiLoraGRPOPipeline:
             evaluation_config=evaluation_config,
             evaluate_batch=partial(_evaluate_batch, sampler, evaluation_rewards) if evaluation_config else None,
         )
-        metrics = JSONLMetricsRecorder(runtime['metrics_path'], run_id='async_multi_lora_grpo', mode='ray')
+        raw_metrics_config = raw_config.get('metrics')
+        metrics_config = dict(raw_metrics_config or {})
+        metrics = create_metrics_reporter(
+            raw_metrics_config,
+            run_id=str(runtime.get('run_id', 'async_multi_lora_grpo')),
+        )
         return cls(
             context_manager=manager,
             rollout_worker=rollout_worker,
@@ -502,10 +385,11 @@ class AsyncMultiLoraGRPOPipeline:
             trainer_worker=trainer_worker,
             sampler=sampler,
             metrics=metrics,
-            resources={
-                'model': model,
-                'contexts': contexts
-            },
+            config=AsyncMultiLoraGRPOConfig(
+                metrics_drain_interval_s=float(metrics_config.get('drain_interval_s', 1.0)),
+            ),
+            model=model,
+            contexts=contexts,
         )
 
     async def run_async(self) -> dict[str, Any]:
@@ -529,16 +413,12 @@ class AsyncMultiLoraGRPOPipeline:
                 await asyncio.sleep(self.config.metrics_drain_interval_s)
         except Exception as exc:
             if self.metrics is not None:
-                self.metrics.flush()
-                failure_metrics = {
-                    'error': f'{type(exc).__name__}: {exc}',
-                    'wall_time_s': time.perf_counter() - started,
-                    **self.metrics.stats(),
-                }
-                self.metrics.record(
-                    event='run_failed',
-                    metrics=failure_metrics,
-                )
+                self.metrics.record(MetricRecord(
+                    stage='run',
+                    status='failed',
+                    values={'wall_time_s': time.perf_counter() - started},
+                    attributes={'error': f'{type(exc).__name__}: {exc}'},
+                ))
                 self.metrics.flush()
             raise
         finally:
@@ -549,10 +429,9 @@ class AsyncMultiLoraGRPOPipeline:
             'wall_time_s': time.perf_counter() - started,
         }
         if self.metrics is not None:
+            self.metrics.record(MetricRecord(stage='run', values=result))
             self.metrics.flush()
-            result.update(self.metrics.stats())
-            self.metrics.record(event='run_completed', metrics=result)
-            self.metrics.flush()
+            result['metrics_health'] = self.metrics.health()
         return result
 
     def run(self) -> dict[str, Any]:
@@ -563,29 +442,15 @@ class AsyncMultiLoraGRPOPipeline:
                 self.metrics.close()
 
     async def _drain_metrics(self) -> None:
-        if self.metrics is None:
-            return
         workers = [self.rollout_worker, self.advantage_worker, self.trainer_worker]
         for worker in workers:
-            events = await worker.drain_metrics.remote()
-            for item in events:
-                self.metrics.record(
-                    event=item.event,
-                    context=item.context,
-                    partition_id=item.partition_id,
-                    metrics=item.metrics,
-                    policy_version=item.policy_version,
-                )
+            records = await worker.drain_metric_records.remote()
+            if self.metrics is not None:
+                self.metrics.record_many(records)
         if self.sampler is not None:
-            events = await asyncio.to_thread(self.sampler.drain_metrics)
-            for item in events:
-                self.metrics.record(
-                    event=item.event,
-                    context=item.context,
-                    partition_id=item.partition_id,
-                    metrics=item.metrics,
-                    policy_version=item.policy_version,
-                )
+            records = await asyncio.to_thread(self.sampler.drain_metric_records)
+            if self.metrics is not None:
+                self.metrics.record_many(records)
 
 
 def create_cpu_actor(cls: type, *args: Any, **kwargs: Any) -> Any:
@@ -687,34 +552,18 @@ def _evaluate_batch(
 
 
 def _reward_for_context(
-    context: LoraContext,
-    *,
     reward_config: dict[str, Any] | None = None,
-    rollout_config: dict[str, Any] | None = None,
+    *,
+    context_key: str,
 ) -> Any:
-    from twinkle.reward import (BoxedMathAccuracyReward, DAPOMathAccuracyReward, DAPOMathReward,
-                                GSM8KAccuracyBrevityReward, GSM8KAccuracyReward, MathVerifyAccuracyReward)
-    if context.reward_type in {'gsm8k', 'gsm8k_accuracy'}:
-        return GSM8KAccuracyReward()
-    if context.reward_type == 'gsm8k_accuracy_brevity':
-        return GSM8KAccuracyBrevityReward()
-    if context.reward_type == 'math_verify_accuracy':
-        return MathVerifyAccuracyReward()
-    if context.reward_type == 'dapo_math_accuracy':
-        return DAPOMathAccuracyReward()
-    if context.reward_type == 'dapo_math':
-        if rollout_config is None:
-            raise ValueError(f'rollout config is required for DAPO reward in {context.key}')
-        reward_config = dict(reward_config or {})
-        return DAPOMathReward(
-            max_response_length=int(rollout_config['max_tokens']),
-            overlong_buffer_length=int(reward_config['overlong_buffer_length']),
-            overlong_penalty_factor=float(reward_config.get('overlong_penalty_factor', 1.0)),
-            score_tail_chars=int(reward_config.get('score_tail_chars', 300)),
-        )
-    if context.reward_type == 'aime2024_accuracy':
-        return BoxedMathAccuracyReward()
-    raise ValueError(f'unsupported async-RL reward_type {context.reward_type!r} for {context.key}')
+    from twinkle.reward import Reward
+
+    config = dict(reward_config or {})
+    class_path = config.get('class_path', '')
+    reward_cls = locate(class_path)
+    if not isinstance(reward_cls, type) or not issubclass(reward_cls, Reward):
+        raise TypeError(f'reward.class_path {class_path!r} for {context_key} must reference a Reward subclass')
+    return reward_cls(**dict(config.get('kwargs') or {}))
 
 
 def _compute_advantages(data: Any, admission: PartitionAdmission) -> tuple[list[float], list[float]]:

@@ -11,15 +11,16 @@ from concurrent.futures import Future
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Empty, SimpleQueue
 from typing import Any
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams, user_data_get
+from twinkle.metric import MetricBuffer, MetricRecord
+from .metrics import rollout_metrics
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
-from .metrics import rollout_performance_metrics
-from .types import LoraContext, MetricEvent, PromptGroup, RolloutOutput, RolloutPolicy
+from .types import LoraContext, PromptGroup, RolloutOutput, RolloutPolicy
+from .utils import resolve_adapter_path
 
 logger = get_logger()
 
@@ -58,7 +59,7 @@ def _compute_rewards(
     context: LoraContext,
     rollout_rows: list[RolloutOutput],
 ) -> list[float] | None:
-    reward_fn = reward_registry.get(context.key) or reward_registry.get(context.reward_type)
+    reward_fn = reward_registry.get(context.key)
     if reward_fn is None:
         return None
     return list(reward_fn(rollout_rows, context=context))
@@ -70,7 +71,7 @@ def _compute_reward_metrics(
     rollout_rows: list[RolloutOutput],
     rewards: list[float],
 ) -> dict[str, Any]:
-    reward_fn = reward_registry.get(context.key) or reward_registry.get(context.reward_type)
+    reward_fn = reward_registry.get(context.key)
     metric_payload = getattr(reward_fn, 'metric_payload', None)
     if metric_payload is None:
         return {}
@@ -103,13 +104,6 @@ class _PromptGroupRolloutStats:
     completion_lengths: tuple[int, ...]
     stop_reasons: tuple[str | None, ...]
     policy_versions: tuple[int, ...]
-
-
-def resolve_adapter_path(adapter_path: str) -> str:
-    path = os.path.abspath(os.path.expanduser(str(adapter_path)))
-    if not os.path.exists(path):
-        raise FileNotFoundError(f'local LoRA adapter path does not exist: {path}')
-    return path
 
 
 @remote_class()
@@ -151,22 +145,32 @@ class VLLMSamplerTQ(vLLMSampler):
         if self.rollout_retry_delay_s < 0:
             raise ValueError(f'rollout_retry_delay_s must be non-negative, got {self.rollout_retry_delay_s}')
         self._background_submissions: dict[str, Future] = {}
-        self._metrics_events: SimpleQueue[MetricEvent] = SimpleQueue()
+        self.metric_buffer = MetricBuffer()
         self._failure: str | None = None
 
-    async def _emit(self, event: str, context: LoraContext, partition_id: str, metrics: dict[str, Any]) -> None:
-        self._metrics_events.put(
-            MetricEvent(event, context, partition_id, dict(metrics), metrics.get('policy_version')))
+    def _record_metrics(
+        self,
+        group: PromptGroup,
+        values: dict[str, Any],
+        *,
+        status: str = 'completed',
+        attributes: dict[str, Any] | None = None,
+        policy_version: int | None = None,
+    ) -> None:
+        self.metric_buffer.record(MetricRecord(
+            stage='rollout',
+            values=dict(values),
+            context_key=group.context.key,
+            partition_id=group.partition_id,
+            partition_index=group.partition.step,
+            policy_version=policy_version,
+            status=status,
+            attributes=dict(attributes or {}),
+        ))
 
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
-    def drain_metrics(self) -> list[MetricEvent]:
-        events = []
-        while True:
-            try:
-                events.append(self._metrics_events.get_nowait())
-            except Empty:
-                break
-        return events
+    def drain_metric_records(self) -> list[MetricRecord]:
+        return self.metric_buffer.drain()
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def check_health(self) -> None:
@@ -250,14 +254,11 @@ class VLLMSamplerTQ(vLLMSampler):
             ((group, result) for group, result in zip(groups, results) if isinstance(result, Exception)), None)
         if failed_group is not None:
             group, error = failed_group
-            await self._emit(
-                'rollout_failed',
-                group.context,
-                group.partition_id,
-                {
-                    'group_id': group.group_id,
-                    'error': str(error)
-                },
+            self._record_metrics(
+                group,
+                {},
+                status='failed',
+                attributes={'scope': 'group', 'group_id': group.group_id, 'error': str(error)},
             )
             raise RuntimeError(f'rollout failed for {group.group_id}: {error}') from error
 
@@ -273,21 +274,21 @@ class VLLMSamplerTQ(vLLMSampler):
         policy_versions = [version for stats in rollout_stats for version in stats.policy_versions]
         first_group = groups[0]
         dp_size = self.device_mesh.dp_world_size or 1
-        await self._emit(
-            'rollout_partition_done' if dp_size == 1 else 'rollout_shard_done',
-            first_group.context,
-            first_group.partition_id,
+        self._record_metrics(
+            first_group,
             {
                 'prompt_group_count': len(groups),
-                **rollout_performance_metrics(
-                    metric_rows,
+                **rollout_metrics(
+                    completion_lengths=[row['completion_length'] for row in metric_rows],
+                    stop_reasons=[row['stop_reason'] for row in metric_rows],
                     rollout_latency_s=time.perf_counter() - submitted_at,
                 ),
-                'policy_version': max(policy_versions),
                 'policy_version_min': min(policy_versions),
                 'policy_version_max': max(policy_versions),
                 'sampler_dp_size': dp_size,
             },
+            attributes={'scope': 'partition' if dp_size == 1 else 'shard'},
+            policy_version=max(policy_versions),
         )
 
     async def _run_prompt_group(
@@ -319,9 +320,9 @@ class VLLMSamplerTQ(vLLMSampler):
                 'rollout_policy_version': generated.final_policy.version,
                 'rollout_adapter_path': generated.final_policy.adapter_path,
                 'rollout_policy_versions': versions,
-                'initial_policy_version': versions[0],
-                'final_policy_version': versions[-1],
-                'policy_version_span': max(versions) - min(versions),
+                'initial_policy_version': generated.initial_policy.version,
+                'final_policy_version': generated.final_policy.version,
+                'policy_version_span': generated.final_policy.version - generated.initial_policy.version,
             })
             rows.append(row)
         if len(rows) != num_generations:
@@ -353,27 +354,29 @@ class VLLMSamplerTQ(vLLMSampler):
                 )
             except Exception as error:
                 logger.warning('Failed to write rollout output for %s: %s', group.group_id, error)
-        await self._emit(
-            'rollout_done',
-            group.context,
-            group.partition_id,
+        self._record_metrics(
+            group,
             {
-                'group_id':
-                group.group_id,
-                **rollout_performance_metrics(rows, rollout_latency_s=rollout_latency_s),
+                **rollout_metrics(
+                    rewards={'reward': rewards},
+                    completion_lengths=[int(row['completion_length']) for row in rows],
+                    stop_reasons=[row.get('stop_reason') for row in rows],
+                    rollout_latency_s=rollout_latency_s,
+                ),
                 'retry_count':
                 sum(sample.retry_count for sample in generated_samples),
                 'aborted_sample_count':
                 sum(sample.was_aborted for sample in generated_samples),
                 'partial_resumed_sample_count':
                 sum(sample.resumed_partial_output for sample in generated_samples),
-                'policy_version':
-                max(policy_versions),
                 'policy_version_min':
                 min(policy_versions),
                 'policy_version_max':
                 max(policy_versions),
+                **reward_metrics,
             },
+            attributes={'scope': 'group', 'group_id': group.group_id},
+            policy_version=max(policy_versions),
         )
         return _PromptGroupRolloutStats(
             completion_lengths=tuple(int(row['completion_length']) for row in rows),
@@ -447,7 +450,7 @@ class VLLMSamplerTQ(vLLMSampler):
         """Load the adapter selected for one group's rollout snapshot."""
         if policy.adapter_path is None:
             return None
-        local_path = os.path.abspath(await asyncio.to_thread(resolve_adapter_path, policy.adapter_path))
+        local_path = await asyncio.to_thread(resolve_adapter_path, policy.adapter_path)
         lora_request = await self.engine._get_or_load_lora(local_path)
         if lora_request is None:
             raise RuntimeError(f'failed to load LoRA adapter from {local_path}')
