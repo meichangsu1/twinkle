@@ -1,7 +1,8 @@
 # Long-lived async-RL service with dynamic tenant registration.
 #
 # Required hardware with the defaults below:
-#   runtime.model_gpus + runtime.sampler_gpus = 3 GPUs
+#   runtime.model_gpus + runtime.sampler_gpus = 2 GPUs
+#   one GPU for training and one GPU for rollout/vLLM
 #
 # Start it with:
 #   ray start --head
@@ -32,7 +33,7 @@ applications:
           run_id: async_rl_server
           model_id: ${oc.env:MODEL_ID,ms://Qwen/Qwen3.5-4B}
           mode: ray
-          model_gpus: 2
+          model_gpus: 1
           sampler_gpus: 1
           sampler_tp: 1
           sampler_max_loras: 4
