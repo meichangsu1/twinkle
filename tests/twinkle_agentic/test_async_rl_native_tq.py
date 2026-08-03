@@ -88,6 +88,34 @@ def test_cpu_service_actor_uses_twinkle_ray_mode(monkeypatch):
     assert captured['actor_kwargs'] == {'enabled': True}
 
 
+def test_unload_lora_paths_does_not_require_pruned_checkpoint(tmp_path):
+    removed_paths = []
+
+    class Engine:
+
+        async def remove_loras(self, paths):
+            removed_paths.extend(paths)
+
+    class Completed:
+
+        @staticmethod
+        def result():
+            return None
+
+    sampler = object.__new__(VLLMSamplerTQ)
+    sampler.engine = Engine()
+
+    def submit(coro):
+        asyncio.run(coro)
+        return Completed()
+
+    sampler._submit_in_loop = submit
+    pruned_path = tmp_path / 'already-pruned'
+    sampler.unload_lora_paths([str(pruned_path)])
+
+    assert removed_paths == [str(pruned_path.resolve())]
+
+
 def test_sequence_parallel_size_must_divide_model_gpus():
     assert resolve_sequence_parallel_size(2, 1) == 1
     assert resolve_sequence_parallel_size(2, 2) == 2

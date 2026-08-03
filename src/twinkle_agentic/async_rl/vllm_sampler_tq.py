@@ -164,7 +164,13 @@ class VLLMSamplerTQ(vLLMSampler):
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def unload_lora_paths(self, adapter_paths: list[str]) -> None:
-        local_paths = [resolve_adapter_path(path) for path in adapter_paths]
+        # Unloading is keyed by the normalized path stored in VLLMEngine's
+        # request cache. The checkpoint itself may already have been pruned,
+        # so unlike loading this must not require the path to still exist.
+        local_paths = [
+            os.path.abspath(os.path.expanduser(str(path)))
+            for path in adapter_paths
+        ]
         self._submit_in_loop(self.engine.remove_loras(local_paths)).result()
 
     @remote_function(dispatch='slice_dp', collect='none', lazy_collect=False)
