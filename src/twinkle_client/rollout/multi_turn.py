@@ -4,8 +4,7 @@
 This module hosts :class:`ClientMultiTurnRollout`, a hand-maintained multi-turn
 rollout orchestrator whose algorithmic structure mirrors
 ``twinkle_agentic.rollout.multi_turn.MultiTurnRollout`` but issues sampling over
-HTTP via ``twinkle_client.sampler.vLLMSampler.sample()`` instead of holding a
-Ray actor handle.
+HTTP via the client sampler instead of holding a Ray actor handle.
 
 Design notes:
     * It deliberately does NOT subclass ``MultiTurnRollout``. That class is
@@ -14,9 +13,12 @@ Design notes:
       not match the HTTP-client semantics here.
     * The ``tool_manager`` type is reused directly from
       ``twinkle_agentic.tools.tool_manager.ToolManager`` (imported, not copied).
+    * ``arun`` uses the Sampler component's asynchronous future API; ``__call__``
+      remains a synchronous compatibility wrapper.
     * Bridge-token stitching is reused from
       ``twinkle_agentic.rollout.bridge.extend_with_bridge``.
 """
+import asyncio
 import dataclasses
 from typing import Any, Dict, List, Optional
 
@@ -33,8 +35,7 @@ class ClientMultiTurnRollout:
 
     Mirrors the per-trajectory state machine of
     ``twinkle_agentic.rollout.multi_turn.MultiTurnRollout`` but issues sampling
-    via ``vLLMSampler.sample()`` (an HTTP call to ``/twinkle/sample``) rather
-    than a Ray actor call.
+    through the HTTP Sampler component rather than a Ray actor call.
     """
 
     def __init__(
@@ -67,11 +68,24 @@ class ClientMultiTurnRollout:
                              f'got {self.sampling_params.num_samples}')
 
     def __call__(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
-        """Run the batched multi-turn rollout state machine over HTTP.
+        """Synchronous wrapper for :meth:`arun`.
+
+        Async client orchestrators should call ``await rollout.arun(...)`` so
+        independent rollout pipelines can overlap with Model training.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(trajectories, **kwargs))
+        raise RuntimeError('ClientMultiTurnRollout.__call__ cannot run inside an event loop; '
+                           'use `await rollout.arun(...)` instead')
+
+    async def arun(self, trajectories: List[Trajectory], **kwargs) -> List[Trajectory]:
+        """Asynchronously run the batched multi-turn state machine over HTTP.
 
         Structurally mirrors ``MultiTurnRollout.__call__`` but issues each
-        round's sampling through ``vLLMSampler.sample()`` (an HTTP POST to
-        ``/twinkle/sample``) rather than a Ray actor call. Every round makes a
+        round's sampling through ``vLLMSampler.asample()`` rather than a Ray
+        actor call. Every round makes a
         SINGLE batched HTTP call for all currently-live trajectories so the
         sampler can run them in parallel; finished trajectories are parked and
         excluded from later batches.
@@ -138,7 +152,19 @@ class ClientMultiTurnRollout:
             #    upstream concern (retry/backoff) and failures are never
             #    silently swallowed.
             batch_pifs = [pifs[i] for i in active]
-            resps = self.sampler.sample(batch_pifs, sampling_params=sampling_params)
+            sample_kwargs = {'sampling_params': sampling_params}
+            for name in ('adapter_name', 'adapter_uri'):
+                if name in kwargs:
+                    sample_kwargs[name] = kwargs[name]
+            async_sample = getattr(self.sampler, 'asample', None)
+            if callable(async_sample):
+                resps = await async_sample(batch_pifs, **sample_kwargs)
+            else:
+                resps = await asyncio.to_thread(
+                    self.sampler.sample,
+                    batch_pifs,
+                    **sample_kwargs,
+                )
 
             pending_bridges: List[tuple] = []  # (global_idx, tool_messages)
             for local_idx, global_idx in enumerate(active):

@@ -32,7 +32,6 @@ class GRPOLoss(Loss):
         beta: float = 0.0,
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
-        **kwargs,
     ):
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
@@ -41,6 +40,9 @@ class GRPOLoss(Loss):
         # Gate the expensive entropy compute path in the model forward.
         self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
+
+    def micro_batch_scale(self, inputs, indices):
+        return len(indices) / len(inputs)
 
     def _compute_log_importance_weights(
         self,
@@ -102,8 +104,7 @@ class GRPOLoss(Loss):
         """
         Aggregate per-token loss to scalar.
 
-        Override this method in subclasses for different normalization.
-        Default: mean over sequences, then mean over batch.
+        Mean over response tokens within each sequence, then over sequences.
 
         Args:
             per_token_loss: [batch, seq_len] per-token loss values
@@ -113,7 +114,6 @@ class GRPOLoss(Loss):
         Returns:
             loss: scalar loss value
         """
-        # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
         # Each sequence contributes equally regardless of length.
         return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 
@@ -366,6 +366,18 @@ class CISPOLoss(GRPOLoss):
 
     Clamps the IS weight and uses policy gradient.
     """
+    def micro_batch_scale(self, inputs, indices):
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
 
     def _compute_per_token_loss(
         self,
@@ -397,6 +409,18 @@ class BNPOLoss(GRPOLoss):
 
     Normalizes by total completion tokens across batch.
     """
+    def micro_batch_scale(self, inputs, indices):
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
 
     def _aggregate_loss(
         self,

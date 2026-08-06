@@ -53,6 +53,21 @@ applications:
             env_vars:
               TWINKLE_FAIL_FAST: "0"
 
+  # TransferQueue-backed data references used by client-orchestrated RL.
+  - name: data-plane
+    route_prefix: /api/v1/data-plane
+    import_path: data_plane
+    args:
+      config:
+        backend:
+          SimpleStorage:
+            num_data_storage_units: 2
+    deployments:
+      - name: DataPlaneManagement
+        num_replicas: 1
+        ray_actor_options:
+          num_cpus: 1
+
   # 2. Model Service - Hosts the base model for training.
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
@@ -60,7 +75,9 @@ applications:
     args:
       backend: transformers                        # Model backend: transformers | megatron
       model_id: "ms://Qwen/Qwen3.5-4B"    # ModelScope model identifier
+      max_loras: 8                                  # Concurrent client-owned training adapters
       max_length: 10240
+      data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
       nproc_per_node: 1                            # Number of GPU processes per node
       device_group:
         name: model
@@ -94,12 +111,14 @@ applications:
     import_path: sampler
     args:
       model_id: "ms://Qwen/Qwen3.5-4B"   # ModelScope model identifier
+      data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
       nproc_per_node: 1               # Number of GPU processes per node
       sampler_type: vllm              # Inference engine: 'vllm' (fast) or 'torch' (TorchSampler)
       engine_args:                    # vLLM engine-specific settings
         max_model_len: 4096           # Maximum sequence length the engine supports
         gpu_memory_utilization: 0.5   # Fraction of GPU memory to use (0.0-1.0)
         enable_lora: true             # Allow loading LoRA adapters during inference
+        max_loras: 8                  # Published policies cached across tenants
         logprobs_mode: processed_logprobs # Logprobs mode for sampling results
       device_group:                   # Logical device group for the sampler
         name: sampler

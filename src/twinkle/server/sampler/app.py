@@ -7,9 +7,11 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 from fastapi import FastAPI, Request
 from ray import serve
-from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
@@ -19,6 +21,7 @@ from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
+
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 
@@ -54,6 +57,20 @@ SAMPLER_SELECTOR = BackendSelector(
 )
 
 
+def _construct_sampler_backend(
+    sampler_type: str,
+    sampler_kwargs: dict[str, Any],
+    data_plane_url: str | None,
+) -> Any:
+    if sampler_type == 'vllm' and data_plane_url:
+        # Client-orchestrated async RL needs sampler admission to release the
+        # Ray actor immediately.  VLLMSamplerTQ retains the inherited
+        # synchronous API for ordinary sample calls.
+        from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
+        return VLLMSamplerTQ(**sampler_kwargs, context_manager=None)
+    return SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
+
+
 class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     """Unified sampler management service.
 
@@ -72,6 +89,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                  sampler_type: str,
                  engine_args: dict[str, Any] | None = None,
                  queue_config: TaskQueueConfig | None = None,
+                 data_plane_url: str | None = None,
                  **kwargs):
         self.device_group = DeviceGroup(**device_group)
         self.device_mesh = init_twinkle_runtime(
@@ -101,12 +119,20 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             )
         else:
             sampler_kwargs.update(kwargs)
-        self.sampler = SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
+        self.sampler = _construct_sampler_backend(sampler_type, sampler_kwargs, data_plane_url)
 
         self.state: ServerState = get_server_state()
+        from twinkle.server.data_plane import DataPlaneProxy
+        self.data_plane = DataPlaneProxy(data_plane_url)
 
         # Initialize task queue mixin
         self._init_task_queue(queue_config, deployment_name='Sampler')
+
+    async def shutdown(self) -> None:
+        cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
+        if callable(cancel_all):
+            await asyncio.to_thread(cancel_all)
+        await self.data_plane.close()
 
     @serve.multiplexed(max_num_models_per_replica=5)
     async def _sticky_entry(self, sticky_key: str):
@@ -131,6 +157,7 @@ def build_sampler_app(model_id: str,
                       sampler_type: str,
                       engine_args: dict[str, Any] | None = None,
                       queue_config: TaskQueueConfig | None = None,
+                      data_plane_url: str | None = None,
                       **kwargs):
     """Build a unified sampler application for text generation inference.
 
@@ -172,6 +199,7 @@ def build_sampler_app(model_id: str,
             'version': '1.0.0',
         },
         attach_replica_id_header=True,
+        on_shutdown=lambda servable: servable.shutdown(),
     )
 
     return bind_deployment(
@@ -179,7 +207,8 @@ def build_sampler_app(model_id: str,
         SamplerManagement,
         deploy_options,
         deployment_name='SamplerManagement',
-        bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config),
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config,
+                   data_plane_url),
         bind_kwargs=kwargs,
     )
 

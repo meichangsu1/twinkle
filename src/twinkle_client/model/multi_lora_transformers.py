@@ -2,6 +2,9 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 import time
 from twinkle_client.http import http_get, http_post
+from twinkle_client.remote_task import RemoteTask
+from twinkle_client.common.json_utils import json_safe
+from twinkle_client.types.component import ComponentTaskRef, DataRef
 from twinkle_client.types.model import (
     CalculateLossResponse,
     CalculateMetricResponse,
@@ -26,6 +29,8 @@ class MultiLoraTransformersModel:
         """Initialize model client."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
+        from twinkle_client.data_plane import DataPlaneClient
+        self.data_plane = DataPlaneClient(kwargs.pop('data_plane_url', None))
 
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -36,6 +41,85 @@ class MultiLoraTransformersModel:
             url=f'{self.server_url}/create',
         )
         response.raise_for_status()
+
+    def submit_forward(
+        self,
+        inputs: Any | DataRef,
+        *,
+        forward_only: bool = False,
+        **forward_kwargs,
+    ) -> RemoteTask:
+        """Submit the Model component's forward primitive directly."""
+        body = {
+            'adapter_name': self.adapter_name or '',
+            'forward_only': forward_only,
+            'forward_kwargs': forward_kwargs,
+        }
+        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
+            inputs.model_dump() if isinstance(inputs, DataRef) else json_safe(inputs))
+        response = http_post(
+            url=f'{self.server_url}/submit_forward',
+            json_data=body,
+        )
+        response.raise_for_status()
+        return RemoteTask(ComponentTaskRef(**response.json()))
+
+    def submit_forward_only(
+        self,
+        inputs: Any | DataRef,
+        **forward_kwargs,
+    ) -> RemoteTask:
+        return self.submit_forward(
+            inputs,
+            forward_only=True,
+            **forward_kwargs,
+        )
+
+    def submit_forward_backward(
+        self,
+        inputs: Any | DataRef,
+        **kwargs,
+    ) -> RemoteTask:
+        """Submit forward/backward without prescribing the surrounding train loop."""
+        body = {'adapter_name': self.adapter_name or '', 'kwargs': json_safe(kwargs)}
+        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
+            inputs.model_dump() if isinstance(inputs, DataRef) else json_safe(inputs))
+        response = http_post(
+            url=f'{self.server_url}/submit_forward_backward',
+            json_data=body,
+        )
+        response.raise_for_status()
+        return RemoteTask(ComponentTaskRef(**response.json()))
+
+    def submit_clip_grad_and_step(
+        self,
+        max_grad_norm: float = 1.0,
+        norm_type: int = 2,
+        **kwargs,
+    ) -> RemoteTask:
+        response = http_post(
+            url=f'{self.server_url}/submit_clip_grad_and_step',
+            json_data={
+                'adapter_name': self.adapter_name or '',
+                'max_grad_norm': max_grad_norm,
+                'norm_type': norm_type,
+                'kwargs': kwargs,
+            },
+        )
+        response.raise_for_status()
+        return RemoteTask(ComponentTaskRef(**response.json()))
+
+    def submit_save(self, name: str, *, save_optimizer: bool = False) -> RemoteTask:
+        response = http_post(
+            url=f'{self.server_url}/submit_save',
+            json_data={
+                'adapter_name': self.adapter_name or '',
+                'name': name,
+                'save_optimizer': save_optimizer,
+            },
+        )
+        response.raise_for_status()
+        return RemoteTask(ComponentTaskRef(**response.json()))
 
     def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs) -> None:
         """Add a new adapter to the model."""
@@ -48,6 +132,17 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
         self.adapter_name = adapter_name
+
+    def remove_adapter(self, adapter_name: str | None = None) -> None:
+        """Release one client-owned adapter from the training component."""
+        name = adapter_name or self.adapter_name
+        response = http_post(
+            url=f'{self.server_url}/remove_adapter',
+            json_data={'adapter_name': name},
+        )
+        response.raise_for_status()
+        if name == self.adapter_name:
+            self.adapter_name = None
 
     def forward(self, inputs: Any, **kwargs) -> ForwardResponse:
         """Execute forward pass on the model."""

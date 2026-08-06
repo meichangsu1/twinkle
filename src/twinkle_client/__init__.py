@@ -72,4 +72,7 @@ def init_twinkle_client(
     )
 
 
-__all__ = ['init_tinker_client', 'init_twinkle_client']
+from .remote_task import RemoteTask, RemoteTaskError
+from .data_plane import DataPlaneClient
+
+__all__ = ['DataPlaneClient', 'RemoteTask', 'RemoteTaskError', 'init_tinker_client', 'init_twinkle_client']

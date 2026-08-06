@@ -26,6 +26,7 @@ from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoi
                                        validate_user_path)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
+from twinkle_client.common.json_utils import json_safe
 from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
@@ -53,6 +54,24 @@ def _get_twinkle_adapter_name(request: Request, adapter_name: str | None) -> str
         return None
     owner_id = get_session_id_from_request(request) or request.state.request_id
     return owner_id + '-' + adapter_name
+
+
+def _model_result_rows(result: Any, batch_size: int) -> list[dict[str, Any]]:
+    """Keep per-sample model outputs at TQ sample granularity."""
+    if isinstance(result, list) and len(result) == batch_size and all(isinstance(item, dict) for item in result):
+        return result
+    if isinstance(result, dict):
+        batched = {
+            name
+            for name, value in result.items()
+            if isinstance(value, list) and len(value) == batch_size
+        }
+        if batched:
+            return [{
+                name: value[index] if name in batched else value
+                for name, value in result.items()
+            } for index in range(batch_size)]
+    return [{'result': result}]
 
 
 def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
@@ -120,6 +139,184 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 batch_size=batch_size,
                 data_world_size=self.data_world_size,
                 task_type='forward',
+            ))
+
+    @app.post('/twinkle/submit_forward')
+    async def submit_forward(
+            request: Request,
+            body: types.AsyncForwardRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict[str, Any]:
+        """Queue a forward pass and return immediately with a task id."""
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            raw_inputs = (
+                await self.data_plane.get(body.input_ref)
+                if body.input_ref is not None else body.inputs
+            )
+            inputs = _parse_inputs(raw_inputs)
+            method = self.model.forward_only if body.forward_only else self.model.forward
+            ret = method(inputs=inputs, adapter_name=adapter_name, **body.forward_kwargs)
+            safe = json_safe(ret)
+            if self.data_plane.enabled:
+                rows = _model_result_rows(safe, len(inputs))
+                output_ref = await self.data_plane.put(rows, kind='model-output')
+                return {'output_ref': output_ref.model_dump()}
+            return {'result': safe}
+
+        raw_for_metrics = body.inputs or []
+        inputs_list = raw_for_metrics if isinstance(raw_for_metrics, list) else [raw_for_metrics]
+        input_tokens = (
+            body.input_ref.num_tokens
+            if body.input_ref is not None else
+            sum(len(item.get('input_ids', [])) if isinstance(item, dict) else 0 for item in inputs_list)
+        )
+        batch_size = body.input_ref.size if body.input_ref is not None else len(inputs_list)
+        return await self.schedule_task(
+            _task,
+            model_id=adapter_name,
+            token=token,
+            input_tokens=input_tokens,
+            batch_size=batch_size,
+            data_world_size=self.data_world_size,
+            task_type='async_forward',
+        )
+
+    @app.post('/twinkle/submit_forward_backward')
+    async def submit_forward_backward(
+            request: Request,
+            body: types.AsyncForwardBackwardRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict[str, Any]:
+        """Queue the same forward/backward primitive exposed by the synchronous client."""
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        def first_element(data):
+            while isinstance(data, list):
+                if len(data) == 0:
+                    return None
+                data = data[0]
+            return data
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            raw_inputs = (
+                await self.data_plane.get(body.input_ref)
+                if body.input_ref is not None else body.inputs
+            )
+            inputs = _parse_inputs(raw_inputs)
+            for model_input in inputs:
+                for key in model_input:
+                    if (isinstance(model_input[key], list)
+                            and isinstance(first_element(model_input[key]), (int, float))):
+                        model_input[key] = torch.tensor(model_input[key])
+            ret = self.model.forward_backward(inputs=inputs, adapter_name=adapter_name, **body.kwargs)
+            return {'result': json_safe(ret)}
+
+        raw_for_metrics = body.inputs or []
+        inputs_list = raw_for_metrics if isinstance(raw_for_metrics, list) else [raw_for_metrics]
+        input_tokens = (
+            body.input_ref.num_tokens
+            if body.input_ref is not None else
+            sum(len(item.get('input_ids', [])) for item in inputs_list if isinstance(item, dict))
+        )
+        batch_size = body.input_ref.size if body.input_ref is not None else len(inputs_list)
+        return await self.schedule_task(
+            _task,
+            model_id=adapter_name,
+            token=token,
+            input_tokens=input_tokens,
+            batch_size=batch_size,
+            data_world_size=self.data_world_size,
+            task_type='async_forward_backward',
+        )
+
+    @app.post('/twinkle/submit_clip_grad_and_step')
+    async def submit_clip_grad_and_step(
+            request: Request,
+            body: types.AsyncClipGradAndStepRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict[str, Any]:
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            self.model.clip_grad_and_step(
+                max_grad_norm=body.max_grad_norm,
+                norm_type=body.norm_type,
+                adapter_name=adapter_name,
+                **body.kwargs,
+            )
+            return {'status': 'ok'}
+
+        return await self.schedule_task(
+            _task,
+            model_id=adapter_name,
+            token=token,
+            task_type='async_clip_grad_and_step',
+        )
+
+    @app.post('/twinkle/submit_save')
+    async def submit_save(
+            request: Request,
+            body: types.AsyncSaveRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict[str, Any]:
+        """Queue an adapter snapshot; used for explicit policy publication."""
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            self.assert_resource_exists(adapter_name)
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            checkpoint_name = checkpoint_manager.get_ckpt_name(body.name)
+            save_dir = checkpoint_manager.get_save_dir(model_id=adapter_name, is_sampler=body.is_sampler)
+            twinkle_path = checkpoint_manager.save(
+                model_id=adapter_name,
+                name=checkpoint_name,
+                is_sampler=body.is_sampler,
+            )
+            model_save_name = 'latest' if body.is_sampler else checkpoint_name
+            checkpoint_dir = self.model.save(
+                name=model_save_name,
+                output_dir=save_dir,
+                adapter_name=adapter_name,
+                save_optimizer=body.save_optimizer,
+            )
+            return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
+
+        return await self.schedule_task(
+            _task,
+            model_id=adapter_name,
+            token=token,
+            task_type='async_save',
+        )
+
+    @app.post('/twinkle/remove_adapter')
+    async def remove_adapter(
+            request: Request,
+            body: types.AdapterRequest,
+            self: ModelManagement = Depends(self_fn),
+    ) -> dict[str, str]:
+        """Release a drained tenant's in-memory training adapter."""
+        token = await self._on_request_start(request)
+        adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
+
+        async def _task():
+            await self._cleanup_adapter(adapter_name)
+            return {'status': 'ok'}
+
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                model_id=adapter_name,
+                token=token,
+                task_type='remove_adapter',
             ))
 
     @app.post('/twinkle/forward_only', response_model=types.ForwardResponse)
@@ -467,7 +664,10 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 async_upload=False,
             )
 
-        future_ref = await self.schedule_background_task(_task, task_type='upload_to_hub')
+        future_ref = await self.schedule_background_task(
+            _task,
+            task_type='upload_to_hub',
+        )
         request_id = future_ref.get('request_id')
         if request_id is None:
             raise HTTPException(status_code=500, detail=f'Upload task scheduling failed: {future_ref}')

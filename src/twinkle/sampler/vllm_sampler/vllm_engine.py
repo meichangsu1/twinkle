@@ -495,6 +495,20 @@ class VLLMEngine(BaseSamplerEngine):
             logger.error(f'Failed to load LoRA from {lora_path}: {e}')
             return None
 
+    async def unload_lora_paths(self, adapter_paths: list[str]) -> None:
+        """Evict selected LoRA requests without requiring their files to exist."""
+        for adapter_path in adapter_paths:
+            normalized = os.path.abspath(os.path.expanduser(adapter_path))
+            request = self._lora_request_cache.pop(normalized, None)
+            if request is None:
+                request = self._lora_request_cache.pop(adapter_path, None)
+            if request is None:
+                continue
+            try:
+                await self.engine.remove_lora(request.lora_int_id)
+            except Exception as exc:
+                logger.warning('Failed to unload LoRA %s: %s', adapter_path, exc)
+
     async def sleep(self, level: int = 2) -> None:
         """
         Offload weights and/or KV cache from GPU memory.

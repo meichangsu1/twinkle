@@ -487,6 +487,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self._run_in_loop(_receive_and_load())
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
+        """Unload policy snapshots from vLLM and clear cached requests."""
+        self._run_in_loop(self.engine.unload_lora_paths(adapter_paths))
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self):
         """Gracefully shutdown the vLLM engine and background event loop.
 

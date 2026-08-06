@@ -87,7 +87,8 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
                         stop=body.sampling_params.stop,
                     )
 
-                responses = self.sampler.sample(
+                sample_fn = getattr(self.sampler, 'sample_sync', self.sampler.sample)
+                responses = sample_fn(
                     inputs=[prompt_inputs] * body.num_samples,
                     sampling_params=sampling_params,
                     adapter_path=adapter_uri,

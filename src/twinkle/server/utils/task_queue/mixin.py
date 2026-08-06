@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-TaskQueueMixin: serial compute queue + background-task execution.
+"""TaskQueueMixin: serial compute queue plus admitted concurrent tasks.
 
-Two execution paths:
-  schedule_task() / schedule_task_and_wait()  -> serial compute queue (GPU ops)
-  schedule_background_task()                  -> fire-and-forget asyncio Task (I/O ops)
+``schedule_task`` serializes stateful Model operations. Detached tasks are
+used for I/O and for engines such as vLLM that own their compute concurrency
+and continuous batching internally.
 """
 from __future__ import annotations
 
@@ -39,8 +38,8 @@ class TaskQueueMixin:
        Use for GPU operations: forward, backward, step, save, load, etc.
 
     2. Background task (schedule_background_task):
-       asyncio.create_task, runs concurrently with compute queue.
-       Use for pure I/O: upload_to_hub, etc.
+       asyncio.create_task, runs concurrently with compute queue. Use for I/O
+       or an engine that provides its own safe concurrency and batching.
        Status is still tracked; clients can poll the same status endpoints.
 
     Requirements
@@ -200,8 +199,15 @@ class TaskQueueMixin:
         """
         request_id = f'req_{uuid.uuid4().hex}'
 
-        preflight_result = await self._perform_preflight_checks(request_id, model_id, token, input_tokens, batch_size,
-                                                                data_world_size, batch_size_multiple)
+        preflight_result = await self._perform_preflight_checks(
+            request_id=request_id,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            batch_size=batch_size,
+            data_world_size=data_world_size,
+            batch_size_multiple=batch_size_multiple,
+        )
         if preflight_result is not None:
             return preflight_result
 
@@ -209,7 +215,11 @@ class TaskQueueMixin:
             self._event_loop = asyncio.get_running_loop()
 
         await self.state.store_future_status(
-            request_id, TaskStatus.PENDING.value, model_id, queue_state=QueueState.ACTIVE.value)
+            request_id,
+            TaskStatus.PENDING.value,
+            model_id,
+            queue_state=QueueState.ACTIVE.value,
+        )
 
         queue_key = self._queue_key(model_id=model_id, token=token)
         self._compute_worker.ensure_queue_registered(queue_key)
@@ -227,7 +237,11 @@ class TaskQueueMixin:
                 created_at=time.monotonic(),
             ))
         await self.state.store_future_status(
-            request_id, TaskStatus.QUEUED.value, model_id, queue_state=QueueState.ACTIVE.value)
+            request_id,
+            TaskStatus.QUEUED.value,
+            model_id,
+            queue_state=QueueState.ACTIVE.value,
+        )
         logger.info(f'[TaskQueue] Task {request_id} queued, type={task_type or "unknown"}, '
                     f'model_id={model_id}, queue_key={queue_key}, '
                     f'queue_depth={q.qsize()}, input_tokens={input_tokens}')
@@ -294,12 +308,12 @@ class TaskQueueMixin:
         model_id: str | None = None,
         task_type: str | None = None,
     ) -> dict[str, Any]:
-        """Schedule a fire-and-forget background task (bypasses compute queue).
+        """Schedule a fire-and-forget task outside the serial queue.
 
-        Designed for pure I/O operations such as upload_to_hub that do not
-        require GPU serialization. The task is launched immediately as an
-        asyncio.create_task so it runs concurrently with the compute queue
-        without blocking any other user's training operations.
+        The task is launched immediately as an asyncio task. This is suitable
+        for pure I/O and for an inference engine such as vLLM that performs its
+        own safe request concurrency and continuous batching. Stateful Model
+        operations must continue to use :meth:`schedule_task`.
 
         Status is tracked via state.store_future_status so clients can poll
         progress through the same status endpoints as schedule_task().
@@ -317,7 +331,11 @@ class TaskQueueMixin:
                     f'type={task_type or "unknown"}, model_id={model_id}')
 
         await self.state.store_future_status(
-            request_id, TaskStatus.RUNNING.value, model_id, queue_state=QueueState.ACTIVE.value)
+            request_id,
+            TaskStatus.RUNNING.value,
+            model_id,
+            queue_state=QueueState.ACTIVE.value,
+        )
 
         async def _run() -> None:
             try:
@@ -327,7 +345,8 @@ class TaskQueueMixin:
                     TaskStatus.COMPLETED.value,
                     model_id,
                     result=result,
-                    queue_state=QueueState.ACTIVE.value)
+                    queue_state=QueueState.ACTIVE.value,
+                )
                 logger.info(f'[TaskQueue] Background task {request_id} completed, type={task_type or "unknown"}')
             except Exception:
                 error_payload = task_error_payload(traceback.format_exc())
@@ -336,7 +355,8 @@ class TaskQueueMixin:
                     TaskStatus.FAILED.value,
                     model_id,
                     result=error_payload,
-                    queue_state=QueueState.ACTIVE.value)
+                    queue_state=QueueState.ACTIVE.value,
+                )
                 logger.error(f'[TaskQueue] Background task {request_id} FAILED, type={task_type or "unknown"}:\n'
                              f'{traceback.format_exc(limit=3)}')
 

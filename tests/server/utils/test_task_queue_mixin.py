@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from twinkle.server.utils.task_queue.config import TaskQueueConfig
@@ -46,6 +48,8 @@ async def test_preflight_rejects_batch_without_per_dp_multiple():
     assert result == {'request_id': 'req1', 'model_id': 'model1'}
     _, kwargs = queue.state.records[-1]
     assert kwargs['result']['category'] == 'User'
+    assert 'token' not in kwargs
+    assert 'session_id' not in kwargs
     assert 'Batch size 2 must be divisible by 4' in kwargs['result']['error']
 
 
@@ -65,3 +69,20 @@ async def test_preflight_accepts_batch_with_per_dp_multiple():
 
     assert result is None
     assert queue.state.records == []
+
+
+@pytest.mark.asyncio
+async def test_background_task_tracks_status_without_owner_or_preflight():
+    queue = _DummyQueue()
+
+    async def work():
+        return {'ok': True}
+
+    await queue.schedule_background_task(
+        work,
+        model_id='model1',
+    )
+    await asyncio.sleep(0)
+
+    assert queue.state.records[0][0][1] == 'running'
+    assert all('token' not in kwargs and 'session_id' not in kwargs for _, kwargs in queue.state.records)

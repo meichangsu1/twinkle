@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Any, Mapping
 
 from twinkle.dataset import DatasetMeta
+from .json_utils import json_safe
 
 supported_types = {
     DatasetMeta,

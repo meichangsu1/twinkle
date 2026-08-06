@@ -192,7 +192,11 @@ class ComputeWorker:
         q.task_done() in the finally block.
         """
         await self._state.store_future_status(
-            task.request_id, TaskStatus.RUNNING.value, task.model_id, queue_state=QueueState.ACTIVE.value)
+            task.request_id,
+            TaskStatus.RUNNING.value,
+            task.model_id,
+            queue_state=QueueState.ACTIVE.value,
+        )
 
         task_type = task.task_type or 'unknown'
         exec_start = time.monotonic()
@@ -226,7 +230,8 @@ class ComputeWorker:
                 TaskStatus.COMPLETED.value,
                 task.model_id,
                 result=result,
-                queue_state=QueueState.ACTIVE.value)
+                queue_state=QueueState.ACTIVE.value,
+            )
         except asyncio.TimeoutError:
             task_status = 'timeout'
             exec_time = time.monotonic() - exec_start

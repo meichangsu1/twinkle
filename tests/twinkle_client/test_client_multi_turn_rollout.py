@@ -309,6 +309,32 @@ def _build_from_scripts(scripts_spec: List[Dict[str, Any]]):
     return trajectories, sampler, template
 
 
+@pytest.mark.asyncio
+async def test_async_rollout_passes_explicit_policy_to_sampler() -> None:
+    trajectories, sampler, template = _build_from_scripts([{
+        'num_tools': 0,
+        'terminal': 'stop',
+        'logprobs': True,
+    }])
+    calls = []
+
+    async def asample(inputs, **kwargs):
+        calls.append(kwargs)
+        return sampler.sample(inputs, sampling_params=kwargs.get('sampling_params'))
+
+    sampler.asample = asample
+    rollout = ClientMultiTurnRollout(sampler, template, max_turns=2)
+    outputs = await rollout.arun(
+        trajectories,
+        adapter_name='math-lora',
+        adapter_uri='twinkle://run/weights/policy-3',
+    )
+
+    assert len(outputs) == 1
+    assert calls[0]['adapter_name'] == 'math-lora'
+    assert calls[0]['adapter_uri'] == 'twinkle://run/weights/policy-3'
+
+
 # =============================================================================
 # Hypothesis strategies
 # =============================================================================
