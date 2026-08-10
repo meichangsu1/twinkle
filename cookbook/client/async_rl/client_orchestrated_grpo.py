@@ -23,6 +23,10 @@ from twinkle_client.sampler import vLLMSampler
 
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
+TEMPLATE_CLS = os.environ.get(
+    'TWINKLE_TEMPLATE_CLS',
+    'Qwen3_5Template' if ('Qwen3.5' in BASE_MODEL or 'Qwen3.6' in BASE_MODEL) else 'Template',
+)
 ADAPTER_NAME = os.environ.get('TWINKLE_ADAPTER_NAME', 'client-grpo')
 MAX_PARTITIONS = int(os.environ.get('TWINKLE_MAX_PARTITIONS', '100'))
 MAX_STALENESS = int(os.environ.get('TWINKLE_MAX_STALENESS', '2'))
@@ -118,7 +122,7 @@ class _GRPOState:
 
 def create_dataset() -> Dataset:
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
+    dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -439,8 +443,8 @@ async def train() -> None:
         model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
         model.set_optimizer('AdamW', lr=2e-5)
         model.set_processor('InputProcessor', padding_free=True)
-        model.set_template('Qwen3_5Template', model_id=MODEL_ID)
-        sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+        model.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
+        sampler.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
 
         dataloader = DataLoader(dataset=create_dataset(), batch_size=BATCH_SIZE, num_workers=0)
         await run_grpo(dataloader, model, sampler, data_plane)

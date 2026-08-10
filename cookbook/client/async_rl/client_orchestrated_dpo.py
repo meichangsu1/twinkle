@@ -19,6 +19,10 @@ from twinkle_client.types import DataRef
 
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
+TEMPLATE_CLS = os.environ.get(
+    'TWINKLE_TEMPLATE_CLS',
+    'Qwen3_5Template' if ('Qwen3.5' in BASE_MODEL or 'Qwen3.6' in BASE_MODEL) else 'Template',
+)
 DATASET_ID = os.environ.get('TWINKLE_DPO_DATASET_ID', 'ms://hjh0119/shareAI-Llama3-DPO-zh-en-emoji')
 ADAPTER_NAME = os.environ.get('TWINKLE_ADAPTER_NAME', 'client-dpo')
 MAX_STEPS = int(os.environ.get('TWINKLE_MAX_STEPS', '100'))
@@ -29,7 +33,7 @@ MAX_LENGTH = int(os.environ.get('TWINKLE_MAX_LENGTH', '2048'))
 def create_dataset() -> Dataset:
     """Load and encode preference pairs in the client process."""
     dataset = Dataset(DatasetMeta(DATASET_ID, data_slice=range(MAX_STEPS * BATCH_SIZE)))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=MAX_LENGTH)
+    dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=MAX_LENGTH)
     dataset.map(EmojiDPOProcessor, init_args={'system': 'You are a helpful assistant.'})
     dataset.encode()
     return dataset
@@ -216,7 +220,7 @@ async def train() -> None:
         ADAPTER_NAME,
         LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05),
     )
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    model.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('DPOLoss', beta=0.1, loss_type='sigmoid', reference_free=False)
     model.add_metric('DPOMetric', beta=0.1)

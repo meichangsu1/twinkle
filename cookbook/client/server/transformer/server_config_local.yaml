@@ -1,9 +1,10 @@
-# Twinkle Server Configuration - local Qwen3.5-4B for client-orchestrated async RL
+# Twinkle Server Configuration - local Qwen3-4B for client-orchestrated async RL
 
 # Set the absolute Hugging Face-compatible model directory before loading this file:
-#   export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
+#   export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3-4B
+#   export TWINKLE_MODEL_ID=Qwen/Qwen3-4B  # in every client process
 #
-# The public HTTP model name remains Qwen/Qwen3.5-4B. Both the training Model
+# The public HTTP model name remains Qwen/Qwen3-4B. Both the training Model
 # and the vLLM Sampler load the same local directory, so neither component
 # downloads the base model independently.
 
@@ -31,7 +32,7 @@ applications:
       server_config:
         per_token_model_limit: 3
       supported_models:
-        - Qwen/Qwen3.5-4B
+        - Qwen/Qwen3-4B
     deployments:
       - name: TinkerCompatServer
         max_ongoing_requests: 50
@@ -61,8 +62,8 @@ applications:
           num_cpus: 1
 
   # One GPU hosts the training base model and multiple LoRA adapters.
-  - name: models-Qwen3.5-4B
-    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+  - name: models-Qwen3-4B
+    route_prefix: /api/v1/model/Qwen/Qwen3-4B
     import_path: model
     args:
       backend: transformers
@@ -97,8 +98,8 @@ applications:
               TWINKLE_FAIL_FAST: "0"
 
   # A second GPU hosts vLLM and loads the same local base model.
-  - name: sampler-Qwen3.5-4B
-    route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
+  - name: sampler-Qwen3-4B
+    route_prefix: /api/v1/sampler/Qwen/Qwen3-4B
     import_path: sampler
     args:
       model_id: ${oc.env:TWINKLE_LOCAL_MODEL_PATH}
