@@ -3,6 +3,7 @@
 # Set the absolute Hugging Face-compatible model directory before loading this file:
 #   export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3-4B
 #   export TWINKLE_MODEL_ID=Qwen/Qwen3-4B  # in every client process
+#   export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3-4B  # if clients share that path
 #
 # The public HTTP model name remains Qwen/Qwen3-4B. Both the training Model
 # and the vLLM Sampler load the same local directory, so neither component
@@ -105,7 +106,7 @@ applications:
       model_id: ${oc.env:TWINKLE_LOCAL_MODEL_PATH}
       data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
       nproc_per_node: 1
-      sampler_type: vllm
+      sampler_type: vllm_async
       engine_args:
         max_model_len: 4096
         gpu_memory_utilization: 0.5

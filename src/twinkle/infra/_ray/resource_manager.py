@@ -97,7 +97,7 @@ class ResourceManager:
                 except IndexError:
                     node = self.nodes[0]
                 node_cpu = int(node['Resources']['CPU'])
-                bundles.append({device_type: nproc_per_node, 'CPU': max(node_cpu // 2, 1)})
+                bundles.append({device_type: nproc_per_node, 'CPU': max(nproc_per_node, 1)})
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
         if cpu_proc_count > 0:
@@ -150,11 +150,22 @@ class ResourceManager:
             return os.environ.get(Platform.get_platform(device_type).visible_device_env())
 
         if self.placement_groups:
-            self.visible_devices = ray.get([
-                get_visible_devices.options(placement_group=pg, runtime_env={
-                    'env_vars': self.noset_env()
-                }).remote() for pg in self.placement_groups
-            ])
+            visible_device_futures = []
+            for pg in self.placement_groups:
+                probe_options = {'placement_group': pg}
+                if device_type == 'GPU':
+                    # Ask Ray for the GPUs owned by this placement group.  A
+                    # no-GPU probe with NOSET_* only sees the node-global
+                    # CUDA_VISIBLE_DEVICES list, so independently initialized
+                    # Model and Sampler groups both select its first entry.
+                    # The probe is short-lived and releases the bundle before
+                    # component workers are created.
+                    probe_options['num_gpus'] = nproc_per_node
+                else:
+                    probe_options['resources'] = {device_type: nproc_per_node}
+                visible_device_futures.append(
+                    get_visible_devices.options(**probe_options).remote())
+            self.visible_devices = ray.get(visible_device_futures)
 
         visible_devices = []
         for visible_device in self.visible_devices:

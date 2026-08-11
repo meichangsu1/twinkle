@@ -157,24 +157,12 @@ def test_server_waiter_admits_later_submission_before_first_finishes() -> None:
     sampler = Sampler()
 
     async def run():
+        sampler.submit_generation('first')
+        sampler.submit_generation('second')
         first = asyncio.create_task(
-            _await_generation(
-                sampler,
-                'first',
-                [{'input_ids': [1]}],
-                SamplingParams(max_tokens=4),
-                adapter_name='',
-                adapter_path=None,
-            ))
+            _await_generation(sampler, 'first'))
         second = asyncio.create_task(
-            _await_generation(
-                sampler,
-                'second',
-                [{'input_ids': [2]}],
-                SamplingParams(max_tokens=4),
-                adapter_name='',
-                adapter_path=None,
-            ))
+            _await_generation(sampler, 'second'))
         while len(sampler.submission_order) < 2:
             await asyncio.sleep(0)
         assert not first.done()
@@ -186,3 +174,37 @@ def test_server_waiter_admits_later_submission_before_first_finishes() -> None:
 
     asyncio.run(run())
     assert set(sampler.submission_order) == {'first', 'second'}
+
+
+def test_server_waiter_retries_cancelled_status_poll() -> None:
+    from ray.exceptions import TaskCancelledError
+
+    class Sampler:
+
+        def __init__(self):
+            self.status_calls = 0
+            self.cancelled = False
+
+        def submit_generation(self, *_args, **_kwargs):
+            return None
+
+        def get_generation_status(self, _submission_id):
+            self.status_calls += 1
+            if self.status_calls == 1:
+                raise TaskCancelledError()
+            return {'status': 'completed'}
+
+        def collect_generation(self, _submission_id):
+            return ['completed']
+
+        def cancel_generation(self, _submission_id):
+            self.cancelled = True
+
+    sampler = Sampler()
+    sampler.submit_generation('submission')
+    result = asyncio.run(
+        _await_generation(sampler, 'submission'))
+
+    assert result == ['completed']
+    assert sampler.status_calls == 2
+    assert not sampler.cancelled

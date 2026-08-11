@@ -1,7 +1,6 @@
 import asyncio
 
 from cookbook.client.async_rl.client_orchestrated_dpo import (
-    _extract_ref_outputs,
     prepare_dpo_batch,
     run_dpo,
 )
@@ -26,15 +25,6 @@ def test_prepare_dpo_batch_interleaves_complete_pairs() -> None:
 
     assert [row['pair_id'] for row in rows] == ['a', 'a', 'b', 'b']
     assert [row['input_ids'] for row in rows] == [[1, 2], [1, 3], [4], [5]]
-
-
-def test_extract_ref_outputs_unwraps_data_plane_row() -> None:
-    ref_outputs = _extract_ref_outputs(
-        {'output_ref': {'ref_id': 'unused'}},
-        [{'result': {'logps': [[-1.0, -2.0], [-3.0, -4.0]], 'logits': None}}],
-    )
-
-    assert ref_outputs == {'logps': [[-1.0, -2.0], [-3.0, -4.0]]}
 
 
 def test_dpo_roles_overlap_reference_and_training(monkeypatch) -> None:
@@ -77,24 +67,26 @@ def test_dpo_roles_overlap_reference_and_training(monkeypatch) -> None:
             self.steps = 0
             self.forward_backward_kwargs = []
 
-        async def submit_forward_only(self, ref, **_kwargs):
+        async def forward_only(self, ref, **kwargs):
             self.references += 1
             name = f'reference-{self.references}'
             events.append(f'{name}-start')
             if self.references == 2:
                 await first_train_started.wait()
             events.append(f'{name}-done')
-            return {'logps': [[-0.1]] * ref.size}
+            assert kwargs['output_ref'] == ref
+            assert kwargs['output_fields'] == {'logps': 'ref_logps'}
+            return ref.model_copy(update={'fields': [*ref.fields, 'ref_logps']})
 
-        async def submit_forward_backward(self, _ref, **kwargs):
+        async def forward_backward(self, _ref, **kwargs):
             self.forward_backward_kwargs.append(kwargs)
             events.append('train-start')
             first_train_started.set()
 
-        async def submit_clip_grad_and_step(self, **_kwargs):
+        async def clip_grad_and_step(self, **_kwargs):
             self.steps += 1
 
-        async def submit_save(self, name, **_kwargs):
+        async def save(self, name, **_kwargs):
             return {'twinkle_path': name}
 
     batches = [
@@ -109,8 +101,8 @@ def test_dpo_roles_overlap_reference_and_training(monkeypatch) -> None:
     assert events.index('train-start') < events.index('reference-2-done')
     assert model.steps == 2
     assert model.forward_backward_kwargs == [
-        {'ref_outputs': {'logps': [[-0.1], [-0.1]]}},
-        {'ref_outputs': {'logps': [[-0.1], [-0.1]]}},
+        {'kwarg_fields': {'ref_outputs.logps': 'ref_logps'}},
+        {'kwarg_fields': {'ref_outputs.logps': 'ref_logps'}},
     ]
     assert saved == {'twinkle_path': 'dpo-policy-2'}
     assert len(data_plane.released) == 2

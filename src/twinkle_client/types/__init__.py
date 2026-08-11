@@ -93,14 +93,9 @@ from .training import (
 
 from .checkpoint import ResolvedLoadPath
 from .component import (
-    AsyncClipGradAndStepRequest,
-    AsyncForwardBackwardRequest,
-    AsyncForwardRequest,
-    AsyncSampleRequest,
-    AsyncSaveRequest,
-    ComponentTaskRef,
     DataAppendRequest,
     DataGetRequest,
+    DataPlaneSampleRequest,
     DataPutRequest,
     DataRef,
     DataReleaseRequest,

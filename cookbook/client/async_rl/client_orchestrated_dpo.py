@@ -19,6 +19,7 @@ from twinkle_client.types import DataRef
 
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
+TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
 TEMPLATE_CLS = os.environ.get(
     'TWINKLE_TEMPLATE_CLS',
     'Qwen3_5Template' if ('Qwen3.5' in BASE_MODEL or 'Qwen3.6' in BASE_MODEL) else 'Template',
@@ -33,7 +34,7 @@ MAX_LENGTH = int(os.environ.get('TWINKLE_MAX_LENGTH', '2048'))
 def create_dataset() -> Dataset:
     """Load and encode preference pairs in the client process."""
     dataset = Dataset(DatasetMeta(DATASET_ID, data_slice=range(MAX_STEPS * BATCH_SIZE)))
-    dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=MAX_LENGTH)
+    dataset.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID, max_length=MAX_LENGTH)
     dataset.map(EmojiDPOProcessor, init_args={'system': 'You are a helpful assistant.'})
     dataset.encode()
     return dataset
@@ -47,21 +48,6 @@ def prepare_dpo_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows.append({**common, **pair['positive']})
         rows.append({**common, **pair['negative']})
     return json_safe(rows)
-
-
-def _extract_ref_outputs(result: Any, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Normalize an async forward-only result into the DPOLoss input shape."""
-    payload: Any = rows
-    if payload is None and isinstance(result, dict):
-        payload = result.get('result', result)
-    if isinstance(payload, list) and payload and all(
-            isinstance(row, dict) and row.get('logps') is not None for row in payload):
-        return {'logps': [row['logps'] for row in payload]}
-    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
-        payload = payload[0].get('result', payload[0])
-    if not isinstance(payload, dict) or payload.get('logps') is None:
-        raise RuntimeError('reference forward did not return per-token logps')
-    return {'logps': payload['logps']}
 
 
 async def _put_rows(data_plane, rows, *, kind, tags):
@@ -80,6 +66,10 @@ async def _submit(method, *args, **kwargs):
     if inspect.isawaitable(task):
         return await task
     return task
+
+
+def _response_payload(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else value.model_dump()
 
 
 class _DatasetWorker(Worker):
@@ -122,10 +112,9 @@ class _DatasetWorker(Worker):
 
 class _ReferenceWorker(Worker):
 
-    def __init__(self, model, data_plane, source, output):
+    def __init__(self, model, source, output):
         super().__init__('reference')
         self.model = model
-        self.data_plane = data_plane
         self.source = source
         self.output = output
 
@@ -135,9 +124,8 @@ class _ReferenceWorker(Worker):
             if item is None:
                 await self.output.put(None)
                 return
-            ref = item
-            ref_outputs = await _reference_forward(self.model, self.data_plane, ref)
-            await self.output.put((ref, ref_outputs))
+            ref = await _reference_forward(self.model, item)
+            await self.output.put(ref)
 
 
 class _TrainerWorker(Worker):
@@ -154,20 +142,20 @@ class _TrainerWorker(Worker):
         while True:
             item = await self.source.get()
             if item is None:
-                self.saved = await _submit(
-                    self.model.submit_save,
+                self.saved = _response_payload(await _submit(
+                    self.model.save,
                     f'dpo-policy-{self.completed_steps}',
                     save_optimizer=True,
-                )
+                ))
                 return
-            ref, ref_outputs = item
+            ref = item
             try:
                 await _submit(
-                    self.model.submit_forward_backward,
+                    self.model.forward_backward,
                     ref,
-                    ref_outputs=ref_outputs,
+                    kwarg_fields={'ref_outputs.logps': 'ref_logps'},
                 )
-                await _submit(self.model.submit_clip_grad_and_step, max_grad_norm=1.0)
+                await _submit(self.model.clip_grad_and_step, max_grad_norm=1.0)
             finally:
                 await self.data_plane.arelease(ref)
             self.completed_steps += 1
@@ -175,20 +163,16 @@ class _TrainerWorker(Worker):
 
 async def _reference_forward(
     model: MultiLoraTransformersModel,
-    data_plane: DataPlaneClient,
     batch_ref: DataRef,
-) -> dict[str, Any]:
-    """Run the frozen base model and materialize its DataPlane result."""
-    result = await _submit(model.submit_forward_only, batch_ref, disable_lora=True)
-    if not isinstance(result, dict) or not result.get('output_ref'):
-        return _extract_ref_outputs(result)
-
-    output_ref = DataRef(**result['output_ref'])
-    try:
-        rows = await data_plane.aget(output_ref)
-        return _extract_ref_outputs(result, rows)
-    finally:
-        await data_plane.arelease(output_ref)
+) -> DataRef:
+    """Run the frozen base model and append reference logps to the same rows."""
+    return await _submit(
+        model.forward_only,
+        batch_ref,
+        disable_lora=True,
+        output_ref=batch_ref,
+        output_fields={'logps': 'ref_logps'},
+    )
 
 
 async def run_dpo(
@@ -202,7 +186,7 @@ async def run_dpo(
     trainer = _TrainerWorker(model, data_plane, reference_ready)
     await WorkerPipeline((
         _DatasetWorker(dataloader, data_plane, preference_ready),
-        _ReferenceWorker(model, data_plane, preference_ready, reference_ready),
+        _ReferenceWorker(model, preference_ready, reference_ready),
         trainer,
     )).run()
     return trainer.saved
@@ -220,7 +204,7 @@ async def train() -> None:
         ADAPTER_NAME,
         LoraConfig(target_modules='all-linear', r=8, lora_alpha=32, lora_dropout=0.05),
     )
-    model.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
+    model.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
     model.set_processor('InputProcessor', padding_side='right')
     model.set_loss('DPOLoss', beta=0.1, loss_type='sigmoid', reference_free=False)
     model.add_metric('DPOMetric', beta=0.1)

@@ -45,6 +45,16 @@ class FakeModel(nn.Module):
         return self.mlp.experts(x, expert_idx=expert_idx)
 
 
+class FakeLinearModel(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
 def test_peft_target_parameter_key_shapes_for_3d_experts():
     model = FakeModel()
     cfg = LoraConfig(
@@ -211,6 +221,24 @@ def test_multilora_state_dict_round_trips_target_parameters():
         actual = restored_model(inputs, expert_idx=0)
 
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_multilora_state_dict_without_target_parameters_does_not_require_slot():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    slot_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["proj"])
+    model = get_peft_model(FakeLinearModel(), slot_cfg, adapter_name="lora_0")
+    multi_lora = MultiLora(max_loras=1, max_r=4)
+    multi_lora.module = model
+    multi_lora.loras = [LoraTenant(index=0, adapter_name="lora_0", config=slot_cfg)]
+
+    tenant_cfg = LoraConfig(r=2, lora_alpha=4, target_modules=["proj"])
+    multi_lora.acquire_lora("adapter_a", tenant_cfg)
+
+    assert "adapter_a" not in multi_lora.target_parameter_manager.tenant_to_slot
+    state = multi_lora.get_state_dict("adapter_a")
+    assert state
+    multi_lora.set_state_dict("adapter_a", state)
 
 
 def test_multilora_transformers_installs_target_parameters_once():

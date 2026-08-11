@@ -114,7 +114,7 @@ def test_mock_dispatch_returns_mock_sampler() -> None:
     assert isinstance(s, MockSampler)
 
 
-def test_data_plane_vllm_uses_fire_and_forget_sampler(monkeypatch) -> None:
+def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
     from twinkle_agentic.async_rl import vllm_sampler_tq as module
 
     captured = {}
@@ -126,16 +126,16 @@ def test_data_plane_vllm_uses_fire_and_forget_sampler(monkeypatch) -> None:
     monkeypatch.setattr(module, 'VLLMSamplerTQ', construct)
 
     sampler = _construct_sampler_backend(
-        'vllm',
+        'vllm_async',
         {'model_id': 'local-model'},
-        'http://data-plane',
+        None,
     )
 
     assert sampler == 'vllm-tq'
     assert captured == {'model_id': 'local-model', 'context_manager': None}
 
 
-def test_vllm_without_data_plane_keeps_standard_backend(monkeypatch) -> None:
+def test_standard_vllm_is_independent_of_data_plane(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
         SAMPLER_SELECTOR,
@@ -143,7 +143,7 @@ def test_vllm_without_data_plane_keeps_standard_backend(monkeypatch) -> None:
         lambda sampler_type, kwargs: calls.append((sampler_type, kwargs)) or 'standard-vllm',
     )
 
-    sampler = _construct_sampler_backend('vllm', {'model_id': 'local-model'}, None)
+    sampler = _construct_sampler_backend('vllm', {'model_id': 'local-model'}, 'http://data-plane')
 
     assert sampler == 'standard-vllm'
     assert calls == [('vllm', {'model_id': 'local-model'})]

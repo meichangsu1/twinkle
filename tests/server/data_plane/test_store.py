@@ -83,10 +83,17 @@ async def test_data_ref_round_trip_append_release_and_ref_isolation(monkeypatch)
     )
     assert ref.num_tokens == 5
 
+    nested_ref = await store.put([
+        {'train_input': {'input_ids': [1, 2, 3]}},
+        {'train_input': {'input_ids': [4]}},
+    ], kind='rollout')
+    assert nested_ref.num_tokens == 4
+
     with pytest.raises(KeyError):
         await store.get(ref.model_copy(update={'ref_id': 'another-ref'}))
 
     await store.release(ref)
+    await store.release(nested_ref)
     assert records == {}
 
 

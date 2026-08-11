@@ -40,6 +40,13 @@ def _make_vllm_sampler(kw: dict[str, Any]) -> Any:
     return vLLMSampler(**kw)
 
 
+def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
+    """Construct the vLLM backend with non-blocking generation admission."""
+    from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
+
+    return VLLMSamplerTQ(**kw, context_manager=None)
+
+
 def _make_torch_sampler(kw: dict[str, Any]) -> Any:
     from twinkle.sampler import TorchSampler  # type: ignore[attr-defined]
 
@@ -52,6 +59,7 @@ SAMPLER_SELECTOR = BackendSelector(
     {
         'mock': _make_mock_sampler,
         'vllm': _make_vllm_sampler,
+        'vllm_async': _make_vllm_async_sampler,
         'torch': _make_torch_sampler,
     },
 )
@@ -62,12 +70,8 @@ def _construct_sampler_backend(
     sampler_kwargs: dict[str, Any],
     data_plane_url: str | None,
 ) -> Any:
-    if sampler_type == 'vllm' and data_plane_url:
-        # Client-orchestrated async RL needs sampler admission to release the
-        # Ray actor immediately.  VLLMSamplerTQ retains the inherited
-        # synchronous API for ordinary sample calls.
-        from twinkle_agentic.async_rl.vllm_sampler_tq import VLLMSamplerTQ
-        return VLLMSamplerTQ(**sampler_kwargs, context_manager=None)
+    # Backend selection is explicit. DataPlane config controls where results
+    # are stored, not which sampler implementation is instantiated.
     return SAMPLER_SELECTOR.construct(sampler_type, sampler_kwargs)
 
 
@@ -170,7 +174,7 @@ def build_sampler_app(model_id: str,
         device_group: Device group configuration dict
         device_mesh: Device mesh configuration dict for parallelism
         deploy_options: Ray Serve deployment options
-        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``torch``.
+        sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async`` | ``torch``.
             Validated up front; bad values raise :class:`ConfigError` before
             any side effect.
         engine_args: Additional engine arguments for the sampler

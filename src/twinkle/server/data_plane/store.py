@@ -20,11 +20,14 @@ def _partition(ref: DataRef) -> str:
 
 
 def _input_token_count(rows: list[dict[str, Any]]) -> int:
-    return sum(
-        len(row.get('input_ids', []))
-        for row in rows
-        if isinstance(row.get('input_ids'), (list, tuple))
-    )
+    total = 0
+    for row in rows:
+        input_ids = row.get('input_ids')
+        if input_ids is None and isinstance(row.get('train_input'), dict):
+            input_ids = row['train_input'].get('input_ids')
+        if isinstance(input_ids, (list, tuple)):
+            total += len(input_ids)
+    return total
 
 
 def _rows_from_tensordict(data: Any, size: int) -> list[dict[str, Any]]:
@@ -124,7 +127,7 @@ class TQDataRefStore:
         updates: dict[str, Any] = {
             'fields': list(dict.fromkeys([*ref.fields, *rows[0].keys()])),
         }
-        if 'input_ids' in rows[0]:
+        if 'input_ids' in rows[0] or 'train_input' in rows[0]:
             updates['num_tokens'] = _input_token_count(rows)
         return ref.model_copy(update=updates)
 

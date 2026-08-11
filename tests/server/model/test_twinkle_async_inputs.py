@@ -28,6 +28,19 @@ class _SchedulingManagement:
         self.scheduled = []
         self.model_calls = []
         self.model = self
+        self.data_plane = self
+        self.rows = {
+            'data-a': [{
+                'train_input': {'input_ids': [index]},
+                'sampled_logprobs': [-0.1],
+                'advantage': 1.0,
+            } for index in range(4)],
+            'data-b': [{
+                'train_input': {'input_ids': [index]},
+                'sampled_logprobs': [-0.2],
+                'advantage': -1.0,
+            } for index in range(4, 8)],
+        }
 
     async def _on_request_start(self, _request):
         return 'token'
@@ -39,26 +52,35 @@ class _SchedulingManagement:
         self.model_calls.append((inputs, adapter_name, kwargs))
         return {'loss': 1.0}
 
-    async def schedule_task(self, task, **kwargs):
+    async def get(self, ref, *, fields=None):
+        rows = self.rows[ref.ref_id]
+        if fields is None:
+            return rows
+        return [{field: row[field] for field in fields} for row in rows]
+
+    async def schedule_task_and_wait(self, task, **kwargs):
         self.scheduled.append(kwargs)
-        await task()
-        return {'request_id': 'request-1', 'model_id': kwargs.get('model_id')}
+        return await task()
 
 
 @pytest.mark.asyncio
-async def test_async_forward_backward_schedules_without_algorithm_metadata() -> None:
+async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -> None:
     management = _SchedulingManagement()
     app = FastAPI()
     _register_twinkle_routes(app, lambda: management)
-    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/submit_forward_backward')
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
-    body = types.AsyncForwardBackwardRequest(
+    body = types.ForwardRequest(
         adapter_name='adapter',
-        inputs=[{'input_ids': [index]} for index in range(8)],
-        kwargs={
-            'old_logps': [[-0.1]] * 8,
-            'advantages': [1.0] * 8,
+        input_refs=[
+            types.DataRef(ref_id='data-a', size=4, num_tokens=4),
+            types.DataRef(ref_id='data-b', size=4, num_tokens=4),
+        ],
+        input_field='train_input',
+        kwarg_fields={
+            'old_logps': 'sampled_logprobs',
+            'advantages': 'advantage',
         },
     )
 
@@ -66,7 +88,10 @@ async def test_async_forward_backward_schedules_without_algorithm_metadata() -> 
 
     assert management.scheduled[-1]['batch_size'] == 8
     assert management.scheduled[-1]['data_world_size'] == 2
-    assert 'batch_size_multiple' not in management.scheduled[-1]
-    _, adapter_name, forwarded_kwargs = management.model_calls[-1]
+    inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
     assert adapter_name == 'session-adapter'
-    assert forwarded_kwargs == body.kwargs
+    assert [row['input_ids'].tolist() for row in inputs] == [[index] for index in range(8)]
+    assert forwarded_kwargs == {
+        'old_logps': [[-0.1]] * 4 + [[-0.2]] * 4,
+        'advantages': [1.0] * 4 + [-1.0] * 4,
+    }

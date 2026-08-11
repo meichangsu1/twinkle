@@ -23,6 +23,7 @@ from twinkle_client.sampler import vLLMSampler
 
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
+TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
 TEMPLATE_CLS = os.environ.get(
     'TWINKLE_TEMPLATE_CLS',
     'Qwen3_5Template' if ('Qwen3.5' in BASE_MODEL or 'Qwen3.6' in BASE_MODEL) else 'Template',
@@ -50,6 +51,7 @@ class _RolloutPartition:
 
     partition_id: int
     policy: _Policy
+    prompts: list[dict[str, Any]]
     rollouts: list[asyncio.Task[Any]]
     ready: asyncio.Queue['_ReadyGroup'] = field(default_factory=asyncio.Queue)
 
@@ -57,16 +59,14 @@ class _RolloutPartition:
 @dataclass
 class _ReadyGroup:
     group_index: int
-    rows: list[dict[str, Any]]
-    tags: list[dict[str, Any]]
     ref: Any
-    forward_kwargs: dict[str, Any]
 
 
 @dataclass
 class _RolloutResult:
     partition: _RolloutPartition
     group_index: int
+    prompt: dict[str, Any]
     ref: Any
 
 
@@ -122,7 +122,7 @@ class _GRPOState:
 
 def create_dataset() -> Dataset:
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=2048, enable_thinking=False)
+    dataset.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -137,8 +137,8 @@ async def rollout_group(
 ) -> Any:
     """Submit one GRPO group and keep its sample-level TQ DataRef alive."""
     async with semaphore:
-        result = await _submit(
-            sampler.submit_sample,
+        return await _submit(
+            sampler.asample_to_data_plane,
             [prompt],
             adapter_name=ADAPTER_NAME,
             adapter_uri=policy.adapter_uri,
@@ -152,10 +152,6 @@ async def rollout_group(
             },
             num_samples=NUM_GENERATIONS,
         )
-    if not isinstance(result, dict) or not result.get('output_ref'):
-        raise RuntimeError('async sampler did not return a DataPlane output_ref')
-    from twinkle_client.types import DataRef
-    return DataRef(**result['output_ref'])
 
 
 def start_partition(
@@ -166,9 +162,11 @@ def start_partition(
     semaphore: asyncio.Semaphore,
 ) -> _RolloutPartition:
     """Capture the snapshot before submitting any rollout in this partition."""
+    prompts = json_safe(batch)
     return _RolloutPartition(
         partition_id=partition_id,
         policy=policy,
+        prompts=prompts,
         rollouts=[
             asyncio.create_task(
                 rollout_group(
@@ -178,19 +176,9 @@ def start_partition(
                     semaphore,
                     f'partition-{partition_id}/group-{group_index}',
                 ))
-            for group_index, prompt in enumerate(json_safe(batch))
+            for group_index, prompt in enumerate(prompts)
         ],
     )
-
-
-async def _put_rows(data_plane: DataPlaneClient, rows, *, kind: str, tags):
-    """Pass native sample tags while remaining friendly to small cookbook fakes."""
-    try:
-        return await data_plane.aput(rows, kind=kind, tags=tags)
-    except TypeError as error:
-        if 'tags' not in str(error):
-            raise
-        return await data_plane.aput(rows, kind=kind)
 
 
 async def _submit(method, *args, **kwargs):
@@ -200,6 +188,12 @@ async def _submit(method, *args, **kwargs):
     if inspect.isawaitable(task):
         return await task
     return task
+
+
+def _checkpoint_path(saved: Any) -> str:
+    if isinstance(saved, dict):
+        return str(saved['twinkle_path'])
+    return str(saved.twinkle_path)
 
 
 class _RolloutWorker(Worker):
@@ -215,7 +209,8 @@ class _RolloutWorker(Worker):
     async def _collect(self, partition, group_index, task):
         try:
             ref = await task
-            await self.output.put(_RolloutResult(partition, group_index, ref))
+            await self.output.put(
+                _RolloutResult(partition, group_index, partition.prompts[group_index], ref))
         except BaseException as error:
             await self.state.fail(error)
             raise
@@ -268,52 +263,28 @@ class _AdvantageWorker(Worker):
                     return
                 group_id = f'partition-{result.partition.partition_id}/group-{result.group_index}'
                 try:
-                    batch = await self.data_plane.aget_batch(result.ref)
-                    if len(batch.rows) != NUM_GENERATIONS:
+                    rows = await self.data_plane.aget(result.ref, fields=['decoded'])
+                    if len(rows) != NUM_GENERATIONS:
                         raise RuntimeError(
                             f'group {group_id} expected {NUM_GENERATIONS} generations, '
-                            f'got {len(batch.rows)}')
-                    features = [row.get('new_input_feature') for row in batch.rows]
-                    if not all(isinstance(feature, dict) for feature in features):
-                        raise RuntimeError(f'group {group_id} has no trainable new_input_feature')
-                    old_logps = [
-                        [position[0][1] for position in (row.get('logprobs') or [])]
-                        for row in batch.rows
-                    ]
-                    rewards = await asyncio.to_thread(GSM8KAccuracyReward(), features)
+                            f'got {len(rows)}')
+                    trajectories = []
+                    for row in rows:
+                        messages = list(result.prompt.get('messages') or [])
+                        messages.append({'role': 'assistant', 'content': row.get('decoded') or ''})
+                        trajectories.append({**result.prompt, 'messages': messages})
+                    rewards = await asyncio.to_thread(GSM8KAccuracyReward(), trajectories)
                     advantages = await asyncio.to_thread(
                         GRPOAdvantage(), rewards, num_generations=NUM_GENERATIONS)
-                    train_rows = [dict(feature) for feature in features]
-                    if batch.tags and len(batch.tags) != len(train_rows):
-                        raise RuntimeError(
-                            f'group {group_id} returned {len(batch.tags)} tags for '
-                            f'{len(train_rows)} rows')
-                    source_tags = batch.tags or [{} for _ in train_rows]
-                    tags = [{
-                        **tag,
-                        'record_type': 'sample',
-                        'group_id': group_id,
-                        'generation_idx': index,
-                        'rollout_status': 'ROLLOUT_DONE',
-                        'advantage_status': 'ADVANTAGE_DONE',
-                        'rollout_policy_version': result.partition.policy.version,
-                        'rollout_adapter_uri': result.partition.policy.adapter_uri,
-                    } for index, tag in enumerate(source_tags)]
-                    ref = await self.data_plane.aappend(result.ref, train_rows, tags=tags)
-                    # The physical TQ rows retain rollout fields, while this
-                    # reference selects only the trainable InputFeature.
-                    train_ref = ref.model_copy(update={'fields': list(train_rows[0])})
+                    ref = await self.data_plane.aappend(
+                        result.ref,
+                        [{
+                            'reward': float(reward),
+                            'advantage': float(advantage),
+                        } for reward, advantage in zip(rewards, advantages)],
+                    )
                     await result.partition.ready.put(
-                        _ReadyGroup(
-                            result.group_index,
-                            train_rows,
-                            tags,
-                            train_ref,
-                            {
-                                'old_logps': json_safe(old_logps),
-                                'advantages': json_safe(advantages),
-                            },
-                        ))
+                        _ReadyGroup(result.group_index, ref))
                 except BaseException:
                     await self.data_plane.arelease(result.ref)
                     raise
@@ -332,40 +303,24 @@ class _TrainerWorker(Worker):
         self.optimizer_step = 0
 
     async def _train(self, groups: list[_ReadyGroup]) -> None:
-        rows = [row for group in groups for row in group.rows]
-        tags = [tag for group in groups for tag in group.tags]
-        created_batch = len(groups) > 1
-        train_ref = (
-            await _put_rows(self.data_plane, rows, kind='grpo-train', tags=tags)
-            if created_batch else groups[0].ref
-        )
-        old_logps = [
-            value
-            for group in groups
-            for value in group.forward_kwargs['old_logps']
-        ]
-        advantages = [
-            value
-            for group in groups
-            for value in group.forward_kwargs['advantages']
-        ]
+        refs = [group.ref for group in groups]
         try:
             await _submit(
-                self.model.submit_forward_backward,
-                train_ref,
-                old_logps=old_logps,
-                advantages=advantages,
+                self.model.forward_backward,
+                refs,
+                input_field='train_input',
+                kwarg_fields={
+                    'old_logps': 'sampled_logprobs',
+                    'advantages': 'advantage',
+                },
                 dynamic_batching=True,
                 micro_batch_size=MICRO_BATCH_SIZE,
                 max_tokens_per_micro_batch=MAX_TOKENS_PER_MICRO_BATCH,
             )
-            await _submit(self.model.submit_clip_grad_and_step, max_grad_norm=1.0)
+            await _submit(self.model.clip_grad_and_step, max_grad_norm=1.0)
             self.optimizer_step += 1
         finally:
-            if created_batch:
-                await self.data_plane.arelease(train_ref)
-            for group in groups:
-                await self.data_plane.arelease(group.ref)
+            await asyncio.gather(*(self.data_plane.arelease(ref) for ref in refs))
 
     async def run(self) -> None:
         try:
@@ -387,8 +342,8 @@ class _TrainerWorker(Worker):
                 if ready:
                     raise RuntimeError('partition ended with an incomplete train mini-batch')
                 publish_version = self.state.policy.version + 1
-                saved = await _submit(self.model.submit_save, f'policy-{publish_version}')
-                policy = _Policy(publish_version, saved['twinkle_path'])
+                saved = await _submit(self.model.save, f'policy-{publish_version}')
+                policy = _Policy(publish_version, _checkpoint_path(saved))
                 await self.state.publish(partition, policy)
                 print(
                     f'partition={partition.partition_id} policy={policy.version} '
@@ -415,8 +370,8 @@ async def run_grpo(
     if BATCH_SIZE % groups_per_step:
         raise ValueError('BATCH_SIZE * NUM_GENERATIONS must be divisible by TRAIN_MINI_BATCH_SIZE')
 
-    initial = await _submit(model.submit_save, 'policy-0')
-    state = _GRPOState(_Policy(version=0, adapter_uri=initial['twinkle_path']))
+    initial = await _submit(model.save, 'policy-0')
+    state = _GRPOState(_Policy(version=0, adapter_uri=_checkpoint_path(initial)))
     semaphore = asyncio.Semaphore(ROLLOUT_CONCURRENCY)
     rollout_results: asyncio.Queue = asyncio.Queue()
     await WorkerPipeline((
@@ -443,8 +398,8 @@ async def train() -> None:
         model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
         model.set_optimizer('AdamW', lr=2e-5)
         model.set_processor('InputProcessor', padding_free=True)
-        model.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
-        sampler.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
+        model.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
+        sampler.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
 
         dataloader = DataLoader(dataset=create_dataset(), batch_size=BATCH_SIZE, num_workers=0)
         await run_grpo(dataloader, model, sampler, data_plane)

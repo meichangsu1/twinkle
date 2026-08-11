@@ -76,8 +76,16 @@ def _sample_models_to_rows(
     tags = []
     for prompt_index, (response, group_id) in enumerate(zip(sample_models, resolved_group_ids)):
         for generation_idx, sequence in enumerate(response.sequences):
+            sampled_logprobs = [
+                0.0 if not position else float(position[0][1])
+                for position in (sequence.logprobs or [])
+            ]
             rows.append({
-                **sequence.model_dump(),
+                'train_input': sequence.new_input_feature,
+                'sampled_logprobs': sampled_logprobs,
+                'tokens': sequence.tokens,
+                'decoded': sequence.decoded,
+                'stop_reason': sequence.stop_reason,
                 'prompt_logprobs': response.prompt_logprobs,
                 'topk_prompt_logprobs': response.topk_prompt_logprobs,
             })
@@ -127,31 +135,32 @@ def _submission_states(value) -> list[dict]:
 async def _await_generation(
     sampler,
     submission_id: str,
-    inputs,
-    params: SamplingParams,
-    *,
-    adapter_name: str,
-    adapter_path: str | None,
 ):
-    """Submit a generation and poll without occupying a worker thread."""
-    submitted = False
+    """Poll an admitted generation without occupying the sampler admission queue."""
     collected = False
     try:
-        # Mark before dispatch so a partial multi-DP admission is still rolled
-        # back if one actor rejects while another has already registered it.
-        submitted = True
-        await asyncio.to_thread(
-            sampler.submit_generation,
-            submission_id,
-            inputs,
-            params,
-            adapter_name=adapter_name,
-            adapter_path=adapter_path,
-        )
         poll_interval = 0.01
         while True:
-            states = _submission_states(
-                await asyncio.to_thread(sampler.get_generation_status, submission_id))
+            try:
+                states = _submission_states(
+                    await asyncio.to_thread(sampler.get_generation_status, submission_id))
+            except Exception as error:
+                # A pending read-only actor call can be cancelled by Ray while
+                # the generation submitted just above remains alive.  Treating
+                # that as a generation failure makes the finally block discard
+                # otherwise valid rollout work.  Retry only Ray's explicit task
+                # cancellation; actor death and application errors must still
+                # propagate immediately.
+                from ray.exceptions import TaskCancelledError
+                if not isinstance(error, TaskCancelledError):
+                    raise
+                logger.warning(
+                    'Generation status poll was cancelled; retrying submission %s',
+                    submission_id,
+                )
+                await asyncio.sleep(poll_interval)
+                poll_interval = min(poll_interval * 1.5, 0.25)
+                continue
             failed = next(
                 (state for state in states if state.get('status') not in ('running', 'completed')),
                 None,
@@ -166,7 +175,7 @@ async def _await_generation(
             await asyncio.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.5, 0.25)
     finally:
-        if submitted and not collected:
+        if not collected:
             try:
                 await asyncio.to_thread(sampler.cancel_generation, submission_id)
             except Exception:
@@ -263,81 +272,81 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 task_type='sample',
             ))
 
-    @app.post('/twinkle/submit_sample')
-    async def submit_sample(
+    @app.post('/twinkle/sample_to_data_plane', response_model=types.DataRef)
+    async def sample_to_data_plane(
             request: Request,
-            body: types.AsyncSampleRequest,
+            body: types.DataPlaneSampleRequest,
             self: SamplerManagement = Depends(self_fn),
-    ) -> dict:
-        """Queue sampling and return immediately for client-side orchestration."""
+    ) -> types.DataRef:
+        """Generate a complete group, store it server-side, and return its DataRef."""
         token = await self._on_request_start(request)
+        if not self.data_plane.enabled:
+            raise HTTPException(status_code=503, detail='sample_to_data_plane requires data_plane_url')
+        if not callable(getattr(self.sampler, 'submit_generation', None)):
+            raise HTTPException(status_code=503, detail='sampler_type must be vllm_async')
 
-        async def _task():
-            adapter_path = None
-            full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''
-            if body.adapter_uri:
-                from twinkle.server.checkpoint import create_checkpoint_manager
-                checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-                _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+        adapter_path = None
+        full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''
+        if body.adapter_uri:
+            from twinkle.server.checkpoint import create_checkpoint_manager
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
 
-            inputs = (
-                await self.data_plane.get(body.input_ref)
-                if body.input_ref is not None else body.inputs
-            )
-            if isinstance(inputs, list) and inputs:
-                first = inputs[0]
-                if isinstance(first, dict) and 'input_ids' in first:
-                    inputs = [InputFeature(**item) for item in inputs]
-                else:
-                    inputs = [Trajectory(**item) for item in inputs]
-            elif isinstance(inputs, dict):
-                inputs = [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
-
-            params_dict = dict(body.sampling_params or {})
-            params_dict['num_samples'] = body.num_samples
-            params = SamplingParams.from_dict(params_dict)
-            if callable(getattr(self.sampler, 'submit_generation', None)):
-                responses = await _await_generation(
-                    self.sampler,
-                    uuid.uuid4().hex,
-                    inputs,
-                    params,
-                    adapter_name=full_adapter_name,
-                    adapter_path=adapter_path,
-                )
+        inputs = (
+            await self.data_plane.get(body.input_ref)
+            if body.input_ref is not None else body.inputs
+        )
+        if isinstance(inputs, list) and inputs:
+            first = inputs[0]
+            if isinstance(first, dict) and 'input_ids' in first:
+                inputs = [InputFeature(**item) for item in inputs]
             else:
-                # Mock/Torch and vLLM deployments without a DataPlane retain
-                # the compatibility path.  DataPlane-enabled vLLM deployments
-                # are constructed with VLLMSamplerTQ and never wait here.
-                responses = await asyncio.to_thread(
-                    self.sampler.sample,
-                    inputs,
-                    params,
-                    adapter_name=full_adapter_name,
-                    adapter_path=adapter_path,
-                )
-            sample_models = _responses_to_models(responses)
-            payload = types.SampleResponseModelList(samples=sample_models).model_dump()
-            if self.data_plane.enabled:
-                rows, tags = _sample_models_to_rows(
-                    sample_models,
-                    group_ids=body.group_ids,
-                    policy_version=body.policy_version,
-                    adapter_uri=body.adapter_uri,
-                )
-                output_ref = await self.data_plane.put(
-                    [json_safe(item) for item in rows],
-                    kind='rollout',
-                    tags=tags,
-                )
-                return {'output_ref': output_ref.model_dump()}
-            return payload
+                inputs = [Trajectory(**item) for item in inputs]
+        elif isinstance(inputs, dict):
+            inputs = [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
 
-        return await self.schedule_background_task(
-            _task,
-            model_id=full_adapter_name if (full_adapter_name := _get_twinkle_sampler_adapter_name(
-                request, body.adapter_name)) else None,
-            task_type='async_sample',
+        params_dict = dict(body.sampling_params or {})
+        params_dict['num_samples'] = body.num_samples
+        params = SamplingParams.from_dict(params_dict)
+        submission_id = uuid.uuid4().hex
+
+        async def _admit():
+            await asyncio.to_thread(
+                self.sampler.submit_generation,
+                submission_id,
+                inputs,
+                params,
+                adapter_name=full_adapter_name,
+                adapter_path=adapter_path,
+            )
+            return submission_id
+
+        inline_inputs = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = (
+            body.input_ref.num_tokens
+            if body.input_ref is not None else
+            sum(len(item.get('input_ids', [])) for item in inline_inputs if isinstance(item, dict))
+        )
+        await run_task(
+            self.schedule_task_and_wait(
+                _admit,
+                model_id=full_adapter_name or None,
+                token=token,
+                input_tokens=input_tokens,
+                task_type='sample_admission',
+            ))
+
+        responses = await _await_generation(self.sampler, submission_id)
+        rows, tags = _sample_models_to_rows(
+            _responses_to_models(responses),
+            group_ids=body.group_ids,
+            policy_version=body.policy_version,
+            adapter_uri=body.adapter_uri,
+        )
+        return await self.data_plane.put(
+            [json_safe(item) for item in rows],
+            kind='rollout',
+            tags=tags,
         )
 
     @app.post('/twinkle/unload_adapter_paths')

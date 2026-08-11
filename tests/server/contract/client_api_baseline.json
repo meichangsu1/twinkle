@@ -927,46 +927,6 @@
           ]
         }
       },
-      "/twinkle/submit_clip_grad_and_step": {
-        "POST": {
-          "operationId": "submit_clip_grad_and_step_twinkle_submit_clip_grad_and_step_post",
-          "parameters": [],
-          "responses": [
-            "200",
-            "422"
-          ]
-        }
-      },
-      "/twinkle/submit_forward": {
-        "POST": {
-          "operationId": "submit_forward_twinkle_submit_forward_post",
-          "parameters": [],
-          "responses": [
-            "200",
-            "422"
-          ]
-        }
-      },
-      "/twinkle/submit_forward_backward": {
-        "POST": {
-          "operationId": "submit_forward_backward_twinkle_submit_forward_backward_post",
-          "parameters": [],
-          "responses": [
-            "200",
-            "422"
-          ]
-        }
-      },
-      "/twinkle/submit_save": {
-        "POST": {
-          "operationId": "submit_save_twinkle_submit_save_post",
-          "parameters": [],
-          "responses": [
-            "200",
-            "422"
-          ]
-        }
-      },
       "/twinkle/upload_status/{request_id}": {
         "GET": {
           "operationId": "upload_status_twinkle_upload_status__request_id__get",
@@ -1084,6 +1044,16 @@
           ]
         }
       },
+      "/twinkle/sample_to_data_plane": {
+        "POST": {
+          "operationId": "sample_to_data_plane_twinkle_sample_to_data_plane_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/sample_stream": {
         "POST": {
           "operationId": "sample_stream_twinkle_sample_stream_post",
@@ -1097,16 +1067,6 @@
       "/twinkle/set_template": {
         "POST": {
           "operationId": "set_template_twinkle_set_template_post",
-          "parameters": [],
-          "responses": [
-            "200",
-            "422"
-          ]
-        }
-      },
-      "/twinkle/submit_sample": {
-        "POST": {
-          "operationId": "submit_sample_twinkle_submit_sample_post",
           "parameters": [],
           "responses": [
             "200",

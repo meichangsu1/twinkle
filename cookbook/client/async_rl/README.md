@@ -32,22 +32,22 @@ python cookbook/client/async_rl/client_orchestrated_grpo.py
 
 The training loop composes only the low-level component methods:
 
-- `sampler.submit_sample(...)` / `sampler.asample(...)`
-- `model.submit_forward_only(...)`
-- `model.submit_forward_backward(...)`
-- `model.submit_clip_grad_and_step(...)`
-- `model.submit_save(...)`
+- `sampler.sample_to_data_plane(...)` / `sampler.asample_to_data_plane(...)`
+- `model.forward_only(...)`
+- `model.forward_backward(...)`
+- `model.clip_grad_and_step(...)`
+- `model.save(...)`
 - `data_plane.put/get/append/release(...)` and
   `aput/aget/aget_batch/aappend/arelease(...)`
 
 There is no additional RL runtime or orchestration protocol. The GRPO example
-uses `submit_sample()` so the Sampler's output `DataRef` remains in TQ. Each
+uses `asample_to_data_plane()` so the Sampler's output `DataRef` remains in TQ. Each
 generation is one row tagged with its group, generation index, rollout policy,
-and status. The Advantage worker reads those rows and appends reward, advantage,
-old log-probability, and updated status to the same keys. The Trainer consumes
-the resulting `DataRef` and releases it in a local `finally` block. `asample()`
-remains available when an algorithm prefers materialized response objects and
-does not need to retain the intermediate TQ rows.
+and status. The Advantage worker reads only decoded completions and appends
+reward and advantage to the same keys. Token tensors and sampled log-probabilities
+remain server-side. The Trainer passes one or more `DataRef` values to
+`forward_backward()` and releases them in a local `finally` block. `asample()`
+remains the materialized-response convenience API.
 
 - `ClientMultiTurnRollout.arun()` keeps tool calls and Reward computation in
   the client and accepts an explicit `adapter_uri` policy snapshot.
@@ -55,7 +55,7 @@ does not need to retain the intermediate TQ rows.
 `_RolloutPartition` is a private client record, not a server resource or SDK
 API. The local FIFO limits live DataLoader batches before rollout, ready prompt
 groups immediately use the Model primitives above, and the client calls
-`submit_save()` once after a whole batch has trained. `WorkerPipeline` only
+`save()` once after a whole batch has trained. `WorkerPipeline` only
 starts, joins, and fail-fast cancels concrete roles; queues and algorithm state
 remain ordinary client Python code.
 

@@ -1,11 +1,11 @@
+import asyncio
 from typing import Any, Dict, List, Optional, Union
 from twinkle_client.http import http_post
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 from twinkle_client.common.json_utils import json_safe
-from twinkle_client.remote_task import RemoteTask
-from twinkle_client.types.component import ComponentTaskRef, DataRef
+from twinkle_client.types.component import DataRef
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -98,7 +98,7 @@ class vLLMSampler:
         response.raise_for_status()
         return [SampleResponseModel(**r) for r in response.json()['samples']]
 
-    def submit_sample(
+    def sample_to_data_plane(
         self,
         inputs: Union[List[Trajectory], List[InputFeature], DataRef],
         sampling_params: Optional[Dict[str, Any]] = None,
@@ -108,8 +108,8 @@ class vLLMSampler:
         policy_version: int | None = None,
         group_ids: list[str] | None = None,
         num_samples: int = 1,
-    ) -> RemoteTask:
-        """Submit directly to the Sampler component and return immediately."""
+    ) -> DataRef:
+        """Generate complete prompt groups and keep their rows in the server DataPlane."""
         body = {
             'sampling_params': sampling_params,
             'adapter_name': adapter_name,
@@ -121,13 +121,31 @@ class vLLMSampler:
         body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
             inputs.model_dump() if isinstance(inputs, DataRef) else _json_safe(inputs))
         response = http_post(
-            url=f'{self.server_url}/submit_sample',
+            url=f'{self.server_url}/sample_to_data_plane',
             json_data=json_safe(body),
         )
         response.raise_for_status()
-        return RemoteTask(ComponentTaskRef(**response.json()))
+        return DataRef(**response.json())
 
     async def asample(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature]],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        num_samples: int = 1,
+    ) -> List[SampleResponseModel]:
+        """Asynchronous convenience wrapper for the materialized sample API."""
+        return await asyncio.to_thread(
+            self.sample,
+            inputs,
+            sampling_params,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            num_samples=num_samples,
+        )
+
+    async def asample_to_data_plane(
         self,
         inputs: Union[List[Trajectory], List[InputFeature], DataRef],
         sampling_params: Optional[Dict[str, Any]] = None,
@@ -137,11 +155,10 @@ class vLLMSampler:
         policy_version: int | None = None,
         group_ids: list[str] | None = None,
         num_samples: int = 1,
-    ) -> List[SampleResponseModel]:
-        """Submit sampling and asynchronously await it without blocking the event loop."""
-        import asyncio
-        task = await asyncio.to_thread(
-            self.submit_sample,
+    ) -> DataRef:
+        """Asynchronously sample and return the opaque server-side result reference."""
+        return await asyncio.to_thread(
+            self.sample_to_data_plane,
             inputs,
             sampling_params,
             adapter_name=adapter_name,
@@ -150,37 +167,6 @@ class vLLMSampler:
             group_ids=group_ids,
             num_samples=num_samples,
         )
-        result = await task.aresult()
-        if isinstance(result, dict) and result.get('output_ref'):
-            output_ref = DataRef(**result['output_ref'])
-            try:
-                batch = await self.data_plane.aget_batch(output_ref)
-            finally:
-                await self.data_plane.arelease(output_ref)
-            if batch.tags and all('prompt_index' in tag for tag in batch.tags):
-                grouped: dict[int, list[tuple[int, dict[str, Any]]]] = {}
-                for row, tag in zip(batch.rows, batch.tags):
-                    grouped.setdefault(int(tag['prompt_index']), []).append(
-                        (int(tag.get('generation_idx', 0)), row))
-                samples = []
-                for prompt_index in sorted(grouped):
-                    generation_rows = [row for _, row in sorted(grouped[prompt_index])]
-                    first = generation_rows[0]
-                    samples.append({
-                        'sequences': [{
-                            key: value
-                            for key, value in row.items()
-                            if key not in ('prompt_logprobs', 'topk_prompt_logprobs')
-                        } for row in generation_rows],
-                        'prompt_logprobs': first.get('prompt_logprobs'),
-                        'topk_prompt_logprobs': first.get('topk_prompt_logprobs'),
-                    })
-            else:
-                # Compatibility with a server that still stores one nested row per prompt.
-                samples = batch.rows
-        else:
-            samples = result.get('samples', []) if isinstance(result, dict) else []
-        return [SampleResponseModel(**item) for item in samples]
 
     def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
         """Evict policy snapshots that are no longer referenced by this client."""

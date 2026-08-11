@@ -2,9 +2,8 @@ from typing import Any, Dict, Optional
 from pathlib import Path
 import time
 from twinkle_client.http import http_get, http_post
-from twinkle_client.remote_task import RemoteTask
 from twinkle_client.common.json_utils import json_safe
-from twinkle_client.types.component import ComponentTaskRef, DataRef
+from twinkle_client.types.component import DataRef
 from twinkle_client.types.model import (
     CalculateLossResponse,
     CalculateMetricResponse,
@@ -18,6 +17,17 @@ from twinkle_client.types.model import (
 )
 
 
+def _component_input_payload(inputs: Any) -> dict[str, Any]:
+    """Encode inline rows or one or more opaque server-side data references."""
+    if isinstance(inputs, DataRef):
+        return {'input_refs': [inputs.model_dump()]}
+    if isinstance(inputs, list) and inputs and any(isinstance(item, DataRef) for item in inputs):
+        if not all(isinstance(item, DataRef) for item in inputs):
+            raise TypeError('model inputs cannot mix DataRef values with inline rows')
+        return {'input_refs': [item.model_dump() for item in inputs]}
+    return {'inputs': json_safe(inputs)}
+
+
 class MultiLoraTransformersModel:
     """Client wrapper for TwinkleModel that calls server HTTP endpoints.
 
@@ -29,8 +39,7 @@ class MultiLoraTransformersModel:
         """Initialize model client."""
         from twinkle_client.http import get_base_url
         self.server_url = get_base_url()
-        from twinkle_client.data_plane import DataPlaneClient
-        self.data_plane = DataPlaneClient(kwargs.pop('data_plane_url', None))
+        kwargs.pop('data_plane_url', None)
 
         if '://' in model_id:
             model_id = model_id.split('://')[1]
@@ -41,85 +50,6 @@ class MultiLoraTransformersModel:
             url=f'{self.server_url}/create',
         )
         response.raise_for_status()
-
-    def submit_forward(
-        self,
-        inputs: Any | DataRef,
-        *,
-        forward_only: bool = False,
-        **forward_kwargs,
-    ) -> RemoteTask:
-        """Submit the Model component's forward primitive directly."""
-        body = {
-            'adapter_name': self.adapter_name or '',
-            'forward_only': forward_only,
-            'forward_kwargs': forward_kwargs,
-        }
-        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
-            inputs.model_dump() if isinstance(inputs, DataRef) else json_safe(inputs))
-        response = http_post(
-            url=f'{self.server_url}/submit_forward',
-            json_data=body,
-        )
-        response.raise_for_status()
-        return RemoteTask(ComponentTaskRef(**response.json()))
-
-    def submit_forward_only(
-        self,
-        inputs: Any | DataRef,
-        **forward_kwargs,
-    ) -> RemoteTask:
-        return self.submit_forward(
-            inputs,
-            forward_only=True,
-            **forward_kwargs,
-        )
-
-    def submit_forward_backward(
-        self,
-        inputs: Any | DataRef,
-        **kwargs,
-    ) -> RemoteTask:
-        """Submit forward/backward without prescribing the surrounding train loop."""
-        body = {'adapter_name': self.adapter_name or '', 'kwargs': json_safe(kwargs)}
-        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
-            inputs.model_dump() if isinstance(inputs, DataRef) else json_safe(inputs))
-        response = http_post(
-            url=f'{self.server_url}/submit_forward_backward',
-            json_data=body,
-        )
-        response.raise_for_status()
-        return RemoteTask(ComponentTaskRef(**response.json()))
-
-    def submit_clip_grad_and_step(
-        self,
-        max_grad_norm: float = 1.0,
-        norm_type: int = 2,
-        **kwargs,
-    ) -> RemoteTask:
-        response = http_post(
-            url=f'{self.server_url}/submit_clip_grad_and_step',
-            json_data={
-                'adapter_name': self.adapter_name or '',
-                'max_grad_norm': max_grad_norm,
-                'norm_type': norm_type,
-                'kwargs': kwargs,
-            },
-        )
-        response.raise_for_status()
-        return RemoteTask(ComponentTaskRef(**response.json()))
-
-    def submit_save(self, name: str, *, save_optimizer: bool = False) -> RemoteTask:
-        response = http_post(
-            url=f'{self.server_url}/submit_save',
-            json_data={
-                'adapter_name': self.adapter_name or '',
-                'name': name,
-                'save_optimizer': save_optimizer,
-            },
-        )
-        response.raise_for_status()
-        return RemoteTask(ComponentTaskRef(**response.json()))
 
     def add_adapter_to_model(self, adapter_name: str, config: Dict[str, Any], **kwargs) -> None:
         """Add a new adapter to the model."""
@@ -144,23 +74,57 @@ class MultiLoraTransformersModel:
         if name == self.adapter_name:
             self.adapter_name = None
 
-    def forward(self, inputs: Any, **kwargs) -> ForwardResponse:
-        """Execute forward pass on the model."""
+    def forward(
+        self,
+        inputs: Any | DataRef | list[DataRef],
+        *,
+        input_field: str | None = None,
+        kwarg_fields: dict[str, str] | None = None,
+        **kwargs,
+    ) -> ForwardResponse:
+        """Execute forward over inline rows or server-side references."""
         response = http_post(
             url=f'{self.server_url}/forward',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={
+                **_component_input_payload(inputs),
+                'adapter_name': self.adapter_name,
+                'input_field': input_field,
+                'kwarg_fields': kwarg_fields or {},
+                **json_safe(kwargs),
+            },
         )
         response.raise_for_status()
         return ForwardResponse(**response.json())
 
-    def forward_only(self, inputs: Any, **kwargs) -> ForwardResponse:
-        """Execute forward pass without gradient computation."""
+    def forward_only(
+        self,
+        inputs: Any | DataRef | list[DataRef],
+        *,
+        input_field: str | None = None,
+        kwarg_fields: dict[str, str] | None = None,
+        output_ref: DataRef | None = None,
+        output_fields: dict[str, str] | None = None,
+        **kwargs,
+    ) -> ForwardResponse | DataRef:
+        """Execute forward-only, optionally reading and updating server-side rows."""
+        body = {
+            **_component_input_payload(inputs),
+            'adapter_name': self.adapter_name,
+            'input_field': input_field,
+            'kwarg_fields': kwarg_fields or {},
+            'output_ref': output_ref.model_dump() if output_ref is not None else None,
+            'output_fields': output_fields or {},
+            **json_safe(kwargs),
+        }
         response = http_post(
             url=f'{self.server_url}/forward_only',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
+            json_data=body,
         )
         response.raise_for_status()
-        return ForwardResponse(**response.json())
+        result = ForwardResponse(**response.json())
+        if output_ref is not None:
+            return DataRef(**result.result)
+        return result
 
     def calculate_loss(self, **kwargs) -> CalculateLossResponse:
         """Calculate loss from model outputs."""
@@ -188,11 +152,24 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
 
-    def forward_backward(self, inputs: Any, **kwargs) -> ForwardBackwardResponse:
-        """Execute combined forward and backward pass."""
+    def forward_backward(
+        self,
+        inputs: Any | DataRef | list[DataRef],
+        *,
+        input_field: str | None = None,
+        kwarg_fields: dict[str, str] | None = None,
+        **kwargs,
+    ) -> ForwardBackwardResponse:
+        """Execute forward/backward over inline rows or server-side references."""
         response = http_post(
             url=f'{self.server_url}/forward_backward',
-            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs}
+            json_data={
+                **_component_input_payload(inputs),
+                'adapter_name': self.adapter_name,
+                'input_field': input_field,
+                'kwarg_fields': kwarg_fields or {},
+                **json_safe(kwargs),
+            },
         )
         response.raise_for_status()
         return ForwardBackwardResponse(**response.json())

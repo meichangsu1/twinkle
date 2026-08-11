@@ -4,8 +4,10 @@ Pydantic request/response models for twinkle model management endpoints.
 
 These models are used by both the server-side handler and the twinkle client.
 """
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, Dict, List, Optional, Union
+
+from .component import DataRef
 
 
 class CreateRequest(BaseModel):
@@ -15,16 +17,42 @@ class CreateRequest(BaseModel):
 
 
 class ForwardRequest(BaseModel):
-    inputs: Any
+    inputs: Any = None
+    input_refs: List[DataRef] | None = None
+    input_field: str | None = None
+    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
     adapter_name: str
+
+    @model_validator(mode='after')
+    def validate_input(self) -> 'ForwardRequest':
+        if (self.inputs is None) == (self.input_refs is None):
+            raise ValueError('exactly one of inputs and input_refs must be provided')
+        if self.input_refs is not None and not self.input_refs:
+            raise ValueError('input_refs must not be empty')
+        return self
 
     class Config:
         extra = 'allow'
 
 
 class ForwardOnlyRequest(BaseModel):
-    inputs: Any
+    inputs: Any = None
+    input_refs: List[DataRef] | None = None
+    input_field: str | None = None
+    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
+    output_ref: DataRef | None = None
+    output_fields: Dict[str, str] = Field(default_factory=dict)
     adapter_name: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_input(self) -> 'ForwardOnlyRequest':
+        if (self.inputs is None) == (self.input_refs is None):
+            raise ValueError('exactly one of inputs and input_refs must be provided')
+        if self.input_refs is not None and not self.input_refs:
+            raise ValueError('input_refs must not be empty')
+        if (self.output_ref is None) != (len(self.output_fields) == 0):
+            raise ValueError('output_ref and output_fields must be configured together')
+        return self
 
     class Config:
         extra = 'allow'

@@ -139,7 +139,10 @@ class VLLMSamplerTQ(vLLMSampler):
     ):
         self.context_manager = context_manager
         super().__init__(model_id=model_id, engine_args=engine_args, device_mesh=device_mesh, **kwargs)
-        self.data_plane = TQDataPlane()
+        # Native YAML async-RL writes rollout groups to TransferQueue. The C/S
+        # component mode only uses submit_generation/collect_generation and
+        # stores results through the server DataPlane deployment.
+        self.data_plane = TQDataPlane() if context_manager is not None else None
         self.reward_registry = dict(reward_registry or {})
         self.rollout_max_retries = int(rollout_max_retries)
         self.rollout_retry_delay_s = float(rollout_retry_delay_s)
@@ -541,6 +544,8 @@ class VLLMSamplerTQ(vLLMSampler):
         if rewards is None:
             raise ValueError(f'no reward function registered for context {group.context.key}')
         reward_metrics = _compute_reward_metrics(self.reward_registry, group.context, rows, rewards)
+        if self.data_plane is None:
+            raise RuntimeError('native TQ data plane is required for prompt-group sampling')
         await self.data_plane.complete_rollout_group(
             group,
             rollout_rows=rows,

@@ -5,7 +5,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from twinkle_client.types import DataRef, DataRowsResponse
+from twinkle_client.types import DataRef
 
 
 MODULE_PATH = (
@@ -44,7 +44,7 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> 
         return DataRef(
             ref_id=name,
             size=module.NUM_GENERATIONS,
-            fields=['new_input_feature', 'logprobs'],
+            fields=['train_input', 'sampled_logprobs', 'decoded'],
             kind='rollout',
         )
 
@@ -62,36 +62,28 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> 
             self.steps = 0
             self.forward_backward_kwargs = []
 
-        async def submit_save(self, name):
+        async def save(self, name):
             self.saved.append(name)
             return {'twinkle_path': f'/checkpoints/{name}'}
 
-        async def submit_forward_backward(self, _ref, **kwargs):
+        async def forward_backward(self, _refs, **kwargs):
             self.forward_backward_kwargs.append(kwargs)
             events.append('train')
             first_train_started.set()
 
-        async def submit_clip_grad_and_step(self, **_kwargs):
+        async def clip_grad_and_step(self, **_kwargs):
             self.steps += 1
 
     class FakeDataPlane:
         def __init__(self):
             self.released = []
 
-        async def aget_batch(self, ref):
-            return DataRowsResponse(
-                rows=[{
-                    'new_input_feature': {'name': f'{ref.ref_id}-{index}'},
-                    'logprobs': [[(0, 0.0)]],
-                } for index in range(ref.size)],
-                tags=[{'group_id': ref.ref_id, 'generation_idx': index} for index in range(ref.size)],
-            )
+        async def aget(self, ref, *, fields=None):
+            assert fields == ['decoded']
+            return [{'decoded': f'{ref.ref_id}-{index}'} for index in range(ref.size)]
 
-        async def aappend(self, ref, rows, *, tags):
+        async def aappend(self, ref, rows, **_kwargs):
             return ref.model_copy(update={'fields': [*ref.fields, *rows[0]]})
-
-        async def aput(self, rows, *, kind, tags=None):
-            return DataRef(ref_id=f'{kind}-{id(rows)}', size=len(rows), fields=list(rows[0]), kind=kind)
 
         async def arelease(self, ref):
             self.released.append(ref)
@@ -112,8 +104,11 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> 
     assert events.index('train') < events.index('rollout-done:p0-g1')
     assert model.saved == ['policy-0', 'policy-1', 'policy-2', 'policy-3']
     assert model.steps == 6
-    assert all('old_logps' in kwargs and 'advantages' in kwargs
-               for kwargs in model.forward_backward_kwargs)
+    assert all(kwargs['input_field'] == 'train_input' for kwargs in model.forward_backward_kwargs)
+    assert all(kwargs['kwarg_fields'] == {
+        'old_logps': 'sampled_logprobs',
+        'advantages': 'advantage',
+    } for kwargs in model.forward_backward_kwargs)
     assert len(data_plane.released) == 6
 
     snapshots = {name: (version, uri) for name, version, uri in rollout_snapshots}
@@ -141,7 +136,7 @@ def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
         return DataRef(
             ref_id=name,
             size=1,
-            fields=['new_input_feature', 'logprobs'],
+            fields=['train_input', 'sampled_logprobs', 'decoded'],
             kind='rollout',
         )
 
@@ -153,31 +148,23 @@ def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
         def __init__(self):
             self.saved = []
 
-        async def submit_save(self, name):
+        async def save(self, name):
             self.saved.append(name)
             return {'twinkle_path': name}
 
-        async def submit_forward_backward(self, _ref, **_kwargs):
+        async def forward_backward(self, _ref, **_kwargs):
             return None
 
-        async def submit_clip_grad_and_step(self, **_kwargs):
+        async def clip_grad_and_step(self, **_kwargs):
             return None
 
     class FakeDataPlane:
-        async def aget_batch(self, ref):
-            return DataRowsResponse(
-                rows=[{
-                    'new_input_feature': {'name': ref.ref_id},
-                    'logprobs': [[(0, 0.0)]],
-                }],
-                tags=[{'group_id': ref.ref_id, 'generation_idx': 0}],
-            )
+        async def aget(self, ref, *, fields=None):
+            assert fields == ['decoded']
+            return [{'decoded': ref.ref_id}]
 
-        async def aappend(self, ref, rows, *, tags):
+        async def aappend(self, ref, rows, **_kwargs):
             return ref.model_copy(update={'fields': [*ref.fields, *rows[0]]})
-
-        async def aput(self, rows, *, kind, tags=None):
-            return DataRef(ref_id=kind, size=len(rows), fields=list(rows[0]), kind=kind)
 
         async def arelease(self, _ref):
             return None
