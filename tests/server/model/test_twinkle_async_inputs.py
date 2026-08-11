@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 from fastapi import FastAPI
 from starlette.requests import Request
 
@@ -8,6 +9,7 @@ import twinkle_client.types as types
 from twinkle.server.model.twinkle_handlers import (
     _model_result_rows,
     _register_twinkle_routes,
+    _restore_dataref_value,
 )
 
 
@@ -19,6 +21,26 @@ def test_model_result_rows_keeps_one_output_row_per_sample() -> None:
         {'logps': [-1.0], 'loss': 0.25},
         {'logps': [-2.0], 'loss': 0.25},
     ]
+
+
+def test_restore_dataref_value_rebuilds_rectangular_and_ragged_numeric_arrays() -> None:
+    rectangular = _restore_dataref_value([
+        [-0.1, -0.2],
+        [-0.3, -0.4],
+    ])
+    torch.testing.assert_close(
+        rectangular,
+        torch.tensor([[-0.1, -0.2], [-0.3, -0.4]]),
+    )
+
+    ragged = _restore_dataref_value([
+        [-0.1],
+        [-0.2, -0.3],
+    ])
+    assert isinstance(ragged, list)
+    assert all(torch.is_tensor(item) for item in ragged)
+    torch.testing.assert_close(ragged[0], torch.tensor([-0.1]))
+    torch.testing.assert_close(ragged[1], torch.tensor([-0.2, -0.3]))
 
 
 class _SchedulingManagement:
@@ -91,7 +113,51 @@ async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -
     inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
     assert adapter_name == 'session-adapter'
     assert [row['input_ids'].tolist() for row in inputs] == [[index] for index in range(8)]
-    assert forwarded_kwargs == {
-        'old_logps': [[-0.1]] * 4 + [[-0.2]] * 4,
-        'advantages': [1.0] * 4 + [-1.0] * 4,
-    }
+    torch.testing.assert_close(
+        forwarded_kwargs['old_logps'],
+        torch.tensor([[-0.1]] * 4 + [[-0.2]] * 4),
+    )
+    torch.testing.assert_close(
+        forwarded_kwargs['advantages'],
+        torch.tensor([1.0] * 4 + [-1.0] * 4),
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_restores_nested_dpo_ref_logps_as_tensor() -> None:
+    management = _SchedulingManagement()
+    management.rows['dpo'] = [
+        {
+            'input_ids': [1, 2, 3],
+            'labels': [-100, 2, 3],
+            'ref_logps': [-0.1, -0.2, -0.3],
+        },
+        {
+            'input_ids': [1, 4, 5],
+            'labels': [-100, 4, 5],
+            'ref_logps': [-0.4, -0.5, -0.6],
+        },
+    ]
+    app = FastAPI()
+    _register_twinkle_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.ForwardRequest(
+        adapter_name='adapter',
+        input_refs=[types.DataRef(ref_id='dpo', size=2, num_tokens=6)],
+        kwarg_fields={'ref_outputs.logps': 'ref_logps'},
+    )
+
+    await route.endpoint(request, body, management)
+
+    inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
+    assert adapter_name == 'session-adapter'
+    assert [row['input_ids'].tolist() for row in inputs] == [[1, 2, 3], [1, 4, 5]]
+    torch.testing.assert_close(
+        forwarded_kwargs['ref_outputs']['logps'],
+        torch.tensor([
+            [-0.1, -0.2, -0.3],
+            [-0.4, -0.5, -0.6],
+        ]),
+    )

@@ -13,6 +13,7 @@ import torch
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
+from numbers import Number
 from pathlib import Path
 from peft import LoraConfig
 from typing import TYPE_CHECKING, Any
@@ -93,6 +94,30 @@ def _set_at_path(target: dict[str, Any], path: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
+def _restore_dataref_value(value: Any) -> Any:
+    """Restore numeric DataPlane fields to tensors before model dispatch.
+
+    DataPlane rows cross an HTTP/JSON boundary, so tensor-valued fields arrive
+    as Python lists.  Fields selected through ``kwarg_fields`` are model data,
+    not request configuration: rebuild rectangular numeric arrays as tensors
+    and keep ragged arrays as lists of tensors for losses that align each sample
+    independently.
+    """
+    if isinstance(value, dict):
+        return {key: _restore_dataref_value(item) for key, item in value.items()}
+    if not isinstance(value, list) or not value:
+        return value
+    if all(isinstance(item, Number) for item in value):
+        return torch.tensor(value)
+
+    restored = [_restore_dataref_value(item) for item in value]
+    if all(torch.is_tensor(item) for item in restored):
+        shapes = {tuple(item.shape) for item in restored}
+        if len(shapes) == 1:
+            return torch.stack(restored)
+    return restored
+
+
 async def _resolve_model_inputs(body: Any, data_plane: Any) -> tuple[Any, dict[str, Any]]:
     """Resolve transport-level references before entering the model backend."""
     if body.input_refs is None:
@@ -120,10 +145,13 @@ async def _resolve_model_inputs(body: Any, data_plane: Any) -> tuple[Any, dict[s
 
     field_kwargs: dict[str, Any] = {}
     for target_path, source_path in body.kwarg_fields.items():
+        field_value = _restore_dataref_value([
+            _value_at_path(row, source_path) for row in rows
+        ])
         _set_at_path(
             field_kwargs,
             target_path,
-            [_value_at_path(row, source_path) for row in rows],
+            field_value,
         )
     return inputs, field_kwargs
 
