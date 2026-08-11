@@ -947,6 +947,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 Any parameters needed to construct the optimizer instance.
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        # Metric copies the dp group at construction, and OptimizerGroup builds metrics before
+        # dist init -- so rebuild here (first path that runs post-init on every backend) to get
+        # dp-wide token-weighted logging. Logging only; gradients are unaffected.
+        self._ensure_optimizer_dp_groups()
         optimizer_config = self.optimizer_group[adapter_name]
         if isinstance(optimizer_cls, Optimizer):
             optimizer_config.optimizer = optimizer_cls
