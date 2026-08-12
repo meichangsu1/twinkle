@@ -89,6 +89,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         )
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
+        # PEFT initializes LoRA parameters in FP32 even when the base model is
+        # BF16. Native FSDP2 records the pre-wrap parameter dtype as the
+        # DTensor grad_dtype, so materializing those slots from the BF16 rank-0
+        # state later would make FP32 reduced gradients incompatible with the
+        # BF16 sharded parameters. Keep all preallocated slots aligned before
+        # EP state capture and FSDP wrapping on every rank, including meta ranks.
+        self._ensure_lora_dtype(self.model)
         self._initial_lora_weights_saved = False
         if not self._memory_efficient_init:
             self._save_initial_lora_weights()
