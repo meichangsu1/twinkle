@@ -9,11 +9,9 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 from __future__ import annotations
 
 import asyncio
-import torch
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
-from numbers import Number
 from pathlib import Path
 from peft import LoraConfig
 from typing import TYPE_CHECKING, Any
@@ -94,30 +92,6 @@ def _set_at_path(target: dict[str, Any], path: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
-def _restore_dataref_value(value: Any) -> Any:
-    """Restore numeric DataPlane fields to tensors before model dispatch.
-
-    DataPlane rows cross an HTTP/JSON boundary, so tensor-valued fields arrive
-    as Python lists.  Fields selected through ``kwarg_fields`` are model data,
-    not request configuration: rebuild rectangular numeric arrays as tensors
-    and keep ragged arrays as lists of tensors for losses that align each sample
-    independently.
-    """
-    if isinstance(value, dict):
-        return {key: _restore_dataref_value(item) for key, item in value.items()}
-    if not isinstance(value, list) or not value:
-        return value
-    if all(isinstance(item, Number) for item in value):
-        return torch.tensor(value)
-
-    restored = [_restore_dataref_value(item) for item in value]
-    if all(torch.is_tensor(item) for item in restored):
-        shapes = {tuple(item.shape) for item in restored}
-        if len(shapes) == 1:
-            return torch.stack(restored)
-    return restored
-
-
 async def _resolve_model_inputs(body: Any, data_plane: Any) -> tuple[Any, dict[str, Any]]:
     """Resolve transport-level references before entering the model backend."""
     if body.input_refs is None:
@@ -145,9 +119,11 @@ async def _resolve_model_inputs(body: Any, data_plane: Any) -> tuple[Any, dict[s
 
     field_kwargs: dict[str, Any] = {}
     for target_path, source_path in body.kwarg_fields.items():
-        field_value = _restore_dataref_value([
+        # Keep the transport contract JSON-native.  The processor/loss/metric
+        # that understands this field owns any tensor conversion.
+        field_value = [
             _value_at_path(row, source_path) for row in rows
-        ])
+        ]
         _set_at_path(
             field_kwargs,
             target_path,
@@ -355,22 +331,11 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
-        def first_element(data):
-            while isinstance(data, list):
-                if len(data) == 0:
-                    return None
-                data = data[0]
-            return data
-
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             raw_inputs, field_kwargs = await _resolve_model_inputs(body, self.data_plane)
             all_inputs = _parse_inputs(raw_inputs)
-            for inputs in all_inputs:
-                for key in inputs:
-                    if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
-                        inputs[key] = torch.tensor(inputs[key])
             kwargs = _merge_forward_kwargs(extra_kwargs, field_kwargs)
             ret = self.model.forward_backward(inputs=all_inputs, adapter_name=adapter_name, **kwargs)
             return {'result': ret}
