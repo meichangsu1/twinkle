@@ -19,6 +19,18 @@ logger = get_logger()
 LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
 PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
+TWINKLE_NODE_LOCAL_RANK = 'TWINKLE_NODE_LOCAL_RANK'
+TWINKLE_NODE_LOCAL_WORLD_SIZE = 'TWINKLE_NODE_LOCAL_WORLD_SIZE'
+TWINKLE_NODE_RANKS = 'TWINKLE_NODE_RANKS'
+
+
+def _get_node_local_rank() -> int:
+    """Return process topology rank without changing the actor-local device index."""
+    return int(os.environ.get(TWINKLE_NODE_LOCAL_RANK, Platform.get_local_rank()))
+
+
+def _get_node_local_world_size() -> int:
+    return int(os.environ.get(TWINKLE_NODE_LOCAL_WORLD_SIZE, Platform.get_local_world_size()))
 
 
 class NativeFSDPStrategy:
@@ -49,14 +61,20 @@ class NativeFSDPStrategy:
     def use_rank0_pretrained_broadcast(self) -> bool:
         return self._memory_efficient_init and self.device_mesh is not None
 
+    def is_node_local_source_rank(self) -> bool:
+        local_rank = _get_node_local_rank()
+        if local_rank < 0:
+            raise RuntimeError('Native FSDP memory_efficient_init requires node-local rank topology.')
+        return local_rank == 0
+
     def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
         if self._pre_ep_state_captured:
             return
         if not (enable_ep and self.use_rank0_pretrained_broadcast()):
             return
-        local_rank = Platform.get_local_rank()
+        local_rank = _get_node_local_rank()
         if local_rank < 0:
-            raise RuntimeError('Native FSDP node-local pre-EP state capture requires LOCAL_RANK.')
+            raise RuntimeError('Native FSDP node-local pre-EP state capture requires node-local rank topology.')
         is_source_rank = dist.is_available() and dist.is_initialized() and local_rank == 0
         self.set_rank0_pre_ep_full_state_dict(clone_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
         self._pre_ep_state_captured = True
@@ -130,9 +148,9 @@ class NativeFSDPStrategy:
             adapter_source_sd = {}
             adapter_full_sd = {}
             if use_meta:
-                local_rank = Platform.get_local_rank()
+                local_rank = _get_node_local_rank()
                 if local_rank < 0:
-                    raise RuntimeError('Native FSDP node-local state loading requires LOCAL_RANK.')
+                    raise RuntimeError('Native FSDP node-local state loading requires node-local rank topology.')
                 is_source_rank = local_rank == 0
                 if ep_enabled and self._rank0_pre_ep_full_state_dict is not None:
                     original_sd = self._rank0_pre_ep_full_state_dict if is_source_rank else {}
@@ -600,19 +618,30 @@ def _get_local_rank_info() -> tuple[int, int, int, List[int]]:
     """Return local-rank topology for node-local state-dict fanout."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = Platform.get_local_rank()
-    if 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
-        raise RuntimeError('Native FSDP node-local state loading requires LOCAL_WORLD_SIZE or LOCAL_SIZE.')
-    local_world_size = Platform.get_local_world_size()
-    if local_rank < 0 or local_world_size <= 0 or world_size % local_world_size != 0:
+    local_rank = _get_node_local_rank()
+    has_twinkle_topology = TWINKLE_NODE_LOCAL_WORLD_SIZE in os.environ
+    if not has_twinkle_topology and 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
+        raise RuntimeError(
+            'Native FSDP node-local state loading requires Twinkle Ray worker topology, '
+            'LOCAL_WORLD_SIZE, or LOCAL_SIZE.')
+    local_world_size = _get_node_local_world_size()
+    raw_node_ranks = os.environ.get(TWINKLE_NODE_RANKS)
+    if (local_rank < 0 or local_world_size <= 0
+            or (not raw_node_ranks and world_size % local_world_size != 0)):
         raise RuntimeError(f'Invalid local rank topology: rank={rank}, world_size={world_size}, '
                            f'local_rank={local_rank}, local_world_size={local_world_size}.')
-    node_start = rank - local_rank
-    node_ranks = list(range(node_start, min(node_start + local_world_size, world_size)))
+    if raw_node_ranks:
+        node_ranks = [int(item) for item in raw_node_ranks.split(',') if item]
+    else:
+        node_start = rank - local_rank
+        node_ranks = list(range(node_start, min(node_start + local_world_size, world_size)))
     if rank not in node_ranks or len(node_ranks) != local_world_size:
         raise RuntimeError(f'Invalid local rank group: rank={rank}, local_rank={local_rank}, '
                            f'local_world_size={local_world_size}, node_ranks={node_ranks}.')
-    return rank, world_size, node_start, node_ranks
+    if node_ranks[local_rank] != rank:
+        raise RuntimeError(f'Invalid node-local rank ordering: rank={rank}, local_rank={local_rank}, '
+                           f'node_ranks={node_ranks}.')
+    return rank, world_size, node_ranks[0], node_ranks
 
 
 def _find_experts_in_layer(layer_mod: nn.Module, experts_map: Dict[str, nn.Module]) -> Optional[nn.Module]:

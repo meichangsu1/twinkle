@@ -314,6 +314,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         use_rank0_broadcast = getattr(self.strategy, 'use_rank0_pretrained_broadcast', lambda: False)
         if not (use_rank0_broadcast() and dist.is_available() and dist.is_initialized()):
             return False
+        is_node_local_source_rank = getattr(self.strategy, 'is_node_local_source_rank', None)
+        if is_node_local_source_rank is not None:
+            return not is_node_local_source_rank()
         local_rank = Platform.get_local_rank()
         if local_rank < 0:
             raise RuntimeError('Native FSDP memory_efficient_init requires LOCAL_RANK.')

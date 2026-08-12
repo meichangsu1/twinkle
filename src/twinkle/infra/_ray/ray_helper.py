@@ -8,6 +8,21 @@ from .resource_manager import ResourceManager
 T = TypeVar('T')
 
 
+def _get_node_local_topology(placements: List[Dict[str, Any]]) -> List[Tuple[int, List[int]]]:
+    """Return each worker's node-local index and distributed ranks on that node."""
+    node_to_ranks: Dict[int, List[int]] = {}
+    for rank, placement in enumerate(placements):
+        node_rank = int(placement.get('node_rank', 0))
+        node_to_ranks.setdefault(node_rank, []).append(rank)
+
+    topology = []
+    for rank, placement in enumerate(placements):
+        node_rank = int(placement.get('node_rank', 0))
+        node_ranks = node_to_ranks[node_rank]
+        topology.append((node_ranks.index(rank), node_ranks))
+    return topology
+
+
 class RayHelper:
 
     resource_manager: Optional[ResourceManager] = None
@@ -304,6 +319,7 @@ class RayHelper:
             ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
 
         device_type_upper = (device_config.device_type or '').upper()
+        node_local_topology = _get_node_local_topology(placement_groups)
         if device_type_upper != 'CPU':
             world_size = len(ranks)
             device_type = Platform.get_platform(device_type_upper).__name__
@@ -319,6 +335,17 @@ class RayHelper:
                     str(pg_idx),
                     'LOCAL_RANK':
                     str(0),
+                    # Each Ray actor sees only its own accelerator, so LOCAL_RANK
+                    # must remain 0 as the device index. Keep the node-local
+                    # distributed topology in separate Twinkle variables.
+                    'TWINKLE_NODE_LOCAL_RANK':
+                    str(node_local_topology[pg_idx][0]),
+                    'TWINKLE_NODE_LOCAL_WORLD_SIZE':
+                    str(len(node_local_topology[pg_idx][1])),
+                    'TWINKLE_NODE_RANKS':
+                    ','.join(str(rank) for rank in node_local_topology[pg_idx][1]),
+                    'NODE_RANK':
+                    str(deploy_pg.get('node_rank', 0)),
                     'CLUSTER_NAME':
                     cluster_name,
                     'WORKER_NAME':
@@ -373,6 +400,10 @@ class RayHelper:
                     'WORLD_SIZE': str(world_size),
                     'RANK': str(rank),
                     'LOCAL_RANK': str(0),
+                    'TWINKLE_NODE_LOCAL_RANK': str(node_local_topology[rank][0]),
+                    'TWINKLE_NODE_LOCAL_WORLD_SIZE': str(len(node_local_topology[rank][1])),
+                    'TWINKLE_NODE_RANKS': ','.join(str(item) for item in node_local_topology[rank][1]),
+                    'NODE_RANK': str(deploy_pg.get('node_rank', 0)),
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     'TWINKLE_MODE': 'ray',
