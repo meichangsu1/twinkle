@@ -70,6 +70,25 @@ def test_target_parameter_lora_defers_initial_snapshot_on_source_rank():
         assert set(wrapper._initial_lora_A) == {"lora_0", "lora_1"}
 
 
+def test_target_parameter_lora_reuses_matching_preallocated_slots():
+    from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
+
+    model = nn.Module()
+    model.experts = _FakeTensorExperts()
+    manager = TargetParameterLoraManager(max_loras=2, max_r=4)
+    targets = ["experts.gate_up_proj", "experts.down_proj"]
+
+    manager.patch(model, targets)
+    wrappers = list(manager.wrappers)
+    manager.patch(model, targets)
+
+    assert manager.patched_target_parameters == tuple(targets)
+    assert manager.wrappers == wrappers
+
+    with pytest.raises(ValueError, match="target_parameters already patched"):
+        manager.patch(model, ["experts.gate_up_proj"])
+
+
 def test_ep_shards_target_parameter_lora_slots_on_meta():
     _ensure_dummy_zmq()
     from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager

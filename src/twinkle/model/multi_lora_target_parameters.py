@@ -339,6 +339,10 @@ class TargetParameterLoraManager:
         self.tenant_configs: dict[str, LoraConfig] = {}
         self._target_parameters: tuple[str, ...] | None = None
 
+    @property
+    def patched_target_parameters(self) -> tuple[str, ...] | None:
+        return self._target_parameters
+
     def patch(self, model: nn.Module, target_parameters: Iterable[str]) -> None:
         target_parameters = tuple(target_parameters)
         if not target_parameters:

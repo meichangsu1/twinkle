@@ -146,6 +146,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         target_parameters = getattr(config, 'target_parameters', None)
         if not target_parameters:
             return
+        target_parameter_manager = self.multi_adapter.target_parameter_manager
+        if target_parameter_manager.patched_target_parameters is not None:
+            # The first tenant preallocates target-parameter slots for every
+            # LoRA. Later tenants can reuse the same slots after EP/FSDP wrap;
+            # patch() still rejects a different target set.
+            self.multi_adapter.patch_target_parameters(self.model, target_parameters)
+            return
         if self._model_wrapped:
             raise RuntimeError('target_parameters LoRA must be installed before FSDP/DDP wrapping')
         self.multi_adapter.patch_target_parameters(self.model, target_parameters)
@@ -231,6 +238,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
+        # Materialize/shard the preallocated LoRA slots before an optimizer
+        # captures parameter references. Otherwise the first optimizer can
+        # retain pre-FSDP/meta parameters while later optimizers see DTensors.
+        self._lazy_wrap_model()
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
             super().set_optimizer(optimizer_cls, **kwargs)
 
