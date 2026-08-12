@@ -30,14 +30,18 @@ class LoraTenant:
 
 class MultiLora:
 
-    def __init__(self, max_loras=5, max_r=32, max_length: int = 8192):
+    def __init__(self, max_loras=5, max_r=32, max_length: int = 8192, defer_initial_weights: bool = False):
         self.max_loras = max_loras
         self.max_r = max_r
         self.loras: List[LoraTenant] = []
         self.module: PeftModel
         self._active_adapters = []
         self.max_length = max_length
-        self.target_parameter_manager = TargetParameterLoraManager(max_loras=max_loras, max_r=max_r)
+        self.target_parameter_manager = TargetParameterLoraManager(
+            max_loras=max_loras,
+            max_r=max_r,
+            defer_initial_weights=defer_initial_weights,
+        )
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -47,6 +51,12 @@ class MultiLora:
 
     def _read_param_tensor(self, parameter):
         return torch_util.to_local_tensor(parameter)
+
+    @staticmethod
+    def _read_local_param_tensor(parameter):
+        if hasattr(parameter, 'to_local'):
+            return parameter.to_local()
+        return parameter
 
     @staticmethod
     def _is_distributed_param(parameter):
@@ -568,13 +578,19 @@ class MultiLora:
                     if self._is_target_parameter_lora_name(name):
                         continue
                     if pattern.search(name):
-                        lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
+                        local_parameter = self._read_local_param_tensor(parameter)
+                        if local_parameter.is_meta:
+                            raise RuntimeError(
+                                f'LoRA parameter {name} is still on meta; materialize the model before saving '
+                                'its initial weights.')
+                        lora_tenant.lora_A_weights[name] = local_parameter.detach().cpu().clone()
 
             if isinstance(self.module, list):
                 for _module in self.module:
                     _store_weights(_module)
             else:
                 _store_weights(self.module)
+        self.target_parameter_manager.save_initial_weights()
 
     def load_lora_converter(self, name, parameter, **kwargs):
 
@@ -741,12 +757,12 @@ class MultiLora:
                 if self._is_target_parameter_lora_name(name):
                     continue
                 if pattern_A.search(name):
-                    local_param = self._read_param_tensor(parameter)
+                    local_param = self._read_local_param_tensor(parameter)
                     if local_param is not None:
                         value = _lora.lora_A_weights[name].to(dtype=parameter.dtype, device=local_param.device)
                         self._write_param_tensor(parameter, value)
                 if pattern_B.search(name):
-                    local_param = self._read_param_tensor(parameter)
+                    local_param = self._read_local_param_tensor(parameter)
                     if local_param is not None:
                         self._write_param_tensor(parameter, torch.zeros_like(local_param))
 

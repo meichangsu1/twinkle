@@ -431,8 +431,10 @@ def _is_moe_experts(experts: Any) -> bool:
 
 
 def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
-    experts.gate_up_proj = nn.Parameter(experts.gate_up_proj.data[start:end].clone())
-    experts.down_proj = nn.Parameter(experts.down_proj.data[start:end].clone())
+    experts.gate_up_proj = nn.Parameter(
+        experts.gate_up_proj.data[start:end].clone(), requires_grad=experts.gate_up_proj.requires_grad)
+    experts.down_proj = nn.Parameter(
+        experts.down_proj.data[start:end].clone(), requires_grad=experts.down_proj.requires_grad)
     if hasattr(experts, 'num_experts'):
         experts.num_experts = end - start
 
@@ -441,9 +443,11 @@ def _shard_tensor_experts(experts: nn.Module, start: int, end: int) -> None:
         if not isinstance(target_param_wrapper, TargetParameterLoraWrapper):
             continue
         for tenant_name, tenant_tensor in target_param_wrapper.lora_A.items():
-            target_param_wrapper.lora_A[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+            target_param_wrapper.lora_A[tenant_name] = nn.Parameter(
+                tenant_tensor.data[start:end].clone(), requires_grad=tenant_tensor.requires_grad)
         for tenant_name, tenant_tensor in target_param_wrapper.lora_B.items():
-            target_param_wrapper.lora_B[tenant_name] = nn.Parameter(tenant_tensor.data[start:end].clone())
+            target_param_wrapper.lora_B[tenant_name] = nn.Parameter(
+                tenant_tensor.data[start:end].clone(), requires_grad=tenant_tensor.requires_grad)
 
 
 def _run_local_experts(

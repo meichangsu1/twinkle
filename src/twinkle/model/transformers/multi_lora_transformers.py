@@ -81,10 +81,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
-        self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
+        self.multi_adapter = MultiLora(
+            max_loras=max_loras,
+            max_r=max_r,
+            max_length=max_length,
+            defer_initial_weights=self._memory_efficient_init,
+        )
         self.model.gradient_checkpointing_enable()
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
-        self.multi_adapter.save_initial_weights()
+        self._initial_lora_weights_saved = False
+        if not self._memory_efficient_init:
+            self._save_initial_lora_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
         self.handler = self.register_global_mm_forward_hook()
@@ -114,11 +121,18 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         pass
 
     def _lazy_wrap_model(self):
-        return super()._lazy_wrap_model()
+        super()._lazy_wrap_model()
+        # Non-source ranks keep both PEFT and target-parameter LoRA slots on
+        # meta until NativeFSDPStrategy broadcasts the rank-local shards.
+        self._save_initial_lora_weights()
+
+    def _save_initial_lora_weights(self):
+        if self._initial_lora_weights_saved:
+            return
+        self.multi_adapter.save_initial_weights()
+        self._initial_lora_weights_saved = True
 
     def _maybe_apply_expert_parallel(self):
-        if self._memory_efficient_init:
-            raise NotImplementedError('Expert parallel is not supported with memory_efficient_init')
         return super()._maybe_apply_expert_parallel()
 
     def _ensure_target_parameter_lora_installed(self, config: LoraConfig) -> None:
@@ -127,9 +141,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             return
         if self._model_wrapped:
             raise RuntimeError('target_parameters LoRA must be installed before FSDP/DDP wrapping')
-        if getattr(self, '_enable_expert_parallel', False):
-            self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=True)
-            # self._maybe_apply_expert_parallel()   # 各rank广播之前不能对moe层进行分片, 没有实际权重时不能分片
         self.multi_adapter.patch_target_parameters(self.model, target_parameters)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -280,6 +291,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
+        self._lazy_wrap_model()
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
@@ -318,6 +330,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     @remote_function()
     def remove_adapter(self, adapter_name: str):
+        self._lazy_wrap_model()
         if adapter_name in self.optimizer_group:
             self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)

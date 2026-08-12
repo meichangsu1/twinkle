@@ -139,8 +139,14 @@ class NativeFSDPStrategy:
                 else:
                     original_sd = model.state_dict() if is_source_rank else {}
                 adapter_source_sd = _collect_adapter_source_state(model.state_dict())
-                adapter_full_sd = (
-                    self._adapter_full_state_dict if is_source_rank and self._adapter_full_state_dict else {})
+                if is_source_rank:
+                    # Multi-LoRA target-parameter slots are installed before EP
+                    # and then sharded with their experts.  Preserve their full
+                    # pre-EP tensors so every EP rank receives its own expert
+                    # range instead of a copy of the source rank's local range.
+                    adapter_full_sd = _collect_adapter_source_state(original_sd or {}, clone=False)
+                    if self._adapter_full_state_dict:
+                        adapter_full_sd.update(self._adapter_full_state_dict)
                 saved_buffers = _get_non_persistent_buffers(model) if is_source_rank else {}
                 if is_source_rank:
                     model = model.to(torch.device('meta'))
@@ -755,14 +761,15 @@ def _resolve_full_state_source_key(param_name: str, source_state: Mapping[str, A
                    f'Tried source keys: {", ".join(candidates)}.')
 
 
-def _collect_adapter_source_state(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+def _collect_adapter_source_state(state_dict: Mapping[str, Any], *, clone: bool = True) -> Dict[str, Any]:
     adapter_state = {}
     for name, tensor in state_dict.items():
         if not _is_lora_state_key(name) or not hasattr(tensor, 'detach'):
             continue
         if getattr(tensor, 'is_meta', False):
             continue
-        adapter_state[name] = tensor.detach().cpu().clone()
+        tensor = tensor.detach().cpu()
+        adapter_state[name] = tensor.clone() if clone else tensor
     return adapter_state
 
 
