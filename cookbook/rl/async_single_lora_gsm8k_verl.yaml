@@ -1,0 +1,126 @@
+runtime:
+  run_id: async_single_lora_gsm8k_accuracy
+  model_id: ${oc.env:MODEL_ID,/nas/disk1/Qwen3-4B}
+  mode: ray
+  model_gpus: 1
+  sampler_gpus: 1
+  sampler_tp: 1
+  sampler_max_loras: 1
+  seed: 1
+  max_staleness: 0
+  max_steps: 125
+  allow_partial_rollout: false
+  rollout_max_retries: 2
+  rollout_retry_delay_s: 0.5
+  keep_adapter_versions: 2
+  output_dir: output/async_single_lora_gsm8k_accuracy
+
+metrics:
+  enabled: true
+  drain_interval_s: 1.0
+  queue_capacity: 10000
+  close_timeout_s: 10
+  jsonl:
+    enabled: true
+    path: outputs/async_rl/single_lora_gsm8k_accuracy_metrics.jsonl
+    summary_path: outputs/async_rl/single_lora_gsm8k_accuracy_summary.json
+    batch_size: 64
+    flush_interval_s: 2.0
+  swanlab:
+    enabled: false
+    mode: local
+    project: twinkle-rl
+    name: ${runtime.run_id}
+    log_dir: outputs/swanlab
+
+template:
+  cls: Template
+  enable_thinking: true
+
+model:
+  strategy: native_fsdp
+  attn_implementation: flash_attention_2
+  fsdp_config:
+    reshard_after_forward: true
+  sequence_parallel_size: 1
+  padding_free: false
+  max_length: 2048
+
+sampler:
+  max_model_len: 2048
+  max_num_batched_tokens: 4096
+  gpu_memory_utilization: 0.7
+  max_num_seqs: 64
+  enforce_eager: false
+
+rollout_output:
+  enabled: true
+  output_dir: ${runtime.output_dir}/rollouts
+  include_token_ids: false
+
+tq:
+  polling_mode: true
+  storage_units: 2
+
+scheduler:
+  rollout: {policy: round_robin, max_consecutive_units: 1}
+  advantage: {policy: oldest_partition, max_consecutive_units: 1}
+  train: {policy: sticky, max_consecutive_units: null}
+
+evaluation:
+  enabled: true
+  interval: 10
+  batch_size: 16
+  sampling_params:
+    max_tokens: 1024
+    temperature: 0.6
+    top_p: 1.0
+
+lora:
+  target_modules: all-linear
+  r: 16
+  alpha: 16
+  dropout: 0.0
+  learning_rate: 1.7e-5
+
+loss:
+  cls: GRPOLoss
+  epsilon: 0.2
+
+lora_contexts:
+  - tenant_id: tenant_single
+    training_run_id: gsm8k_accuracy
+    adapter_name: gsm8k_accuracy_lora
+    reward:
+      class_path: twinkle.reward.GSM8KAccuracyReward
+    dataset:
+      dataset_id: ${oc.env:GSM8K_TRAIN_DATASET_ID}
+      subset_name: main
+      split: train
+      data_num: 2000
+      max_length: 1024
+      processor: GSM8KProcessor
+      system_prompt: 'You are a helpful math assistant. Solve the problem step by step and put your final answer within \boxed{}.'
+    eval_dataset:
+      name: gsm8k/test
+      dataset_id: ${oc.env:GSM8K_TEST_DATASET_ID}
+      subset_name: main
+      split: test
+      data_num: null
+      max_length: 1024
+      processor: GSM8KProcessor
+      system_prompt: 'You are a helpful math assistant. Solve the problem step by step and put your final answer within \boxed{}.'
+      reward:
+        class_path: twinkle.reward.GSM8KAccuracyReward
+    rollout:
+      batch_size: 16
+      num_generations: 4
+      max_tokens: 1024
+      temperature: 1.0
+      top_p: 1.0
+    train:
+      mini_batch_size: 64
+      micro_batch_size: 64
+      dynamic_batching: true
+      max_tokens_per_micro_batch: 4096
+      packing_algorithm: ffd

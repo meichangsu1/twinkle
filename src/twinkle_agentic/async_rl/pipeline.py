@@ -288,10 +288,13 @@ class AsyncMultiLoraGRPOPipeline:
                     eval_dataset.get('reward'),
                     context_key=f'{context.key} evaluation',
                 )
-            initial_paths[context.key] = model.save(
-                f'async-{context.adapter_name}-initial',
-                output_dir=runtime['output_dir'],
-                adapter_name=context.adapter_name,
+            initial_paths[context.key] = _require_adapter_path(
+                model.save(
+                    f'async-{context.adapter_name}-initial',
+                    output_dir=runtime['output_dir'],
+                    adapter_name=context.adapter_name,
+                ),
+                operation=f'initial adapter save for {context.key}',
             )
 
         manager = create_cpu_actor(
@@ -672,11 +675,23 @@ def _train_batch_with_config(
 
 
 def _save_adapter(model: Any, output_dir: str, admission: PartitionAdmission) -> str:
-    return model.save(
-        f'async-{admission.context.adapter_name}-v{admission.step + 1}',
-        output_dir=output_dir,
-        adapter_name=admission.context.adapter_name,
+    return _require_adapter_path(
+        model.save(
+            f'async-{admission.context.adapter_name}-v{admission.step + 1}',
+            output_dir=output_dir,
+            adapter_name=admission.context.adapter_name,
+        ),
+        operation=f'adapter save for {admission.partition_id}',
     )
+
+
+def _require_adapter_path(value: Any, *, operation: str) -> str:
+    """Fail at the save boundary instead of publishing an invalid policy."""
+    if not isinstance(value, str) or not value:
+        raise TypeError(
+            f'{operation} must return a non-empty checkpoint path string, '
+            f'got {type(value).__name__}: {value!r}')
+    return value
 
 
 def _remove_adapter_snapshot(sampler: Any, adapter_path: str) -> None:

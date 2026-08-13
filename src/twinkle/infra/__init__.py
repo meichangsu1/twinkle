@@ -826,7 +826,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._execute = execute
         wrapper._collect = collect
         wrapper._dispatch = dispatch
-        wrapper._lazy_collect = _lazy_collect
+        wrapper._lazy_collect = _lazy_collect if lazy_collect is None else lazy_collect
         wrapper._sync = sync
         return wrapper
 

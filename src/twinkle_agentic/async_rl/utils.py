@@ -207,7 +207,6 @@ def resolve_context_loss_config(
     loss_config: dict[str, Any] = {
         'cls': 'GRPOLoss',
         'epsilon': 0.2,
-        'normalization': 'sequence_mean',
     }
     loss_config.update(dict(loss_defaults or {}))
     loss_config.update(dict(context_config.get('loss') or {}))

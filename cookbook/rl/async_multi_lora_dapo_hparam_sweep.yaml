@@ -74,7 +74,6 @@ lora:
 loss:
   cls: GRPOLoss
   epsilon: 0.2
-  normalization: sequence_mean
 
 lora_contexts:
   # A/B/C isolate learning rate while keeping mini_batch_size fixed at 32 samples.

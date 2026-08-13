@@ -85,7 +85,6 @@ lora:
 loss:
   cls: GRPOLoss
   epsilon: 0.2
-  normalization: token_mean
 
 lora_contexts:
   - tenant_id: tenant_single

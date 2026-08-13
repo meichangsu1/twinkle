@@ -82,7 +82,6 @@ lora:
 loss:
   cls: GRPOLoss
   epsilon: 0.2
-  normalization: sequence_mean
 
 lora_contexts:
   - tenant_id: tenant_single_dapo

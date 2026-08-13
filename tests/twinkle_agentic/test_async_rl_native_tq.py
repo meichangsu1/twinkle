@@ -19,7 +19,12 @@ from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.native_tq import ContextGRPOGroupNSampler
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
-from twinkle_agentic.async_rl.pipeline import create_cpu_actor, _reward_for_context, _train_batch
+from twinkle_agentic.async_rl.pipeline import (
+    _require_adapter_path,
+    _reward_for_context,
+    _train_batch,
+    create_cpu_actor,
+)
 from twinkle_agentic.async_rl.types import (PartitionAdmission, PreparedPartition, PromptGroup, RolloutPolicy)
 from twinkle_agentic.async_rl.utils import (
     TrainBatchConfig,
@@ -386,20 +391,19 @@ def test_context_loss_config_overrides_global_defaults():
         {
             'loss': {
                 'cls': 'GSPOLoss',
-                'normalization': 'token_mean',
+                'epsilon_high': 0.3,
             }
         },
         {
             'cls': 'GRPOLoss',
             'epsilon': 0.2,
-            'normalization': 'sequence_mean',
         },
     )
 
     assert loss_cls == 'GSPOLoss'
     assert loss_kwargs == {
         'epsilon': 0.2,
-        'normalization': 'token_mean',
+        'epsilon_high': 0.3,
     }
 
 
@@ -408,9 +412,68 @@ def test_context_loss_config_uses_grpo_defaults():
         'GRPOLoss',
         {
             'epsilon': 0.2,
-            'normalization': 'sequence_mean',
         },
     )
+
+
+def test_async_single_lora_gsm8k_verl_config_matches_current_grpo_api():
+    from omegaconf import OmegaConf
+    from twinkle.loss import GRPOLoss
+
+    config_path = 'cookbook/rl/async_single_lora_gsm8k_verl.yaml'
+    config = OmegaConf.to_container(OmegaConf.load(config_path), resolve=False)
+    context = config['lora_contexts'][0]
+    loss_cls, loss_kwargs = resolve_context_loss_config(context, config['loss'])
+
+    assert loss_cls == 'GRPOLoss'
+    GRPOLoss(**loss_kwargs)
+    assert context['reward']['class_path'] == 'twinkle.reward.GSM8KAccuracyReward'
+    assert context['eval_dataset']['reward']['class_path'] == 'twinkle.reward.GSM8KAccuracyReward'
+    validate_context_batch_config(
+        f"{context['tenant_id']}/{context['training_run_id']}/{context['adapter_name']}",
+        rollout_groups=context['rollout']['batch_size'],
+        num_generations=context['rollout']['num_generations'],
+        train=TrainBatchConfig(
+            mini_batch_size=context['train']['mini_batch_size'],
+            micro_batch_size=context['train']['micro_batch_size'],
+            dynamic_batching=context['train']['dynamic_batching'],
+            max_tokens_per_micro_batch=context['train']['max_tokens_per_micro_batch'],
+            packing_algorithm=context['train']['packing_algorithm'],
+        ),
+        sampler_dp=config['runtime']['sampler_gpus'] // config['runtime']['sampler_tp'],
+        model_dp=config['runtime']['model_gpus'],
+    )
+
+
+def test_adapter_path_rejects_uncollected_remote_result():
+    def lazy_result():
+        return '/tmp/policy'
+
+    with pytest.raises(TypeError, match='must return a non-empty checkpoint path string'):
+        _require_adapter_path(lazy_result, operation='test save')
+
+
+def test_multi_lora_transformers_save_disables_lazy_collect():
+    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+
+    assert MultiLoraTransformersModel.save._lazy_collect is False
+
+
+def test_remote_function_metadata_uses_explicit_lazy_collect_value():
+    from twinkle import remote_function
+
+    class Component:
+
+        @remote_function(lazy_collect=False)
+        def eager(self):
+            return None
+
+        @remote_function(lazy_collect=True)
+        def lazy(self):
+            return None
+
+    assert Component.eager._lazy_collect is False
+    assert Component.lazy._lazy_collect is True
 
 
 def test_context_loss_config_rejects_empty_class_name():

@@ -83,7 +83,6 @@ lora:
 loss:
   cls: GRPOLoss
   epsilon: 0.2
-  normalization: sequence_mean
 
 lora_contexts:
   # Set both environment variables to distinct local parquet splits for a disjoint-tenant experiment.
