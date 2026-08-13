@@ -848,6 +848,9 @@ class MultiLora:
         return trainable_param_names
 
     def get_target_parameter_trainable_parameters(self, tenant_adapter_name):
+        lora = self.find_lora_by_tenant(tenant_adapter_name)
+        if not getattr(lora.tenant_config, 'target_parameters', None):
+            return {}
         return {
             name: parameter
             for name, parameter in self.target_parameter_manager.named_slot_parameters(tenant_adapter_name)

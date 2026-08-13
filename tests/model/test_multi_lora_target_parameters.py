@@ -85,6 +85,24 @@ def _make_target_cfg(r=2):
     )
 
 
+def test_standard_lora_has_no_target_parameter_trainable_parameters():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    config = LoraConfig(r=2, lora_alpha=4, target_modules=['linear'])
+    multi_lora = MultiLora(max_loras=1, max_r=4)
+    multi_lora.loras = [
+        LoraTenant(
+            index=0,
+            adapter_name='lora_0',
+            config=config,
+            tenant_adapter_name='adapter_a',
+            tenant_config=config,
+        )
+    ]
+
+    assert multi_lora.get_target_parameter_trainable_parameters('adapter_a') == {}
+
+
 def test_target_parameter_multi_lora_updates_only_active_adapter():
     from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
 
