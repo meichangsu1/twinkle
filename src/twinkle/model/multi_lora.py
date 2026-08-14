@@ -132,6 +132,10 @@ class MultiLora:
     def _count_available_loras(self):
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name is None])
 
+    def _lora_slot_assignments(self):
+        """Return a compact snapshot used to diagnose per-rank slot state."""
+        return [(lora.adapter_name, lora.tenant_adapter_name) for lora in self.loras]
+
     def reset_adapter_status(self):
         """Force lora_0 require_grad, disable others"""
         if isinstance(self.module, list):
@@ -239,13 +243,24 @@ class MultiLora:
                 slot_name=_available_lora.adapter_name,
                 config=config,
             )
-        logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
+        logger.info(
+            'LoRA acquired: tenant=%s, slot=%s, available_lora=%s',
+            tenant_adapter_name,
+            _available_lora.adapter_name,
+            self._count_available_loras(),
+        )
         return _available_lora.adapter_name
 
     def release_lora(self, tenant_adapter_name: str) -> Optional[str]:
         try:
             _lora = self.find_lora_by_tenant(tenant_adapter_name)
         except ValueError:
+            logger.warning(
+                'LoRA release skipped: tenant=%s was not found, assignments=%s',
+                tenant_adapter_name,
+                self._lora_slot_assignments(),
+                ranks='all',
+            )
             return
         # Restore every backing slot before publishing it as available. If a
         # DTensor reset fails, retain the tenant mapping so cleanup can retry
@@ -254,7 +269,13 @@ class MultiLora:
         self.target_parameter_manager.release(tenant_adapter_name)
         _lora.tenant_config = None
         _lora.tenant_adapter_name = None
-        logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
+        logger.info(
+            'LoRA released: tenant=%s, slot=%s, available_lora=%s',
+            tenant_adapter_name,
+            _lora.adapter_name,
+            self._count_available_loras(),
+        )
+        return _lora.adapter_name
 
     def has_lora(self, adapter_name: str) -> bool:
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name]) > 0

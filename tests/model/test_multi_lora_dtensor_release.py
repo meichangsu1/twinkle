@@ -75,3 +75,32 @@ def test_multilora_release_keeps_tenant_when_slot_reset_fails(monkeypatch):
 
     assert tenant.tenant_adapter_name == 'adapter_a'
     assert tenant.tenant_config is not None
+
+
+def test_multilora_release_reports_each_released_slot(monkeypatch):
+    multi_lora = MultiLora(max_loras=2, max_r=4)
+    slot_config = _make_lora_config(4)
+    tenant_config = _make_lora_config(2)
+    multi_lora.loras = [
+        LoraTenant(
+            index=0,
+            adapter_name='lora_0',
+            config=slot_config,
+            tenant_adapter_name='adapter_a',
+            tenant_config=tenant_config,
+        ),
+        LoraTenant(
+            index=1,
+            adapter_name='lora_1',
+            config=slot_config,
+            tenant_adapter_name='adapter_b',
+            tenant_config=tenant_config,
+        ),
+    ]
+    monkeypatch.setattr(multi_lora, '_load_initial_weights', lambda _adapter_name: None)
+    monkeypatch.setattr(multi_lora.target_parameter_manager, 'release', lambda _tenant_name: None)
+
+    assert multi_lora.release_lora('adapter_a') == 'lora_0'
+    assert multi_lora._count_available_loras() == 1
+    assert multi_lora.release_lora('adapter_b') == 'lora_1'
+    assert multi_lora._count_available_loras() == 2
