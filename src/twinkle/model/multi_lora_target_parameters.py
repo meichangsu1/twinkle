@@ -133,6 +133,7 @@ class TargetParameterLoraWrapper(nn.Module):
         return parameter
 
     @staticmethod
+    @torch.no_grad()
     def _write_parameter(parameter: nn.Parameter, value: torch.Tensor) -> None:
         if hasattr(parameter, 'to_local') and hasattr(parameter, 'device_mesh'):
             local_parameter = parameter.to_local()
@@ -401,12 +402,13 @@ class TargetParameterLoraManager:
             wrapper.configure_slot(slot_name, config)
 
     def release(self, tenant_adapter_name: str) -> None:
-        slot_name = self.tenant_to_slot.pop(tenant_adapter_name, None)
-        self.tenant_configs.pop(tenant_adapter_name, None)
+        slot_name = self.tenant_to_slot.get(tenant_adapter_name)
         if slot_name is None:
             return
         for wrapper in self.wrappers:
             wrapper.reset_slot(slot_name)
+        self.tenant_to_slot.pop(tenant_adapter_name, None)
+        self.tenant_configs.pop(tenant_adapter_name, None)
 
     def save_initial_weights(self) -> None:
         for wrapper in self.wrappers:

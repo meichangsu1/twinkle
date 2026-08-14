@@ -349,9 +349,8 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function()
     def remove_adapter(self, adapter_name: str):
         self._lazy_wrap_model()
-        if adapter_name in self.optimizer_group:
-            self.optimizer_group.pop(adapter_name)
         self.multi_adapter.release_lora(adapter_name)
+        self.optimizer_group.pop(adapter_name, None)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
         with self.multi_adapter.adapter(adapter_name):

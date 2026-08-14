@@ -66,7 +66,14 @@ class MultiLora:
     def _is_target_parameter_lora_name(name: str) -> bool:
         return '._twinkle_lora_' in name
 
+    @torch.no_grad()
     def _write_param_tensor(self, parameter, value):
+        """Copy a value into a regular parameter or its local DTensor shard.
+
+        ``DTensor.to_local()`` can return a view produced by a custom autograd
+        Function. In-place writes to that view are forbidden while grad mode is
+        enabled, even for lifecycle operations such as adapter reset/load.
+        """
         if value is None:
             return
         value = value.detach().to(dtype=parameter.dtype)
@@ -238,13 +245,16 @@ class MultiLora:
     def release_lora(self, tenant_adapter_name: str) -> Optional[str]:
         try:
             _lora = self.find_lora_by_tenant(tenant_adapter_name)
-            _lora.tenant_config = None
-            _lora.tenant_adapter_name = None
-            self._load_initial_weights(_lora.adapter_name)
-            self.target_parameter_manager.release(tenant_adapter_name)
-            logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         except ValueError:
             return
+        # Restore every backing slot before publishing it as available. If a
+        # DTensor reset fails, retain the tenant mapping so cleanup can retry
+        # safely instead of exposing a partially reset LoRA slot.
+        self._load_initial_weights(_lora.adapter_name)
+        self.target_parameter_manager.release(tenant_adapter_name)
+        _lora.tenant_config = None
+        _lora.tenant_adapter_name = None
+        logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
 
     def has_lora(self, adapter_name: str) -> bool:
         return len([_lora for _lora in self.loras if _lora.tenant_adapter_name == adapter_name]) > 0
