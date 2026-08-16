@@ -7,6 +7,21 @@ from .resource_manager import ResourceManager
 
 T = TypeVar('T')
 
+# Ray injects these process-local values when it launches each worker.  They
+# must never be copied from a parent actor into a child runtime_env: a child
+# scheduled on another node would otherwise monitor the parent's raylet PID
+# and immediately exit with "the local raylet failed".
+_RAY_INTERNAL_ENV_VARS = frozenset({
+    'RAY_JOB_ID',
+    'RAY_RAYLET_PID',
+    'RAY_OVERRIDE_NODE_ID_FOR_TESTING',
+})
+
+
+def _copy_worker_env() -> Dict[str, str]:
+    """Copy inherited environment without Ray's per-process internal flags."""
+    return {key: value for key, value in os.environ.items() if key not in _RAY_INTERNAL_ENV_VARS}
+
 
 def _get_node_local_topology(placements: List[Dict[str, Any]]) -> List[Tuple[int, List[int]]]:
     """Return each worker's node-local index and distributed ranks on that node."""
@@ -327,7 +342,7 @@ class RayHelper:
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(pg_idx)
-                env_vars = os.environ.copy()
+                env_vars = _copy_worker_env()
                 env_vars.update({
                     'WORLD_SIZE':
                     str(world_size),
@@ -395,7 +410,7 @@ class RayHelper:
                 deploy_pg: Dict
                 cluster_name = group
                 worker_name = key + '-' + str(rank)
-                env_vars = os.environ.copy()
+                env_vars = _copy_worker_env()
                 env_vars.update({
                     'WORLD_SIZE': str(world_size),
                     'RANK': str(rank),
