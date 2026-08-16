@@ -17,45 +17,40 @@ class CreateRequest(BaseModel):
 
 
 class ForwardRequest(BaseModel):
-    inputs: Any = None
-    input_refs: List[DataRef] | None = None
-    input_field: str | None = None
-    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
+    inputs: Any
     adapter_name: str
-
-    @model_validator(mode='after')
-    def validate_input(self) -> 'ForwardRequest':
-        if (self.inputs is None) == (self.input_refs is None):
-            raise ValueError('exactly one of inputs and input_refs must be provided')
-        if self.input_refs is not None and not self.input_refs:
-            raise ValueError('input_refs must not be empty')
-        return self
 
     class Config:
         extra = 'allow'
 
 
 class ForwardOnlyRequest(BaseModel):
-    inputs: Any = None
-    input_refs: List[DataRef] | None = None
-    input_field: str | None = None
-    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
-    output_ref: DataRef | None = None
-    output_fields: Dict[str, str] = Field(default_factory=dict)
+    inputs: Any
     adapter_name: Optional[str] = None
-
-    @model_validator(mode='after')
-    def validate_input(self) -> 'ForwardOnlyRequest':
-        if (self.inputs is None) == (self.input_refs is None):
-            raise ValueError('exactly one of inputs and input_refs must be provided')
-        if self.input_refs is not None and not self.input_refs:
-            raise ValueError('input_refs must not be empty')
-        if (self.output_ref is None) != (len(self.output_fields) == 0):
-            raise ValueError('output_ref and output_fields must be configured together')
-        return self
 
     class Config:
         extra = 'allow'
+
+
+class DataPlaneForwardRequest(BaseModel):
+    input_refs: List[DataRef] = Field(min_length=1)
+    input_field: str | None = None
+    kwarg_fields: Dict[str, str] = Field(default_factory=dict)
+    adapter_name: str
+
+    class Config:
+        extra = 'allow'
+
+
+class DataPlaneForwardOnlyRequest(DataPlaneForwardRequest):
+    output_ref: DataRef | None = None
+    output_fields: Dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode='after')
+    def validate_output(self) -> 'DataPlaneForwardOnlyRequest':
+        if (self.output_ref is None) != (len(self.output_fields) == 0):
+            raise ValueError('output_ref and output_fields must be configured together')
+        return self
 
 
 class AdapterRequest(BaseModel):

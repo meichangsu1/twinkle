@@ -306,7 +306,7 @@ class _TrainerWorker(Worker):
         refs = [group.ref for group in groups]
         try:
             await _submit(
-                self.model.forward_backward,
+                self.model.forward_backward_from_data_plane,
                 refs,
                 input_field='train_input',
                 kwarg_fields={

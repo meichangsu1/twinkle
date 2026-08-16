@@ -33,8 +33,8 @@ python cookbook/client/async_rl/client_orchestrated_grpo.py
 The training loop composes only the low-level component methods:
 
 - `sampler.sample_to_data_plane(...)` / `sampler.asample_to_data_plane(...)`
-- `model.forward_only(...)`
-- `model.forward_backward(...)`
+- `model.forward_only_from_data_plane(...)`
+- `model.forward_backward_from_data_plane(...)`
 - `model.clip_grad_and_step(...)`
 - `model.save(...)`
 - `data_plane.put/get/append/release(...)` and
@@ -46,7 +46,7 @@ generation is one row tagged with its group, generation index, rollout policy,
 and status. The Advantage worker reads only decoded completions and appends
 reward and advantage to the same keys. Token tensors and sampled log-probabilities
 remain server-side. The Trainer passes one or more `DataRef` values to
-`forward_backward()` and releases them in a local `finally` block. `asample()`
+`forward_backward_from_data_plane()` and releases them in a local `finally` block. `asample()`
 remains the materialized-response convenience API.
 
 - `ClientMultiTurnRollout.arun()` keeps tool calls and Reward computation in

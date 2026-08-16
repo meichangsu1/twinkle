@@ -16,6 +16,8 @@ from .model import (
     ClipGradNormResponse,
     CreateRequest,
     CreateResponse,
+    DataPlaneForwardOnlyRequest,
+    DataPlaneForwardRequest,
     ForwardBackwardResponse,
     ForwardOnlyRequest,
     ForwardRequest,

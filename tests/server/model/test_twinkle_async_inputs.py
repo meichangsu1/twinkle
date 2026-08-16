@@ -64,7 +64,7 @@ class _SchedulingManagement:
 
 
 @pytest.mark.asyncio
-async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -> None:
+async def test_forward_backward_inline_route_keeps_original_request_shape() -> None:
     management = _SchedulingManagement()
     app = FastAPI()
     _register_twinkle_routes(app, lambda: management)
@@ -72,6 +72,31 @@ async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
     body = types.ForwardRequest(
+        adapter_name='adapter',
+        inputs=[{'input_ids': [1, 2, 3]}],
+        micro_batch_size=1,
+    )
+
+    await route.endpoint(request, body, management)
+
+    inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
+    assert adapter_name == 'session-adapter'
+    assert [row['input_ids'] for row in inputs] == [[1, 2, 3]]
+    assert forwarded_kwargs == {'micro_batch_size': 1}
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_resolves_multiple_data_refs_and_field_kwargs() -> None:
+    management = _SchedulingManagement()
+    app = FastAPI()
+    _register_twinkle_routes(app, lambda: management)
+    route = next(
+        route for route in app.routes
+        if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane'
+    )
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.DataPlaneForwardRequest(
         adapter_name='adapter',
         input_refs=[
             types.DataRef(ref_id='data-a', size=4, num_tokens=4),
@@ -112,10 +137,13 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
     ]
     app = FastAPI()
     _register_twinkle_routes(app, lambda: management)
-    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
+    route = next(
+        route for route in app.routes
+        if getattr(route, 'path', None) == '/twinkle/forward_backward_from_data_plane'
+    )
     request = Request({'type': 'http', 'headers': []})
     request.state.session_id = 'session'
-    body = types.ForwardRequest(
+    body = types.DataPlaneForwardRequest(
         adapter_name='adapter',
         input_refs=[types.DataRef(ref_id='dpo', size=2, num_tokens=6)],
         kwarg_fields={'ref_outputs.logps': 'ref_logps'},

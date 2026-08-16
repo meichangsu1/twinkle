@@ -67,7 +67,7 @@ def test_dpo_roles_overlap_reference_and_training(monkeypatch) -> None:
             self.steps = 0
             self.forward_backward_kwargs = []
 
-        async def forward_only(self, ref, **kwargs):
+        async def forward_only_from_data_plane(self, ref, **kwargs):
             self.references += 1
             name = f'reference-{self.references}'
             events.append(f'{name}-start')
@@ -78,7 +78,7 @@ def test_dpo_roles_overlap_reference_and_training(monkeypatch) -> None:
             assert kwargs['output_fields'] == {'logps': 'ref_logps'}
             return ref.model_copy(update={'fields': [*ref.fields, 'ref_logps']})
 
-        async def forward_backward(self, _ref, **kwargs):
+        async def forward_backward_from_data_plane(self, _ref, **kwargs):
             self.forward_backward_kwargs.append(kwargs)
             events.append('train-start')
             first_train_started.set()

@@ -17,15 +17,14 @@ from twinkle_client.types.model import (
 )
 
 
-def _component_input_payload(inputs: Any) -> dict[str, Any]:
-    """Encode inline rows or one or more opaque server-side data references."""
-    if isinstance(inputs, DataRef):
-        return {'input_refs': [inputs.model_dump()]}
-    if isinstance(inputs, list) and inputs and any(isinstance(item, DataRef) for item in inputs):
-        if not all(isinstance(item, DataRef) for item in inputs):
-            raise TypeError('model inputs cannot mix DataRef values with inline rows')
-        return {'input_refs': [item.model_dump() for item in inputs]}
-    return {'inputs': json_safe(inputs)}
+def _data_ref_payload(inputs: DataRef | list[DataRef]) -> dict[str, Any]:
+    """Encode one or more opaque references for a DataPlane model endpoint."""
+    refs = [inputs] if isinstance(inputs, DataRef) else list(inputs)
+    if not refs:
+        raise ValueError('at least one DataRef is required')
+    if not all(isinstance(item, DataRef) for item in refs):
+        raise TypeError('data-plane model inputs must contain only DataRef values')
+    return {'input_refs': [item.model_dump() for item in refs]}
 
 
 class MultiLoraTransformersModel:
@@ -74,19 +73,37 @@ class MultiLoraTransformersModel:
         if name == self.adapter_name:
             self.adapter_name = None
 
-    def forward(
+    def forward(self, inputs: Any, **kwargs) -> ForwardResponse:
+        """Execute forward pass on inline model inputs."""
+        response = http_post(
+            url=f'{self.server_url}/forward',
+            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
+        )
+        response.raise_for_status()
+        return ForwardResponse(**response.json())
+
+    def forward_only(self, inputs: Any, **kwargs) -> ForwardResponse:
+        """Execute forward pass without gradient computation on inline inputs."""
+        response = http_post(
+            url=f'{self.server_url}/forward_only',
+            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
+        )
+        response.raise_for_status()
+        return ForwardResponse(**response.json())
+
+    def forward_from_data_plane(
         self,
-        inputs: Any | DataRef | list[DataRef],
+        inputs: DataRef | list[DataRef],
         *,
         input_field: str | None = None,
         kwarg_fields: dict[str, str] | None = None,
         **kwargs,
     ) -> ForwardResponse:
-        """Execute forward over inline rows or server-side references."""
+        """Execute forward using rows referenced from the server DataPlane."""
         response = http_post(
-            url=f'{self.server_url}/forward',
+            url=f'{self.server_url}/forward_from_data_plane',
             json_data={
-                **_component_input_payload(inputs),
+                **_data_ref_payload(inputs),
                 'adapter_name': self.adapter_name,
                 'input_field': input_field,
                 'kwarg_fields': kwarg_fields or {},
@@ -96,9 +113,9 @@ class MultiLoraTransformersModel:
         response.raise_for_status()
         return ForwardResponse(**response.json())
 
-    def forward_only(
+    def forward_only_from_data_plane(
         self,
-        inputs: Any | DataRef | list[DataRef],
+        inputs: DataRef | list[DataRef],
         *,
         input_field: str | None = None,
         kwarg_fields: dict[str, str] | None = None,
@@ -106,9 +123,9 @@ class MultiLoraTransformersModel:
         output_fields: dict[str, str] | None = None,
         **kwargs,
     ) -> ForwardResponse | DataRef:
-        """Execute forward-only, optionally reading and updating server-side rows."""
+        """Execute forward-only using DataPlane rows and optionally append outputs."""
         body = {
-            **_component_input_payload(inputs),
+            **_data_ref_payload(inputs),
             'adapter_name': self.adapter_name,
             'input_field': input_field,
             'kwarg_fields': kwarg_fields or {},
@@ -117,7 +134,7 @@ class MultiLoraTransformersModel:
             **json_safe(kwargs),
         }
         response = http_post(
-            url=f'{self.server_url}/forward_only',
+            url=f'{self.server_url}/forward_only_from_data_plane',
             json_data=body,
         )
         response.raise_for_status()
@@ -152,19 +169,28 @@ class MultiLoraTransformersModel:
         )
         response.raise_for_status()
 
-    def forward_backward(
+    def forward_backward(self, inputs: Any, **kwargs) -> ForwardBackwardResponse:
+        """Execute combined forward and backward pass on inline inputs."""
+        response = http_post(
+            url=f'{self.server_url}/forward_backward',
+            json_data={'inputs': inputs, 'adapter_name': self.adapter_name, **kwargs},
+        )
+        response.raise_for_status()
+        return ForwardBackwardResponse(**response.json())
+
+    def forward_backward_from_data_plane(
         self,
-        inputs: Any | DataRef | list[DataRef],
+        inputs: DataRef | list[DataRef],
         *,
         input_field: str | None = None,
         kwarg_fields: dict[str, str] | None = None,
         **kwargs,
     ) -> ForwardBackwardResponse:
-        """Execute forward/backward over inline rows or server-side references."""
+        """Execute forward/backward using rows referenced from the server DataPlane."""
         response = http_post(
-            url=f'{self.server_url}/forward_backward',
+            url=f'{self.server_url}/forward_backward_from_data_plane',
             json_data={
-                **_component_input_payload(inputs),
+                **_data_ref_payload(inputs),
                 'adapter_name': self.adapter_name,
                 'input_field': input_field,
                 'kwarg_fields': kwarg_fields or {},

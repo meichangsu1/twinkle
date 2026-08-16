@@ -777,6 +777,16 @@
           ]
         }
       },
+      "/twinkle/forward_from_data_plane": {
+        "POST": {
+          "operationId": "forward_from_data_plane_twinkle_forward_from_data_plane_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/forward_backward": {
         "POST": {
           "operationId": "forward_backward_twinkle_forward_backward_post",
@@ -787,9 +797,29 @@
           ]
         }
       },
+      "/twinkle/forward_backward_from_data_plane": {
+        "POST": {
+          "operationId": "forward_backward_from_data_plane_twinkle_forward_backward_from_data_plane_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/forward_only": {
         "POST": {
           "operationId": "forward_only_twinkle_forward_only_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
+      "/twinkle/forward_only_from_data_plane": {
+        "POST": {
+          "operationId": "forward_only_from_data_plane_twinkle_forward_only_from_data_plane_post",
           "parameters": [],
           "responses": [
             "200",

@@ -151,7 +151,7 @@ class _TrainerWorker(Worker):
             ref = item
             try:
                 await _submit(
-                    self.model.forward_backward,
+                    self.model.forward_backward_from_data_plane,
                     ref,
                     kwarg_fields={'ref_outputs.logps': 'ref_logps'},
                 )
@@ -167,7 +167,7 @@ async def _reference_forward(
 ) -> DataRef:
     """Run the frozen base model and append reference logps to the same rows."""
     return await _submit(
-        model.forward_only,
+        model.forward_only_from_data_plane,
         batch_ref,
         disable_lora=True,
         output_ref=batch_ref,

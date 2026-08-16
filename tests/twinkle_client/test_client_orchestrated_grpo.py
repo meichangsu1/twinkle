@@ -66,7 +66,7 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> 
             self.saved.append(name)
             return {'twinkle_path': f'/checkpoints/{name}'}
 
-        async def forward_backward(self, _refs, **kwargs):
+        async def forward_backward_from_data_plane(self, _refs, **kwargs):
             self.forward_backward_kwargs.append(kwargs)
             events.append('train')
             first_train_started.set()
