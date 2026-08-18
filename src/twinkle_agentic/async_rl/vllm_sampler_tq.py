@@ -18,7 +18,6 @@ from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams,
 from twinkle.hub import HubOperation
 from twinkle.metric import MetricBuffer, MetricRecord
 from twinkle.sampler.vllm_sampler import vLLMSampler
-
 from .data_plane import TQDataPlane
 from .metrics import rollout_metrics
 from .types import LoraContext, PromptGroup, RolloutOutput, RolloutPolicy
@@ -147,9 +146,7 @@ class VLLMSamplerTQ(vLLMSampler):
         self.rollout_max_retries = int(rollout_max_retries)
         self.rollout_retry_delay_s = float(rollout_retry_delay_s)
         self.rollout_output_dir = (
-            Path(rollout_output_dir).expanduser().resolve()
-            if rollout_output_dir is not None else None
-        )
+            Path(rollout_output_dir).expanduser().resolve() if rollout_output_dir is not None else None)
         self.rollout_output_include_token_ids = bool(rollout_output_include_token_ids)
         if self.rollout_max_retries < 0:
             raise ValueError(f'rollout_max_retries must be non-negative, got {self.rollout_max_retries}')
@@ -173,16 +170,17 @@ class VLLMSamplerTQ(vLLMSampler):
         attributes: dict[str, Any] | None = None,
         policy_version: int | None = None,
     ) -> None:
-        self.metric_buffer.record(MetricRecord(
-            stage='rollout',
-            values=dict(values),
-            context_key=group.context.key,
-            partition_id=group.partition_id,
-            partition_index=group.partition.step,
-            policy_version=policy_version,
-            status=status,
-            attributes=dict(attributes or {}),
-        ))
+        self.metric_buffer.record(
+            MetricRecord(
+                stage='rollout',
+                values=dict(values),
+                context_key=group.context.key,
+                partition_id=group.partition_id,
+                partition_index=group.partition.step,
+                policy_version=policy_version,
+                status=status,
+                attributes=dict(attributes or {}),
+            ))
 
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
     def drain_metric_records(self) -> list[MetricRecord]:
@@ -208,14 +206,11 @@ class VLLMSamplerTQ(vLLMSampler):
         # Unloading is keyed by the normalized path stored in VLLMEngine's
         # request cache. The checkpoint itself may already have been pruned,
         # so unlike loading this must not require the path to still exist.
-        local_paths = [
-            os.path.abspath(os.path.expanduser(str(path)))
-            for path in adapter_paths
-        ]
+        local_paths = [os.path.abspath(os.path.expanduser(str(path))) for path in adapter_paths]
         self._submit_in_loop(self.engine.unload_lora_paths(local_paths)).result()
 
     @remote_function(dispatch='slice_dp', collect='none', lazy_collect=False)
-    def sample(
+    def submit_prompt_groups(
         self,
         groups: list[PromptGroup],
         sampling_params: SamplingParams,
@@ -241,27 +236,6 @@ class VLLMSamplerTQ(vLLMSampler):
             'submitted_prompt_groups': len(groups),
             'submitted_samples': sum(group.num_samples for group in groups),
         }
-
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
-    def sample_sync(
-        self,
-        inputs: Any,
-        sampling_params: SamplingParams | dict[str, Any] | None = None,
-        adapter_name: str = '',
-        adapter_path: str | None = None,
-        *,
-        return_encoded: bool = False,
-        use_base_model: bool = False,
-    ) -> list[SampleResponse]:
-        """Run the inherited blocking sampler API for synchronous CS calls."""
-        return super().sample(
-            inputs,
-            sampling_params,
-            adapter_name=adapter_name,
-            adapter_path=adapter_path,
-            return_encoded=return_encoded,
-            use_base_model=use_base_model,
-        )
 
     @remote_function(dispatch=_dispatch_generation, collect='none', lazy_collect=False)
     def submit_generation(
@@ -422,17 +396,14 @@ class VLLMSamplerTQ(vLLMSampler):
                 logger.warning(f'Failed to pre-load LoRA from {local_adapter_path}, '
                                'sampling will proceed without LoRA')
 
-        return await asyncio.gather(*(
-            self._sample_single(
-                feat,
-                sampling_params,
-                lora_request=lora_request,
-                multi_modal_data=multi_modal_data,
-                logprobs_only=logprobs_only,
-                disable_lora=use_base_model,
-            )
-            for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
-        ))
+        return await asyncio.gather(*(self._sample_single(
+            feat,
+            sampling_params,
+            lora_request=lora_request,
+            multi_modal_data=multi_modal_data,
+            logprobs_only=logprobs_only,
+            disable_lora=use_base_model,
+        ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)))
 
     def _on_submission_done(self, submission_id: str):
 
@@ -470,34 +441,39 @@ class VLLMSamplerTQ(vLLMSampler):
                 group,
                 {},
                 status='failed',
-                attributes={'scope': 'group', 'group_id': group.group_id, 'error': str(error)},
+                attributes={
+                    'scope': 'group',
+                    'group_id': group.group_id,
+                    'error': str(error)
+                },
             )
             raise RuntimeError(f'rollout failed for {group.group_id}: {error}') from error
 
         rollout_stats = [result for result in results if isinstance(result, _PromptGroupRolloutStats)]
-        metric_rows = [
-            {
-                'completion_length': completion_length,
-                'stop_reason': stop_reason,
-            }
-            for stats in rollout_stats
-            for completion_length, stop_reason in zip(stats.completion_lengths, stats.stop_reasons)
-        ]
+        metric_rows = [{
+            'completion_length': completion_length,
+            'stop_reason': stop_reason,
+        } for stats in rollout_stats
+                       for completion_length, stop_reason in zip(stats.completion_lengths, stats.stop_reasons)]
         policy_versions = [version for stats in rollout_stats for version in stats.policy_versions]
         first_group = groups[0]
         dp_size = self.device_mesh.dp_world_size or 1
         self._record_metrics(
             first_group,
             {
-                'prompt_group_count': len(groups),
+                'prompt_group_count':
+                len(groups),
                 **rollout_metrics(
                     completion_lengths=[row['completion_length'] for row in metric_rows],
                     stop_reasons=[row['stop_reason'] for row in metric_rows],
                     rollout_latency_s=time.perf_counter() - submitted_at,
                 ),
-                'policy_version_min': min(policy_versions),
-                'policy_version_max': max(policy_versions),
-                'sampler_dp_size': dp_size,
+                'policy_version_min':
+                min(policy_versions),
+                'policy_version_max':
+                max(policy_versions),
+                'sampler_dp_size':
+                dp_size,
             },
             attributes={'scope': 'partition' if dp_size == 1 else 'shard'},
             policy_version=max(policy_versions),
@@ -589,7 +565,10 @@ class VLLMSamplerTQ(vLLMSampler):
                 max(policy_versions),
                 **reward_metrics,
             },
-            attributes={'scope': 'group', 'group_id': group.group_id},
+            attributes={
+                'scope': 'group',
+                'group_id': group.group_id
+            },
             policy_version=max(policy_versions),
         )
         return _PromptGroupRolloutStats(
@@ -748,8 +727,8 @@ class VLLMSamplerTQ(vLLMSampler):
                 else:
                     if sequence.stop_reason not in {'abort', 'error'}:
                         if not allow_partial_rollout or not partial_responses:
-                            return _GeneratedSample(
-                                response, (policy, ), attempt + 1, was_aborted, resumed_partial_output)
+                            return _GeneratedSample(response, (policy, ), attempt + 1, was_aborted,
+                                                    resumed_partial_output)
                         partial_responses.append(response)
                         partial_policies.append(policy)
                         return _GeneratedSample(

@@ -20,12 +20,11 @@ class MicroBatchConfig:
             raise ValueError(f'micro_batch_size must be positive, got {self.micro_batch_size}')
         if self.packing_algorithm not in ('ffd', 'kk'):
             raise ValueError(f'packing_algorithm must be ffd or kk, got {self.packing_algorithm!r}')
-        if self.dynamic_batching and (
-                self.max_tokens_per_micro_batch is None or self.max_tokens_per_micro_batch <= 0):
+        if self.dynamic_batching and (self.max_tokens_per_micro_batch is None or self.max_tokens_per_micro_batch <= 0):
             raise ValueError('max_tokens_per_micro_batch must be positive when dynamic_batching=true')
 
     @classmethod
-    def from_kwargs(cls, kwargs: dict[str, Any]) -> 'MicroBatchConfig | None':
+    def from_kwargs(cls, kwargs: dict[str, Any]) -> MicroBatchConfig | None:
         option_names = (
             'micro_batch_size',
             'dynamic_batching',
@@ -56,8 +55,7 @@ def _batch_cost(group: list[int], lengths: list[int], padding_free: bool) -> int
     return sum(values) if padding_free else max(values) * len(values)
 
 
-def _fits(group: list[int], index: int, lengths: list[int], config: MicroBatchConfig,
-          padding_free: bool) -> bool:
+def _fits(group: list[int], index: int, lengths: list[int], config: MicroBatchConfig, padding_free: bool) -> bool:
     if len(group) >= config.micro_batch_size:
         return False
     candidate = [*group, index]
@@ -97,11 +95,11 @@ class _KKSet:
         self.items.append(index)
         self.total += value
 
-    def merge(self, other: '_KKSet') -> None:
+    def merge(self, other: _KKSet) -> None:
         self.items.extend(other.items)
         self.total += other.total
 
-    def __lt__(self, other: '_KKSet') -> bool:
+    def __lt__(self, other: _KKSet) -> bool:
         return (self.total, len(self.items), self.items) < (other.total, len(other.items), other.items)
 
 
@@ -118,12 +116,12 @@ class _KKState:
     def spread(self) -> int:
         return self.sets[0].total - self.sets[-1].total
 
-    def merge(self, other: '_KKState') -> None:
+    def merge(self, other: _KKState) -> None:
         for index in range(len(self.sets)):
             self.sets[index].merge(other.sets[-1 - index])
         self.sets.sort(reverse=True)
 
-    def __lt__(self, other: '_KKState') -> bool:
+    def __lt__(self, other: _KKState) -> bool:
         return self.spread > other.spread
 
 
@@ -146,8 +144,7 @@ def _kk_allocate(lengths: list[int], config: MicroBatchConfig, padding_free: boo
     while group_count <= len(lengths):
         groups = _kk_partition(lengths, group_count)
         if all(
-                len(group) <= config.micro_batch_size
-                and _batch_cost(group, lengths, padding_free) <= capacity
+                len(group) <= config.micro_batch_size and _batch_cost(group, lengths, padding_free) <= capacity
                 for group in groups):
             return groups
         group_count += 1
@@ -179,8 +176,7 @@ def plan_micro_batches(
     capacity = config.max_tokens_per_micro_batch
     oversized = [length for length in lengths if length > capacity]
     if oversized:
-        raise ValueError(
-            f'sequence length {max(oversized)} exceeds max_tokens_per_micro_batch={capacity}')
+        raise ValueError(f'sequence length {max(oversized)} exceeds max_tokens_per_micro_batch={capacity}')
     if config.packing_algorithm == 'ffd':
         return _ffd_allocate(lengths, config, padding_free, min_micro_batches)
     return _kk_allocate(lengths, config, padding_free, min_micro_batches)
@@ -194,19 +190,3 @@ def select_batch(value: Any, indices: list[int], batch_size: int) -> Any:
     if hasattr(value, 'shape') and len(value.shape) > 0 and value.shape[0] == batch_size:
         return value[indices]
     return value
-
-
-def collect_micro_batch_outputs(outputs: list[dict[str, Any]], device_mesh: Any) -> dict[str, Any]:
-    from twinkle.infra.collectors import collect_tensor_dict
-
-    result = collect_tensor_dict(outputs, device_mesh)
-    if len(outputs) <= 1 or 'micro_batch_count' not in outputs[0]:
-        return result
-    collected = [output for index, output in enumerate(outputs) if index in device_mesh.get_collect_ranks()]
-    result['micro_batch_count'] = collected[0]['micro_batch_count']
-    result['micro_batch_samples_mean'] = (
-        sum(output['micro_batch_samples_mean'] for output in collected) / len(collected))
-    result['micro_batch_tokens_mean'] = (
-        sum(output['micro_batch_tokens_mean'] for output in collected) / len(collected))
-    result['micro_batch_tokens_max'] = max(output['micro_batch_tokens_max'] for output in collected)
-    return result

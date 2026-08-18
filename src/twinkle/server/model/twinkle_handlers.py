@@ -9,6 +9,7 @@ self_fn is injected via FastAPI Depends to obtain the ModelManagement instance a
 from __future__ import annotations
 
 import asyncio
+import torch
 import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -24,9 +25,10 @@ from twinkle.data_format import InputFeature, Trajectory
 from twinkle.server.checkpoint import (_resolve_client_save_dir, create_checkpoint_manager, create_training_run_manager,
                                        validate_user_path)
 from twinkle.server.exceptions import FullModeBusyError
+from twinkle.server.model.utils import (data_plane_request_shape, merge_forward_kwargs, resolve_data_plane_model_inputs,
+                                        select_output_rows)
 from twinkle.server.utils.validation import get_session_id_from_request
 from twinkle.utils.logger import get_logger
-from twinkle_client.common.json_utils import json_safe
 from twinkle_client.common.serialize import deserialize_object
 
 logger = get_logger()
@@ -54,114 +56,6 @@ def _get_twinkle_adapter_name(request: Request, adapter_name: str | None) -> str
         return None
     owner_id = get_session_id_from_request(request) or request.state.request_id
     return owner_id + '-' + adapter_name
-
-
-def _model_result_rows(result: Any, batch_size: int) -> list[dict[str, Any]]:
-    """Keep per-sample model outputs at TQ sample granularity."""
-    if isinstance(result, list) and len(result) == batch_size and all(isinstance(item, dict) for item in result):
-        return result
-    if isinstance(result, dict):
-        batched = {
-            name
-            for name, value in result.items()
-            if isinstance(value, list) and len(value) == batch_size
-        }
-        if batched:
-            return [{
-                name: value[index] if name in batched else value
-                for name, value in result.items()
-            } for index in range(batch_size)]
-    return [{'result': result}]
-
-
-def _value_at_path(value: Any, path: str) -> Any:
-    for part in path.split('.'):
-        if not isinstance(value, dict) or part not in value:
-            raise KeyError(f'data field {path!r} does not exist')
-        value = value[part]
-    return value
-
-
-def _set_at_path(target: dict[str, Any], path: str, value: Any) -> None:
-    parts = path.split('.')
-    current = target
-    for part in parts[:-1]:
-        nested = current.setdefault(part, {})
-        if not isinstance(nested, dict):
-            raise ValueError(f'cannot bind nested model argument {path!r}')
-        current = nested
-    current[parts[-1]] = value
-
-
-async def _resolve_data_plane_model_inputs(body: Any, data_plane: Any) -> tuple[Any, dict[str, Any]]:
-    """Resolve DataPlane references before entering the model backend."""
-    selected_fields = None
-    if body.input_field is not None:
-        selected_fields = list(dict.fromkeys([
-            body.input_field,
-            *(source.split('.', 1)[0] for source in body.kwarg_fields.values()),
-        ]))
-    batches = await asyncio.gather(*(
-        data_plane.get(ref, fields=selected_fields)
-        for ref in body.input_refs
-    ))
-    rows = [row for batch in batches for row in batch]
-    if body.input_field is None:
-        kwarg_roots = {source.split('.', 1)[0] for source in body.kwarg_fields.values()}
-        inputs = [
-            {key: value for key, value in row.items() if key not in kwarg_roots}
-            for row in rows
-        ]
-    else:
-        inputs = [_value_at_path(row, body.input_field) for row in rows]
-
-    field_kwargs: dict[str, Any] = {}
-    for target_path, source_path in body.kwarg_fields.items():
-        # Keep the transport contract JSON-native.  The processor/loss/metric
-        # that understands this field owns any tensor conversion.
-        field_value = [
-            _value_at_path(row, source_path) for row in rows
-        ]
-        _set_at_path(
-            field_kwargs,
-            target_path,
-            field_value,
-        )
-    return inputs, field_kwargs
-
-
-def _merge_forward_kwargs(explicit: dict[str, Any], bound: dict[str, Any]) -> dict[str, Any]:
-    collisions = set(explicit).intersection(bound)
-    if collisions:
-        names = ', '.join(sorted(collisions))
-        raise ValueError(f'explicit model kwargs conflict with kwarg_fields: {names}')
-    return {**explicit, **bound}
-
-
-def _request_shape(body: Any) -> tuple[int, int]:
-    input_refs = getattr(body, 'input_refs', None)
-    if input_refs is not None:
-        return (
-            sum(ref.num_tokens for ref in input_refs),
-            sum(ref.size for ref in input_refs),
-        )
-    inputs = body.inputs if isinstance(body.inputs, list) else [body.inputs]
-    return (
-        sum(len(item.get('input_ids', [])) if isinstance(item, dict) else 0 for item in inputs),
-        len(inputs),
-    )
-
-
-def _select_output_rows(
-    result: Any,
-    *,
-    batch_size: int,
-    output_fields: dict[str, str],
-) -> list[dict[str, Any]]:
-    rows = _model_result_rows(json_safe(result), batch_size)
-    if len(rows) != batch_size:
-        raise ValueError(f'model returned {len(rows)} rows for an output_ref of size {batch_size}')
-    return [{target: _value_at_path(row, source) for source, target in output_fields.items()} for row in rows]
 
 
 def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
@@ -218,7 +112,9 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
-        input_tokens, batch_size = _request_shape(body)
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        batch_size = len(inputs_list)
         return await run_task(
             self.schedule_task_and_wait(
                 _task,
@@ -241,8 +137,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _task():
             self.assert_resource_exists(adapter_name)
-            raw_inputs, field_kwargs = await _resolve_data_plane_model_inputs(body, self.data_plane)
-            kwargs = _merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
+            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
             ret = self.model.forward(
                 inputs=_parse_inputs(raw_inputs),
                 adapter_name=adapter_name,
@@ -250,7 +146,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             )
             return {'result': ret}
 
-        input_tokens, batch_size = _request_shape(body)
+        input_tokens, batch_size = data_plane_request_shape(body)
         return await run_task(
             self.schedule_task_and_wait(
                 _task,
@@ -301,15 +197,14 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 inputs=inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
-        input_tokens, batch_size = _request_shape(body)
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
         return await run_task(
             self.schedule_task_and_wait(
                 _task,
                 model_id=adapter_name,
                 token=token,
                 input_tokens=input_tokens,
-                batch_size=batch_size,
-                data_world_size=self.data_world_size,
                 task_type='forward_only',
             ))
 
@@ -324,12 +219,12 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _task():
             self.assert_resource_exists(adapter_name)
-            raw_inputs, field_kwargs = await _resolve_data_plane_model_inputs(body, self.data_plane)
+            raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
             inputs = _parse_inputs(raw_inputs)
-            kwargs = _merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
             ret = self.model.forward_only(inputs=inputs, adapter_name=adapter_name, **kwargs)
             if body.output_ref is not None:
-                rows = _select_output_rows(
+                rows = select_output_rows(
                     ret,
                     batch_size=len(inputs),
                     output_fields=body.output_fields,
@@ -338,7 +233,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 return {'result': output_ref.model_dump()}
             return {'result': ret}
 
-        input_tokens, batch_size = _request_shape(body)
+        input_tokens, batch_size = data_plane_request_shape(body)
         return await run_task(
             self.schedule_task_and_wait(
                 _task,
@@ -389,15 +284,28 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
         token = await self._on_request_start(request)
         adapter_name = _get_twinkle_adapter_name(request, body.adapter_name)
 
+        def first_element(data):
+            while isinstance(data, list):
+                if len(data) == 0:
+                    return None
+                data = data[0]
+            return data
+
         async def _task():
             self.assert_resource_exists(adapter_name)
             extra_kwargs = body.model_extra or {}
             all_inputs = _parse_inputs(body.inputs)
+            for inputs in all_inputs:
+                for key in inputs:
+                    if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
+                        inputs[key] = torch.tensor(inputs[key])
             ret = self.model.forward_backward(
                 inputs=all_inputs, adapter_name=self.resolve_model_adapter_name(adapter_name), **extra_kwargs)
             return {'result': ret}
 
-        input_tokens, batch_size = _request_shape(body)
+        inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
+        input_tokens = sum(len(inp.get('input_ids', [])) if isinstance(inp, dict) else 0 for inp in inputs_list)
+        batch_size = len(inputs_list)
         return await run_task(
             self.schedule_task_and_wait(
                 _task,
@@ -420,8 +328,8 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
 
         async def _task():
             self.assert_resource_exists(adapter_name)
-            raw_inputs, field_kwargs = await _resolve_data_plane_model_inputs(body, self.data_plane)
-            kwargs = _merge_forward_kwargs(body.model_extra or {}, field_kwargs)
+            raw_inputs, field_kwargs = await resolve_data_plane_model_inputs(body, self.data_plane)
+            kwargs = merge_forward_kwargs(body.model_extra or {}, field_kwargs)
             ret = self.model.forward_backward(
                 inputs=_parse_inputs(raw_inputs),
                 adapter_name=adapter_name,
@@ -429,7 +337,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
             )
             return {'result': ret}
 
-        input_tokens, batch_size = _request_shape(body)
+        input_tokens, batch_size = data_plane_request_shape(body)
         return await run_task(
             self.schedule_task_and_wait(
                 _task,
@@ -692,10 +600,7 @@ def _register_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement
                 async_upload=False,
             )
 
-        future_ref = await self.schedule_background_task(
-            _task,
-            task_type='upload_to_hub',
-        )
+        future_ref = await self.schedule_background_task(_task, task_type='upload_to_hub')
         request_id = future_ref.get('request_id')
         if request_id is None:
             raise HTTPException(status_code=500, detail=f'Upload task scheduling failed: {future_ref}')

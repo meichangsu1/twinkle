@@ -15,11 +15,10 @@ from .context_manager import LoraContextManager
 from .data_plane import TQDataPlane
 from .scheduler import ContextSchedulePolicy, SchedulerConfig
 from .types import LoraContext, PartitionAdmission
-from .utils import (TrainBatchConfig, build_native_fsdp_model_kwargs,
-                    configure_lora_lr_scheduler, resolve_context_learning_rate,
-                    resolve_context_lora_target_modules, resolve_context_loss_config,
-                    resolve_model_attention_implementation, sampler_data_parallel_size,
-                    resolve_sequence_parallel_size, validate_context_batch_config)
+from .utils import (TrainBatchConfig, build_native_fsdp_model_kwargs, configure_lora_lr_scheduler,
+                    resolve_context_learning_rate, resolve_context_lora_target_modules, resolve_context_loss_config,
+                    resolve_model_attention_implementation, resolve_sequence_parallel_size, sampler_data_parallel_size,
+                    validate_context_batch_config)
 from .workers import AdvantageWorker, RolloutWorker, TrainerWorker
 
 
@@ -210,10 +209,8 @@ class AsyncMultiLoraGRPOPipeline:
                 mini_batch_size=int(train['mini_batch_size']),
                 micro_batch_size=int(train['micro_batch_size']),
                 dynamic_batching=bool(train.get('dynamic_batching', False)),
-                max_tokens_per_micro_batch=(
-                    int(train['max_tokens_per_micro_batch'])
-                    if train.get('max_tokens_per_micro_batch') is not None else None
-                ),
+                max_tokens_per_micro_batch=(int(train['max_tokens_per_micro_batch'])
+                                            if train.get('max_tokens_per_micro_batch') is not None else None),
                 packing_algorithm=str(train.get('packing_algorithm', 'ffd')),
             )
             validate_context_batch_config(
@@ -264,9 +261,12 @@ class AsyncMultiLoraGRPOPipeline:
                     raise ValueError('evaluation.batch_size and evaluation.interval must be positive')
                 eval_sampling = dict(global_evaluation.get('sampling_params') or {})
                 evaluation_config[context.key] = {
-                    'interval': eval_interval,
-                    'dataset_name': eval_dataset.get('name', eval_dataset['dataset_id']),
-                    'prompt_batches': partial(
+                    'interval':
+                    eval_interval,
+                    'dataset_name':
+                    eval_dataset.get('name', eval_dataset['dataset_id']),
+                    'prompt_batches':
+                    partial(
                         _prompt_batches,
                         eval_dataset,
                         model_id=runtime['model_id'],
@@ -275,7 +275,8 @@ class AsyncMultiLoraGRPOPipeline:
                         enable_thinking=enable_thinking,
                         full_batches_only=False,
                     ),
-                    'sampling_params': SamplingParams(
+                    'sampling_params':
+                    SamplingParams(
                         max_tokens=int(eval_sampling.get('max_tokens', rollout['max_tokens'])),
                         temperature=float(eval_sampling.get('temperature', 0.0)),
                         top_p=float(eval_sampling.get('top_p', 1.0)),
@@ -328,13 +329,9 @@ class AsyncMultiLoraGRPOPipeline:
             context_manager=manager,
             rollout_max_retries=int(runtime.get('rollout_max_retries', 2)),
             rollout_retry_delay_s=float(runtime.get('rollout_retry_delay_s', 0.5)),
-            rollout_output_dir=(
-                rollout_output_config.get('output_dir')
-                if bool(rollout_output_config.get('enabled', False)) else None
-            ),
-            rollout_output_include_token_ids=bool(
-                rollout_output_config.get('include_token_ids', False)
-            ),
+            rollout_output_dir=(rollout_output_config.get('output_dir') if bool(
+                rollout_output_config.get('enabled', False)) else None),
+            rollout_output_include_token_ids=bool(rollout_output_config.get('include_token_ids', False)),
         )
         sampler.set_template(
             template_cls,
@@ -380,7 +377,8 @@ class AsyncMultiLoraGRPOPipeline:
             train_batch_configs=train_batch_configs,
             save_adapter=partial(_save_adapter, model, runtime['output_dir']),
             mini_batch_sizes={
-                key: config.mini_batch_size for key, config in train_batch_configs.items()
+                key: config.mini_batch_size
+                for key, config in train_batch_configs.items()
             },
             scheduler=_scheduler(raw_config['scheduler']['train']),
             keep_adapter_versions=runtime['keep_adapter_versions'],
@@ -406,8 +404,7 @@ class AsyncMultiLoraGRPOPipeline:
             sampler=sampler,
             metrics=metrics,
             config=AsyncMultiLoraGRPOConfig(
-                metrics_drain_interval_s=float(metrics_config.get('drain_interval_s', 1.0)),
-            ),
+                metrics_drain_interval_s=float(metrics_config.get('drain_interval_s', 1.0)), ),
             model=model,
             contexts=contexts,
         )
@@ -433,12 +430,13 @@ class AsyncMultiLoraGRPOPipeline:
                 await asyncio.sleep(self.config.metrics_drain_interval_s)
         except Exception as exc:
             if self.metrics is not None:
-                self.metrics.record(MetricRecord(
-                    stage='run',
-                    status='failed',
-                    values={'wall_time_s': time.perf_counter() - started},
-                    attributes={'error': f'{type(exc).__name__}: {exc}'},
-                ))
+                self.metrics.record(
+                    MetricRecord(
+                        stage='run',
+                        status='failed',
+                        values={'wall_time_s': time.perf_counter() - started},
+                        attributes={'error': f'{type(exc).__name__}: {exc}'},
+                    ))
                 self.metrics.flush()
             raise
         finally:
@@ -646,9 +644,8 @@ def _train_batch_with_config(
     old_logps = list(data['logprobs'])
     advantages = list(data['advantages'])
     if size != config.mini_batch_size:
-        raise ValueError(
-            f'train batch for {admission.context.key} has {size} samples; '
-            f'expected mini_batch_size={config.mini_batch_size}')
+        raise ValueError(f'train batch for {admission.context.key} has {size} samples; '
+                         f'expected mini_batch_size={config.mini_batch_size}')
 
     if size % model_data_parallel_size:
         raise ValueError(f'train batch size {size} must be divisible by model DP size '
@@ -688,9 +685,8 @@ def _save_adapter(model: Any, output_dir: str, admission: PartitionAdmission) ->
 def _require_adapter_path(value: Any, *, operation: str) -> str:
     """Fail at the save boundary instead of publishing an invalid policy."""
     if not isinstance(value, str) or not value:
-        raise TypeError(
-            f'{operation} must return a non-empty checkpoint path string, '
-            f'got {type(value).__name__}: {value!r}')
+        raise TypeError(f'{operation} must return a non-empty checkpoint path string, '
+                        f'got {type(value).__name__}: {value!r}')
     return value
 
 

@@ -130,9 +130,7 @@ class LoraContextManager:
 
     def context_adapter_paths(self, context: LoraContext | str) -> list[str]:
         return [
-            policy.adapter_path
-            for policy in self._state(context).policy_history
-            if policy.adapter_path is not None
+            policy.adapter_path for policy in self._state(context).policy_history if policy.adapter_path is not None
         ]
 
     def get_rollout_policy(self, context: LoraContext | str) -> RolloutPolicy:

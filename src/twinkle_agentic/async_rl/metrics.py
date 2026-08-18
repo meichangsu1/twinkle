@@ -15,11 +15,11 @@ def _p95(values: list[float]) -> float:
 
 
 def rollout_metrics(
-    *,
-    rewards: Mapping[str, Sequence[float]] | None = None,
-    completion_lengths: Sequence[int] = (),
-    stop_reasons: Sequence[str | None] = (),
-    rollout_latency_s: float | None = None,
+        *,
+        rewards: Mapping[str, Sequence[float]] | None = None,
+        completion_lengths: Sequence[int] = (),
+        stop_reasons: Sequence[str | None] = (),
+        rollout_latency_s: float | None = None,
 ) -> dict[str, float | int]:
     """Summarize one RL rollout collection without retaining state."""
     metrics: dict[str, float | int] = {}
@@ -28,12 +28,10 @@ def rollout_metrics(
         raise ValueError(f'reward metric lengths must match, got {reward_counts}')
     sample_count = len(completion_lengths) or (reward_counts[0] if reward_counts else 0)
     if completion_lengths and reward_counts and any(count != sample_count for count in reward_counts):
-        raise ValueError(
-            f'reward and completion metric lengths must match: {reward_counts} != {sample_count}')
+        raise ValueError(f'reward and completion metric lengths must match: {reward_counts} != {sample_count}')
     if stop_reasons and len(stop_reasons) != len(completion_lengths):
-        raise ValueError(
-            'stop reason and completion metric lengths must match: '
-            f'{len(stop_reasons)} != {len(completion_lengths)}')
+        raise ValueError('stop reason and completion metric lengths must match: '
+                         f'{len(stop_reasons)} != {len(completion_lengths)}')
     if sample_count:
         metrics['sample_count'] = sample_count
     if completion_lengths:
@@ -99,9 +97,8 @@ def advantage_signal_metrics(
     if len(rewards) != len(advantages):
         raise ValueError(f'rewards and advantages must have equal length: {len(rewards)} != {len(advantages)}')
     if len(rewards) == 0 or len(rewards) % num_generations:
-        raise ValueError(
-            f'advantage metrics require complete groups: sample_count={len(rewards)}, '
-            f'num_generations={num_generations}')
+        raise ValueError(f'advantage metrics require complete groups: sample_count={len(rewards)}, '
+                         f'num_generations={num_generations}')
 
     reward_values = [float(value) for value in rewards]
     advantage_values = [float(value) for value in advantages]
@@ -111,8 +108,7 @@ def advantage_signal_metrics(
         group_rewards = reward_values[start:start + num_generations]
         group_advantages = advantage_values[start:start + num_generations]
         reward_mean = sum(group_rewards) / num_generations
-        group_reward_stds.append(
-            math.sqrt(sum((value - reward_mean)**2 for value in group_rewards) / num_generations))
+        group_reward_stds.append(math.sqrt(sum((value - reward_mean)**2 for value in group_rewards) / num_generations))
         if max(abs(value) for value in group_advantages) <= zero_tolerance:
             zero_advantage_groups += 1
 
@@ -124,6 +120,6 @@ def advantage_signal_metrics(
         'zero_advantage_group_ratio': zero_advantage_groups / group_count,
         'positive_advantage_ratio': sum(value > zero_tolerance for value in advantage_values) / len(advantage_values),
         'advantage_mean': advantage_mean,
-        'advantage_std': math.sqrt(
-            sum((value - advantage_mean)**2 for value in advantage_values) / len(advantage_values)),
+        'advantage_std':
+        math.sqrt(sum((value - advantage_mean)**2 for value in advantage_values) / len(advantage_values)),
     }

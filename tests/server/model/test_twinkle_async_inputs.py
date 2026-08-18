@@ -5,14 +5,12 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 import twinkle_client.types as types
-from twinkle.server.model.twinkle_handlers import (
-    _model_result_rows,
-    _register_twinkle_routes,
-)
+from twinkle.server.model.twinkle_handlers import _register_twinkle_routes
+from twinkle.server.model.utils import model_result_rows
 
 
 def test_model_result_rows_keeps_one_output_row_per_sample() -> None:
-    assert _model_result_rows(
+    assert model_result_rows(
         {'logps': [[-1.0], [-2.0]], 'loss': 0.25},
         batch_size=2,
     ) == [
@@ -64,28 +62,6 @@ class _SchedulingManagement:
     async def schedule_task_and_wait(self, task, **kwargs):
         self.scheduled.append(kwargs)
         return await task()
-
-
-@pytest.mark.asyncio
-async def test_forward_backward_inline_route_keeps_original_request_shape() -> None:
-    management = _SchedulingManagement()
-    app = FastAPI()
-    _register_twinkle_routes(app, lambda: management)
-    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
-    request = Request({'type': 'http', 'headers': []})
-    request.state.session_id = 'session'
-    body = types.ForwardRequest(
-        adapter_name='adapter',
-        inputs=[{'input_ids': [1, 2, 3]}],
-        micro_batch_size=1,
-    )
-
-    await route.endpoint(request, body, management)
-
-    inputs, adapter_name, forwarded_kwargs = management.model_calls[-1]
-    assert adapter_name == 'session-adapter'
-    assert [row['input_ids'] for row in inputs] == [[1, 2, 3]]
-    assert forwarded_kwargs == {'micro_batch_size': 1}
 
 
 @pytest.mark.asyncio

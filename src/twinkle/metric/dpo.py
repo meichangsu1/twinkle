@@ -5,7 +5,6 @@ from typing import List, Union
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.utils import pad_and_stack_tensors
 from twinkle.utils.rl_tensor_utils import align_per_token_values
-
 from .base import Metric
 
 

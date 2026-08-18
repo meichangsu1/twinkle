@@ -5,7 +5,7 @@ import pytest
 
 from twinkle.loss import CrossEntropyLoss, GRPOLoss
 from twinkle.loss.base import Loss
-from twinkle.model.micro_batch import MicroBatchConfig, collect_micro_batch_outputs, plan_micro_batches
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.utils.nccl_safe import safe_loss
@@ -179,8 +179,6 @@ def test_transformers_forward_backward_executes_real_micro_batches():
     assert model.forward_batches == [[0, 1], [2, 3]]
     assert model.backward_calls == [(False, 1.0), (True, 1.0)]
     assert model.optimizer_group['adapter'].train_status.num_tokens == 1.0
-    assert outputs['micro_batch_count'] == 2
-    assert outputs['micro_batch_samples_mean'] == 2.0
 
 
 def test_fixed_micro_batch_plan_can_match_a_larger_dp_micro_batch_count():
@@ -229,7 +227,6 @@ def test_dp_micro_batch_planning_propagates_remote_rank_error(monkeypatch):
             OptimizerConfig(),
         )
 
-
 def test_dp_micro_batch_planning_rejects_common_count_on_all_ranks(monkeypatch):
     from twinkle.model.transformers import transformers as module
 
@@ -262,35 +259,3 @@ def test_dp_micro_batch_planning_rejects_common_count_on_all_ranks(monkeypatch):
             MicroBatchConfig(micro_batch_size=1),
             OptimizerConfig(),
         )
-
-
-def test_dp_collection_reduces_micro_batch_statistics():
-    class Mesh:
-        @staticmethod
-        def get_collect_ranks():
-            return [0, 1]
-
-    result = collect_micro_batch_outputs(
-        [
-            {
-                'micro_batch_count': 3,
-                'micro_batch_samples_mean': 2.0,
-                'micro_batch_tokens_mean': 100.0,
-                'micro_batch_tokens_max': 150,
-            },
-            {
-                'micro_batch_count': 3,
-                'micro_batch_samples_mean': 3.0,
-                'micro_batch_tokens_mean': 120.0,
-                'micro_batch_tokens_max': 180,
-            },
-        ],
-        Mesh(),
-    )
-
-    assert result == {
-        'micro_batch_count': 3,
-        'micro_batch_samples_mean': 2.5,
-        'micro_batch_tokens_mean': 110.0,
-        'micro_batch_tokens_max': 180,
-    }

@@ -33,8 +33,7 @@ from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import TwinkleModel
-from twinkle.model.micro_batch import (MicroBatchConfig, collect_micro_batch_outputs, plan_micro_batches,
-                                       select_batch)
+from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import AccelerateStrategy, NativeFSDPStrategy
@@ -738,8 +737,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         sync_gradients = kwargs.pop('sync_gradients', None)
         should_sync = (
             optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
-            if sync_gradients is None else bool(sync_gradients)
-        )
+            if sync_gradients is None else bool(sync_gradients))
 
         import contextlib
         no_sync_ctx = contextlib.nullcontext()
@@ -795,23 +793,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             states = [None] * dist.get_world_size(dp_group)
             dist.all_gather_object(states, local_state, group=dp_group)
             errors = [
-                f'rank {rank}: {state["error"]}'
-                for rank, state in enumerate(states)
-                if state['error'] is not None
+                f'rank {rank}: {state["error"]}' for rank, state in enumerate(states) if state['error'] is not None
             ]
             if errors:
-                raise RuntimeError(
-                    'micro-batch planning failed on one or more model DP ranks: '
-                    + '; '.join(errors))
+                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: ' + '; '.join(errors))
 
             counts = [state['micro_batch_count'] for state in states]
             if all(count == len(plan) for count in counts):
                 return plan
             min_micro_batches = max(counts)
             if any(min_micro_batches > state['input_count'] for state in states):
-                raise ValueError(
-                    'model DP ranks cannot execute the same number of non-empty micro-batches; '
-                    'make the input batch divisible by the model data-parallel size')
+                raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
+                                 'make the input batch divisible by the model data-parallel size')
 
     def _forward_backward_micro_batch(
         self,
@@ -831,10 +824,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         previous_normalizer = optimizer_config.train_status.num_tokens
         loss = self.calculate_loss(**kwargs)
         normalizer_delta = optimizer_config.train_status.num_tokens - previous_normalizer
-        optimizer_config.train_status.loss_value = (
-            optimizer_config.train_status.loss_value * loss_scale)
-        optimizer_config.train_status.num_tokens = (
-            previous_normalizer + normalizer_delta * loss_scale)
+        optimizer_config.train_status.loss_value = (optimizer_config.train_status.loss_value * loss_scale)
+        optimizer_config.train_status.num_tokens = (previous_normalizer + normalizer_delta * loss_scale)
         outputs['loss'] = loss * loss_scale
         self.backward(
             sync_gradients=sync_gradients,
@@ -864,17 +855,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             inputs = optimizer_config.template.batch_encode(inputs)
 
         local_batch_size = len(inputs)
-        processor: InputProcessor = optimizer_config.processor
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
         outputs = {}
-        micro_batch_samples = []
-        micro_batch_tokens = []
         loss_instance = optimizer_config.loss_instance
         for micro_batch_index, indices in enumerate(plan):
-            micro_kwargs = {
-                key: select_batch(value, indices, local_batch_size)
-                for key, value in kwargs.items()
-            }
+            micro_kwargs = {key: select_batch(value, indices, local_batch_size) for key, value in kwargs.items()}
             micro_loss_scale = loss_scale * loss_instance.micro_batch_scale(inputs, indices)
             is_last_micro_batch = micro_batch_index == len(plan) - 1
             outputs = self._forward_backward_micro_batch(
@@ -885,21 +870,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 increment_step=is_last_micro_batch,
                 **micro_kwargs,
             )
-            lengths = [
-                int(inputs[index]['input_ids'].shape[-1])
-                if hasattr(inputs[index]['input_ids'], 'shape') else len(inputs[index]['input_ids'])
-                for index in indices
-            ]
-            micro_batch_samples.append(len(indices))
-            micro_batch_tokens.append(
-                sum(lengths) if processor.padding_free else max(lengths) * len(lengths))
-        outputs['micro_batch_count'] = len(plan)
-        outputs['micro_batch_samples_mean'] = sum(micro_batch_samples) / len(plan)
-        outputs['micro_batch_tokens_mean'] = sum(micro_batch_tokens) / len(plan)
-        outputs['micro_batch_tokens_max'] = max(micro_batch_tokens)
         return outputs
 
-    @remote_function(dispatch='slice_dp', collect=collect_micro_batch_outputs)
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
         """Do forward, calculate loss, and backward.

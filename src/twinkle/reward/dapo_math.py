@@ -11,7 +11,6 @@ from twinkle.data_format import Trajectory, user_data_get
 from twinkle.reward.base import Reward
 from twinkle.reward.math_reward import MathReward
 
-
 _ANSWER_LINE = re.compile(r'^\s*Answer\s*:\s*(.+?)\s*$', re.IGNORECASE | re.MULTILINE)
 
 
@@ -102,10 +101,8 @@ class DAPOMathReward(Reward):
 
     def __call__(self, trajectories: list[Trajectory], **kwargs: Any) -> list[float]:
         accuracy_rewards, overlong_rewards = self.components(trajectories)
-        return [
-            (1.0 if accuracy else -1.0) + overlong
-            for accuracy, overlong in zip(accuracy_rewards, overlong_rewards)
-        ]
+        return [(1.0 if accuracy else -1.0) + overlong
+                for accuracy, overlong in zip(accuracy_rewards, overlong_rewards)]
 
     def metric_payload(
         self,

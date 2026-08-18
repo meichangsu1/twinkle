@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import FastAPI
+from typing import Any
 
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from .store import TQDataRefStore

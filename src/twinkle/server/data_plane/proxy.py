@@ -2,9 +2,8 @@
 """Internal HTTP adapter used by Model and Sampler component deployments."""
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
+from typing import Any
 
 from twinkle_client.http.headers import build_routing_headers
 from twinkle_client.types.component import DataRef
@@ -30,7 +29,10 @@ class DataPlaneProxy:
             raise RuntimeError('data_plane_url is required when a component request uses input_ref')
         response = await self.client.post(
             f'{self.base_url}/twinkle/get',
-            json={'ref': ref.model_dump(), 'fields': fields},
+            json={
+                'ref': ref.model_dump(),
+                'fields': fields
+            },
             headers=build_routing_headers(f'data-ref-{ref.ref_id}'),
         )
         response.raise_for_status()
@@ -47,7 +49,11 @@ class DataPlaneProxy:
             raise RuntimeError('data_plane_url is required to store component output')
         response = await self.client.post(
             f'{self.base_url}/twinkle/put',
-            json={'rows': rows, 'kind': kind, 'tags': tags},
+            json={
+                'rows': rows,
+                'kind': kind,
+                'tags': tags
+            },
             headers=build_routing_headers(f'data-put-{kind}'),
         )
         response.raise_for_status()

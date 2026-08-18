@@ -189,12 +189,7 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
 
         def forward_backward(self, **kwargs):
             self.calls.append(kwargs)
-            return lambda: {
-                'micro_batch_count': 4,
-                'micro_batch_samples_mean': 1.0,
-                'micro_batch_tokens_mean': 1.0,
-                'micro_batch_tokens_max': 1,
-            }
+            return lambda: {}
 
         def clip_grad_and_step(self, **_kwargs):
             self.optimizer_steps += 1
@@ -229,7 +224,6 @@ def test_train_batch_accumulates_real_micro_batches_before_one_optimizer_step():
     assert model.calls[0]['loss_scale'] == 1.0
     assert model.optimizer_steps == 1
     assert metrics['micro_batch_size_per_rank'] == 1
-    assert 'micro_batch_count' not in metrics
 
 
 def test_dynamic_micro_batch_planner_honors_per_rank_sample_and_token_limits():
@@ -869,7 +863,7 @@ def test_rollout_worker_retains_prefetched_batch_until_admission_succeeds():
             self.submitted = asyncio.Event()
             self.loop = loop
 
-        def sample(self, _groups, _sampling_params, _allow_partial_rollout):
+        def submit_prompt_groups(self, _groups, _sampling_params, _allow_partial_rollout):
             self.loop.call_soon_threadsafe(self.submitted.set)
 
     loaded_batches = []

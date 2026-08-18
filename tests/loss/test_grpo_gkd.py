@@ -101,10 +101,6 @@ class TestGRPOLoss:
 
         assert result['loss'].item() == pytest.approx(-2.0)
 
-    def test_grpo_does_not_accept_normalization(self):
-        with pytest.raises(TypeError, match='normalization'):
-            GRPOLoss(normalization='token_mean')
-
     def test_grpo_entropy_coef(self):
         loss_fn = GRPOLoss(epsilon=0.2, entropy_coef=0.01)
         inputs, outputs, old_logps, _, advantages = _make_rl_batch()

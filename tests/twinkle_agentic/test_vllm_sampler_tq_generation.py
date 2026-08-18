@@ -18,7 +18,7 @@ def _bare_sampler() -> VLLMSamplerTQ:
 
 def test_generation_dispatch_allows_one_prompt_with_multiple_dp_workers() -> None:
     assert VLLMSamplerTQ.submit_generation._dispatch is _dispatch_generation
-    assert VLLMSamplerTQ.sample._dispatch == 'slice_dp'
+    assert VLLMSamplerTQ.submit_prompt_groups._dispatch == 'slice_dp'
     shards = [
         _dispatch_generation(
             3,
@@ -129,7 +129,7 @@ def test_native_prompt_group_sampling_requires_context_manager() -> None:
     sampler.context_manager = None
 
     with pytest.raises(RuntimeError, match='context_manager is required'):
-        sampler.sample([], SamplingParams(max_tokens=4))
+        sampler.submit_prompt_groups([], SamplingParams(max_tokens=4))
 
 
 def test_server_waiter_admits_later_submission_before_first_finishes() -> None:

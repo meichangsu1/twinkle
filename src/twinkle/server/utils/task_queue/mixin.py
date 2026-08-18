@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 from twinkle.server.telemetry.middleware import get_task_metrics
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
-
 from .config import TaskQueueConfig
 from .rate_limiter import RateLimiter
 from .types import QueuedTask, QueueState, TaskStatus

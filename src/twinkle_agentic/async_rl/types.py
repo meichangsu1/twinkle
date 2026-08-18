@@ -71,6 +71,7 @@ class PromptGroup:
     def num_samples(self) -> int:
         return self.partition.num_generations
 
+
 @dataclass
 class PreparedPartition:
     """Partition prepared in TQ and ready for sampler submission."""

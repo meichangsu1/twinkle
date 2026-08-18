@@ -163,8 +163,7 @@ class ResourceManager:
                     probe_options['num_gpus'] = nproc_per_node
                 else:
                     probe_options['resources'] = {device_type: nproc_per_node}
-                visible_device_futures.append(
-                    get_visible_devices.options(**probe_options).remote())
+                visible_device_futures.append(get_visible_devices.options(**probe_options).remote())
             self.visible_devices = ray.get(visible_device_futures)
 
         visible_devices = []

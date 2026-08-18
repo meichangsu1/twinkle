@@ -48,8 +48,7 @@ def align_per_token_values(
                 if row.ndim == 2 and row.shape[0] == 1:
                     row = row.squeeze(0)
                 if row.ndim != 1:
-                    raise ValueError(
-                        f'{name}[{index}] must be one-dimensional, got shape {tuple(row.shape)}')
+                    raise ValueError(f'{name}[{index}] must be one-dimensional, got shape {tuple(row.shape)}')
                 rows.append(row)
             row_lengths = [row.numel() for row in rows]
             tensor = torch.nn.utils.rnn.pad_sequence(
@@ -66,30 +65,26 @@ def align_per_token_values(
     target_batch_size, target_seq_len = target_shape
     batch_size, seq_len = tensor.shape
     if batch_size != target_batch_size:
-        raise ValueError(
-            f'{name} batch size ({batch_size}) does not match target batch size '
-            f'({target_batch_size})')
+        raise ValueError(f'{name} batch size ({batch_size}) does not match target batch size '
+                         f'({target_batch_size})')
     mask = None
     if valid_mask is not None:
         mask = torch.as_tensor(valid_mask, dtype=torch.bool)
         if tuple(mask.shape) != target_shape:
-            raise ValueError(
-                f'valid_mask shape {tuple(mask.shape)} does not match target shape '
-                f'{target_shape}')
+            raise ValueError(f'valid_mask shape {tuple(mask.shape)} does not match target shape '
+                             f'{target_shape}')
 
     if row_lengths is not None:
         for index, row_len in enumerate(row_lengths):
             if row_len >= target_seq_len:
                 continue
             if mask is None or bool(mask[index, row_len:].any().item()):
-                raise ValueError(
-                    f'{name}[{index}] has {row_len} tokens but target sequence length '
-                    f'is {target_seq_len}')
+                raise ValueError(f'{name}[{index}] has {row_len} tokens but target sequence length '
+                                 f'is {target_seq_len}')
     if seq_len < target_seq_len:
         if mask is None or bool(mask[:, seq_len:].any().item()):
-            raise ValueError(
-                f'{name} seq_len ({seq_len}) is smaller than target seq_len '
-                f'({target_seq_len})')
+            raise ValueError(f'{name} seq_len ({seq_len}) is smaller than target seq_len '
+                             f'({target_seq_len})')
         tensor = torch.nn.functional.pad(
             tensor,
             (0, target_seq_len - seq_len),

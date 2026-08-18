@@ -177,13 +177,14 @@ class TQDataPlane:
                 'generation_idx': generation_idx,
                 'rollout_status': 'PENDING',
             } for generation_idx in range(admission.num_generations)])
-            groups.append(PromptGroup(
-                context=admission.context,
-                partition=admission,
-                group_id=group_id,
-                prompt=dict(prompt),
-                batch_meta=batch_meta,
-            ))
+            groups.append(
+                PromptGroup(
+                    context=admission.context,
+                    partition=admission,
+                    group_id=group_id,
+                    prompt=dict(prompt),
+                    batch_meta=batch_meta,
+                ))
         return PreparedPartition(admission, tuple(groups), sampling_params)
 
     async def complete_rollout_group(

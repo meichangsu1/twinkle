@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from twinkle.data_format import SampleResponse
-
 from .types import RolloutOutput
 
 
@@ -84,9 +83,8 @@ def resolve_model_attention_implementation(
     if implementation is not None:
         implementation = str(implementation)
     if padding_free and sequence_parallel_size > 1 and implementation != 'flash_attention_2':
-        raise ValueError(
-            'model.attn_implementation must be flash_attention_2 when '
-            'model.padding_free=true and model.sequence_parallel_size>1')
+        raise ValueError('model.attn_implementation must be flash_attention_2 when '
+                         'model.padding_free=true and model.sequence_parallel_size>1')
     return implementation
 
 
@@ -123,13 +121,11 @@ def validate_context_batch_config(
                          f'({sampler_dp}), got {rollout_groups}')
     partition_samples = rollout_groups * num_generations
     if partition_samples % train.mini_batch_size:
-        raise ValueError(
-            f'partition for {context_key} has {partition_samples} samples and must be divisible by '
-            f'train.mini_batch_size={train.mini_batch_size}')
+        raise ValueError(f'partition for {context_key} has {partition_samples} samples and must be divisible by '
+                         f'train.mini_batch_size={train.mini_batch_size}')
     if train.mini_batch_size % num_generations:
-        raise ValueError(
-            f'train.mini_batch_size for {context_key} must preserve complete prompt groups: '
-            f'{train.mini_batch_size} % {num_generations} != 0')
+        raise ValueError(f'train.mini_batch_size for {context_key} must preserve complete prompt groups: '
+                         f'{train.mini_batch_size} % {num_generations} != 0')
     if train.mini_batch_size % model_dp:
         raise ValueError(f'train.mini_batch_size for {context_key} must be divisible by '
                          f'model DP size {model_dp}')
@@ -139,13 +135,11 @@ def validate_context_batch_config(
                          f'({samples_per_rank}), got {train.micro_batch_size}')
     if train.dynamic_batching:
         if train.max_tokens_per_micro_batch is None or train.max_tokens_per_micro_batch <= 0:
-            raise ValueError(
-                f'train.max_tokens_per_micro_batch for {context_key} must be positive when '
-                'train.dynamic_batching=true')
+            raise ValueError(f'train.max_tokens_per_micro_batch for {context_key} must be positive when '
+                             'train.dynamic_batching=true')
     if train.packing_algorithm not in ('ffd', 'kk'):
-        raise ValueError(
-            f'train.packing_algorithm for {context_key} must be ffd or kk, '
-            f'got {train.packing_algorithm!r}')
+        raise ValueError(f'train.packing_algorithm for {context_key} must be ffd or kk, '
+                         f'got {train.packing_algorithm!r}')
 
 
 def configure_lora_lr_scheduler(
@@ -195,9 +189,8 @@ def resolve_context_lora_target_modules(
         modules = list(target_modules)
         if all(isinstance(module, str) and module for module in modules):
             return modules
-    raise ValueError(
-        'lora.target_modules must be a non-empty string or sequence of module names, '
-        f'got {target_modules!r}')
+    raise ValueError('lora.target_modules must be a non-empty string or sequence of module names, '
+                     f'got {target_modules!r}')
 
 
 def resolve_context_loss_config(

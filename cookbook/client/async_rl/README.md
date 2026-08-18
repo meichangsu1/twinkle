@@ -49,9 +49,6 @@ remain server-side. The Trainer passes one or more `DataRef` values to
 `forward_backward_from_data_plane()` and releases them in a local `finally` block. `asample()`
 remains the materialized-response convenience API.
 
-- `ClientMultiTurnRollout.arun()` keeps tool calls and Reward computation in
-  the client and accepts an explicit `adapter_uri` policy snapshot.
-
 `_RolloutPartition` is a private client record, not a server resource or SDK
 API. The local FIFO limits live DataLoader batches before rollout, ready prompt
 groups immediately use the Model primitives above, and the client calls

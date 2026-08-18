@@ -100,10 +100,7 @@ class _SummaryReducer:
             if record.policy_version is not None:
                 previous_version = self.context_policy_versions.get(record.context_key)
                 self.context_policy_versions[record.context_key] = (
-                    record.policy_version
-                    if previous_version is None
-                    else max(previous_version, record.policy_version)
-                )
+                    record.policy_version if previous_version is None else max(previous_version, record.policy_version))
             sample_count = _finite_number(record.values.get('sample_count'))
             if sample_count is not None and record.status == 'completed':
                 if record.stage == 'rollout' and record.attributes.get('scope', 'group') == 'group':
@@ -113,11 +110,7 @@ class _SummaryReducer:
                     self.context_trained_samples[record.context_key] += int(sample_count)
         summarize_values = (
             record.status == 'completed'
-            and (
-                record.stage != 'rollout'
-                or record.attributes.get('scope', 'group') == 'group'
-            )
-        )
+            and (record.stage != 'rollout' or record.attributes.get('scope', 'group') == 'group'))
         if summarize_values:
             for name, value in record.values.items():
                 number = _finite_number(value)
@@ -133,23 +126,14 @@ class _SummaryReducer:
             wall_time = time.time() - self.started_at
         rollout_groups = sum(self.context_rollout_groups.values())
         train_steps = sum(counts['train:completed'] for counts in self.context_counts.values())
-        trained_partitions = sum(
-            counts['partition:completed']
-            for counts in self.context_counts.values()
-        )
+        trained_partitions = sum(counts['partition:completed'] for counts in self.context_counts.values())
         terminal_partitions = _finite_number(self.result.get('trained_partitions'))
         if terminal_partitions is not None:
             trained_partitions = int(terminal_partitions)
         rollout_samples = sum(self.context_rollout_samples.values())
         trained_samples = sum(self.context_trained_samples.values())
-        dropped_records = sum(
-            int(item.get('dropped_records', 0))
-            for item in backend_health.values()
-        )
-        backend_write_latency_s = sum(
-            float(item.get('write_latency_s', 0.0))
-            for item in backend_health.values()
-        )
+        dropped_records = sum(int(item.get('dropped_records', 0)) for item in backend_health.values())
+        backend_write_latency_s = sum(float(item.get('write_latency_s', 0.0)) for item in backend_health.values())
         contexts = {}
         for context_key, counts in self.context_counts.items():
             contexts[context_key] = {
@@ -286,22 +270,12 @@ class _QueuedBackend:
                         batch = []
                         break
                     elapsed = time.monotonic() - last_write
-                    should_write = bool(self._queue) and (
-                        self._closing
-                        or self._flush_requested
-                        or len(self._queue) >= self.batch_size
-                        or elapsed >= self.flush_interval_s
-                    )
+                    should_write = bool(self._queue) and (self._closing or self._flush_requested or len(self._queue)
+                                                          >= self.batch_size or elapsed >= self.flush_interval_s)
                     if should_write:
-                        batch = [
-                            self._queue.popleft()
-                            for _ in range(min(len(self._queue), self.batch_size))
-                        ]
+                        batch = [self._queue.popleft() for _ in range(min(len(self._queue), self.batch_size))]
                         break
-                    wait_s = (
-                        max(0.0, self.flush_interval_s - elapsed)
-                        if self._queue else self.flush_interval_s
-                    )
+                    wait_s = (max(0.0, self.flush_interval_s - elapsed) if self._queue else self.flush_interval_s)
                     self._condition.wait(wait_s)
                 if not batch:
                     break
@@ -358,10 +332,7 @@ class _JSONLBackend(_QueuedBackend):
         super().__init__('jsonl', **kwargs)
 
     def _write_batch(self, batch: Sequence[dict[str, Any]]) -> None:
-        self._stream.writelines(
-            json.dumps(payload, ensure_ascii=True, default=str) + '\n'
-            for payload in batch
-        )
+        self._stream.writelines(json.dumps(payload, ensure_ascii=True, default=str) + '\n' for payload in batch)
         self._stream.flush()
 
     def _close_sink(self) -> None:
@@ -392,10 +363,7 @@ class _SwanLabBackend(_QueuedBackend):
 
     def _write_batch(self, batch: Sequence[dict[str, Any]]) -> None:
         for payload in batch:
-            prefix = (
-                f'context/{_safe_name(payload["context_key"])}'
-                if payload.get('context_key') else 'global'
-            )
+            prefix = (f'context/{_safe_name(payload["context_key"])}' if payload.get('context_key') else 'global')
             stage = _safe_name(payload['stage'])
             values = {}
             for name, value in payload['values'].items():
@@ -474,10 +442,7 @@ class MetricsReporter:
         self._write_summary()
 
     def health(self) -> dict[str, Any]:
-        backend_health = {
-            backend.name: backend.health()
-            for backend in self._backends
-        }
+        backend_health = {backend.name: backend.health() for backend in self._backends}
         for name, error in self._initial_errors.items():
             backend_health[name] = {
                 'enabled': False,
@@ -487,10 +452,7 @@ class MetricsReporter:
             }
         return {
             'record_count': self._sequence,
-            'dropped_records': sum(
-                int(item.get('dropped_records', 0))
-                for item in backend_health.values()
-            ),
+            'dropped_records': sum(int(item.get('dropped_records', 0)) for item in backend_health.values()),
             'backends': backend_health,
         }
 
@@ -567,15 +529,16 @@ def create_metrics_reporter(config: Mapping[str, Any] | None, *, run_id: str) ->
             logger.warning('JSONL metrics backend could not start: %s', exc)
     if bool(swanlab_config.get('enabled', False)) and swanlab_config.get('mode') != 'disabled':
         try:
-            backends.append(_SwanLabBackend(
-                project=str(swanlab_config.get('project', 'twinkle-rl')),
-                experiment_name=str(swanlab_config.get('name', run_id)),
-                log_dir=swanlab_config.get('log_dir', 'outputs/swanlab'),
-                mode=str(swanlab_config.get('mode', 'local')),
-                queue_capacity=queue_capacity,
-                batch_size=int(swanlab_config.get('batch_size', 16)),
-                flush_interval_s=float(swanlab_config.get('flush_interval_s', 1.0)),
-            ))
+            backends.append(
+                _SwanLabBackend(
+                    project=str(swanlab_config.get('project', 'twinkle-rl')),
+                    experiment_name=str(swanlab_config.get('name', run_id)),
+                    log_dir=swanlab_config.get('log_dir', 'outputs/swanlab'),
+                    mode=str(swanlab_config.get('mode', 'local')),
+                    queue_capacity=queue_capacity,
+                    batch_size=int(swanlab_config.get('batch_size', 16)),
+                    flush_interval_s=float(swanlab_config.get('flush_interval_s', 1.0)),
+                ))
         except Exception as exc:
             backend_errors['swanlab'] = exc
             logger.warning('SwanLab metrics backend could not start: %s', exc)

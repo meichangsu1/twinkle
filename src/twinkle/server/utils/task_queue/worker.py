@@ -18,7 +18,6 @@ from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.task_errors import task_error_payload
 from twinkle.utils.logger import get_logger
-
 from .config import TaskQueueConfig
 from .types import QueuedTask, QueueState, TaskStatus
 

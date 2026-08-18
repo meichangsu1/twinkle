@@ -8,9 +8,8 @@ must not be used to drive the hot path.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Sequence
-
 from transfer_queue import GRPOGroupNSampler
+from typing import Any, Protocol, Sequence
 
 
 class AsyncTQClient(Protocol):

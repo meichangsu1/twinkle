@@ -32,6 +32,7 @@ class GRPOLoss(Loss):
         beta: float = 0.0,
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
+        **kwargs,
     ):
         self.epsilon = epsilon
         self.epsilon_high = epsilon_high if epsilon_high is not None else epsilon
@@ -399,6 +400,7 @@ class CISPOLoss(GRPOLoss):
 
     Clamps the IS weight and uses policy gradient.
     """
+
     def micro_batch_scale(self, inputs, indices):
         token_counts = []
         for model_input in inputs:
@@ -442,6 +444,7 @@ class BNPOLoss(GRPOLoss):
 
     Normalizes by total completion tokens across batch.
     """
+
     def micro_batch_scale(self, inputs, indices):
         token_counts = []
         for model_input in inputs:

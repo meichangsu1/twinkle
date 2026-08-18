@@ -27,8 +27,8 @@ from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.validation import get_session_id_from_request
-from twinkle_client.common.json_utils import json_safe
 from twinkle.utils.logger import get_logger
+from twinkle_client.common.json_utils import json_safe
 
 logger = get_logger()
 
@@ -59,7 +59,7 @@ def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None
     return owner_id + '-' + adapter_name
 
 
-def _sample_models_to_rows(
+def _build_rollout_rows_and_tags(
     sample_models: list[types.SampleResponseModel],
     *,
     group_ids: list[str] | None,
@@ -69,16 +69,14 @@ def _sample_models_to_rows(
     """Flatten sampler output to one TQ row per generated sequence."""
     resolved_group_ids = group_ids or [uuid.uuid4().hex for _ in sample_models]
     if len(resolved_group_ids) != len(sample_models):
-        raise ValueError(
-            f'group_ids contains {len(resolved_group_ids)} values for '
-            f'{len(sample_models)} sampler inputs')
+        raise ValueError(f'group_ids contains {len(resolved_group_ids)} values for '
+                         f'{len(sample_models)} sampler inputs')
     rows = []
     tags = []
     for prompt_index, (response, group_id) in enumerate(zip(sample_models, resolved_group_ids)):
         for generation_idx, sequence in enumerate(response.sequences):
             sampled_logprobs = [
-                0.0 if not position else float(position[0][1])
-                for position in (sequence.logprobs or [])
+                0.0 if not position else float(position[0][1]) for position in (sequence.logprobs or [])
             ]
             rows.append({
                 'train_input': sequence.new_input_feature,
@@ -101,7 +99,7 @@ def _sample_models_to_rows(
     return rows, tags
 
 
-def _responses_to_models(responses) -> list[types.SampleResponseModel]:
+def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
     """Convert internal sampler responses to the HTTP response schema."""
     sample_models = []
     for response in responses:
@@ -111,12 +109,9 @@ def _responses_to_models(responses) -> list[types.SampleResponseModel]:
                 tokens=list(sequence.tokens),
                 logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
                 decoded=sequence.decoded,
-                new_input_feature=(
-                    _serialize_input_feature(sequence.new_input_feature)
-                    if sequence.new_input_feature is not None else None
-                ),
-            )
-            for sequence in response.sequences
+                new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
+                                   if sequence.new_input_feature is not None else None),
+            ) for sequence in response.sequences
         ]
         sample_models.append(
             types.SampleResponseModel(
@@ -142,8 +137,7 @@ async def _await_generation(
         poll_interval = 0.01
         while True:
             try:
-                states = _submission_states(
-                    await asyncio.to_thread(sampler.get_generation_status, submission_id))
+                states = _submission_states(await asyncio.to_thread(sampler.get_generation_status, submission_id))
             except Exception as error:
                 # A pending read-only actor call can be cancelled by Ray while
                 # the generation submitted just above remains alive.  Treating
@@ -260,14 +254,13 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 params = SamplingParams.from_dict(body.sampling_params)
 
             # Sample
-            sample_fn = getattr(self.sampler, 'sample_sync', self.sampler.sample)
-            responses = sample_fn(
+            responses = self.sampler.sample(
                 inputs,
                 params,
                 adapter_name=full_adapter_name,
                 adapter_path=adapter_path,
             )
-            return types.SampleResponseModelList(samples=_responses_to_models(responses))
+            return types.SampleResponseModelList(samples=_to_sample_response_models(responses))
 
         # Calculate metrics for queue scheduling
         inputs_list = body.inputs if isinstance(body.inputs, list) else [body.inputs]
@@ -300,10 +293,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
 
-        inputs = (
-            await self.data_plane.get(body.input_ref)
-            if body.input_ref is not None else body.inputs
-        )
+        inputs = (await self.data_plane.get(body.input_ref) if body.input_ref is not None else body.inputs)
         if isinstance(inputs, list) and inputs:
             first = inputs[0]
             if isinstance(first, dict) and 'input_ids' in first:
@@ -331,10 +321,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         inline_inputs = body.inputs if isinstance(body.inputs, list) else [body.inputs]
         input_tokens = (
-            body.input_ref.num_tokens
-            if body.input_ref is not None else
-            sum(len(item.get('input_ids', [])) for item in inline_inputs if isinstance(item, dict))
-        )
+            body.input_ref.num_tokens if body.input_ref is not None else sum(
+                len(item.get('input_ids', [])) for item in inline_inputs if isinstance(item, dict)))
         await run_task(
             self.schedule_task_and_wait(
                 _admit,
@@ -345,8 +333,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             ))
 
         responses = await _await_generation(self.sampler, submission_id)
-        rows, tags = _sample_models_to_rows(
-            _responses_to_models(responses),
+        rows, tags = _build_rollout_rows_and_tags(
+            _to_sample_response_models(responses),
             group_ids=body.group_ids,
             policy_version=body.policy_version,
             adapter_uri=body.adapter_uri,

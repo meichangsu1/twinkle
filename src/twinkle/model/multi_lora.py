@@ -707,8 +707,7 @@ class MultiLora:
                 _load_weights(_module)
         else:
             _load_weights(self.module)
-        if getattr(_lora.tenant_config, 'target_parameters', None):
-            self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
+        self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
 
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
@@ -733,9 +732,7 @@ class MultiLora:
                 state_dict.update(_get_weights(_module))
         else:
             state_dict = _get_weights(self.module)
-        target_state_dict = {}
-        if getattr(_lora.tenant_config, 'target_parameters', None):
-            target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
+        target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
         overlap = state_dict.keys() & target_state_dict.keys()
         if overlap:
             raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
@@ -851,9 +848,6 @@ class MultiLora:
         return trainable_param_names
 
     def get_target_parameter_trainable_parameters(self, tenant_adapter_name):
-        lora = self.find_lora_by_tenant(tenant_adapter_name)
-        if not getattr(lora.tenant_config, 'target_parameters', None):
-            return {}
         return {
             name: parameter
             for name, parameter in self.target_parameter_manager.named_slot_parameters(tenant_adapter_name)

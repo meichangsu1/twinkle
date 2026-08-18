@@ -8,7 +8,7 @@ import twinkle_client.types as types
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.server.sampler.twinkle_handlers import (
     _register_twinkle_sampler_routes,
-    _sample_models_to_rows,
+    _build_rollout_rows_and_tags,
 )
 
 
@@ -28,7 +28,7 @@ def _response(tokens: list[int]) -> types.SampleResponseModel:
 
 
 def test_async_sampler_flattens_generations_to_tagged_tq_rows() -> None:
-    rows, tags = _sample_models_to_rows(
+    rows, tags = _build_rollout_rows_and_tags(
         [_response([10, 11]), _response([20, 21])],
         group_ids=['group-a', 'group-b'],
         policy_version=7,
@@ -51,7 +51,7 @@ def test_async_sampler_flattens_generations_to_tagged_tq_rows() -> None:
 
 def test_async_sampler_rejects_group_id_count_mismatch() -> None:
     with pytest.raises(ValueError, match='group_ids contains 1 values for 2'):
-        _sample_models_to_rows(
+        _build_rollout_rows_and_tags(
             [_response([10]), _response([20])],
             group_ids=['only-one'],
             policy_version=0,

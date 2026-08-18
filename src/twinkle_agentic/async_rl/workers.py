@@ -67,17 +67,18 @@ class _Worker:
         optimizer_step: int | None = None,
         policy_version: int | None = None,
     ) -> None:
-        self.metric_buffer.record(MetricRecord(
-            stage=stage,
-            values=dict(values or {}),
-            context_key=context.key if context is not None else None,
-            partition_id=admission.partition_id if admission is not None else partition_id,
-            partition_index=admission.step if admission is not None else None,
-            optimizer_step=optimizer_step,
-            policy_version=policy_version,
-            status=status,
-            attributes=dict(attributes or {}),
-        ))
+        self.metric_buffer.record(
+            MetricRecord(
+                stage=stage,
+                values=dict(values or {}),
+                context_key=context.key if context is not None else None,
+                partition_id=admission.partition_id if admission is not None else partition_id,
+                partition_index=admission.step if admission is not None else None,
+                optimizer_step=optimizer_step,
+                policy_version=policy_version,
+                status=status,
+                attributes=dict(attributes or {}),
+            ))
 
     async def _run_service(self) -> None:
         try:
@@ -237,7 +238,7 @@ class RolloutWorker(_Worker):
                     config['sampling_params'],
                 )
                 await asyncio.to_thread(
-                    self.sampler.sample,
+                    self.sampler.submit_prompt_groups,
                     list(prepared.groups),
                     prepared.sampling_params,
                     self.allow_partial_rollout,
@@ -360,10 +361,10 @@ class TrainerWorker(_Worker):
                  initial_adapter_paths: dict[str, str] | None = None,
                  remove_adapter: Callable[[str], None] | None = None,
                  evaluation_config: dict[str, dict[str, Any]] | None = None,
-                 evaluate_batch: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any],
-                                          dict[str, Any]] | None = None,
-                 evaluate_with_reward_fn: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any,
-                                                    Any], dict[str, Any]] | None = None,
+                 evaluate_batch: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any], dict[str, Any]]
+                 | None = None,
+                 evaluate_with_reward_fn: Callable[[Sequence[dict[str, Any]], PartitionAdmission, str, int, Any, Any],
+                                                   dict[str, Any]] | None = None,
                  evaluation_rewards: dict[str, Any] | None = None,
                  persistent: bool = False,
                  idle_delay_s: float = 0.05):
@@ -498,8 +499,7 @@ class TrainerWorker(_Worker):
                     raise RuntimeError(f'training failed for {admission.partition_id}: {exc}') from exc
                 self.scheduler.on_success(candidate)
                 metrics['sample_count'] = sample_count
-                metrics['reward'] = (
-                    sum(float(value) for value in batch.data['rewards']) / sample_count)
+                metrics['reward'] = (sum(float(value) for value in batch.data['rewards']) / sample_count)
                 metrics['train_latency_s'] = time.perf_counter() - started
                 metrics.update(training_policy_metrics(batch.sample_tags, policy.version))
                 context_key = admission.context.key
@@ -534,7 +534,10 @@ class TrainerWorker(_Worker):
                 'adapter_save_latency_s': adapter_save_latency_s,
                 'policy_publish_latency_s': policy_publish_latency_s,
             },
-            attributes={'operation': 'publish', 'adapter_path': adapter_path},
+            attributes={
+                'operation': 'publish',
+                'adapter_path': adapter_path
+            },
             optimizer_step=self._optimizer_steps[admission.context.key],
             policy_version=policy.version,
         )
@@ -648,7 +651,11 @@ class TrainerWorker(_Worker):
                 values={
                     'adapter_prune_latency_s': time.perf_counter() - started,
                 },
-                attributes={'operation': 'adapter_prune', 'adapter_path': path, 'error': str(exc)},
+                attributes={
+                    'operation': 'adapter_prune',
+                    'adapter_path': path,
+                    'error': str(exc)
+                },
             )
             return
         self._record_metric(
@@ -657,7 +664,10 @@ class TrainerWorker(_Worker):
             values={
                 'adapter_prune_latency_s': time.perf_counter() - started,
             },
-            attributes={'operation': 'adapter_prune', 'adapter_path': path},
+            attributes={
+                'operation': 'adapter_prune',
+                'adapter_path': path
+            },
         )
 
 

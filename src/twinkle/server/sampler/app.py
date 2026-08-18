@@ -8,10 +8,9 @@ both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
-
 from fastapi import FastAPI, Request
 from ray import serve
+from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app, init_twinkle_runtime
@@ -21,7 +20,6 @@ from twinkle.server.utils.backend_dispatch import BackendSelector
 from twinkle.server.utils.task_queue import TaskQueueConfig, TaskQueueMixin
 from twinkle.server.utils.validation import get_token_from_request
 from twinkle.utils.logger import get_logger
-
 from .tinker_handlers import _register_tinker_sampler_routes
 from .twinkle_handlers import _register_twinkle_sampler_routes
 

@@ -34,10 +34,7 @@ def _rows_from_tensordict(data: Any, size: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     fields = list(data.keys())
     for index in range(size):
-        rows.append({
-            field: json_safe(data[field][index])
-            for field in fields
-        })
+        rows.append({field: json_safe(data[field][index]) for field in fields})
     return rows
 
 
