@@ -48,6 +48,9 @@ class _SchedulingManagement:
     def assert_resource_exists(self, _adapter_name):
         return None
 
+    def resolve_model_adapter_name(self, adapter_name):
+        return adapter_name
+
     def forward_backward(self, *, inputs, adapter_name, **kwargs):
         self.model_calls.append((inputs, adapter_name, kwargs))
         return {'loss': 1.0}

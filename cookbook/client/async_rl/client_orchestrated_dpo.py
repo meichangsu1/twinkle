@@ -13,7 +13,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import EmojiDPOProcessor
 from twinkle_client import DataPlaneClient, init_twinkle_client
 from twinkle_client.async_rl import Worker, WorkerPipeline
-from twinkle_client.common.serialize import json_safe
+from twinkle_client.common.json_utils import json_safe
 from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.types import DataRef
 

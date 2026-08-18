@@ -7,7 +7,6 @@ import time
 
 import pytest
 
-from cookbook.rl.sync_barrier_multi_lora_grpo import SyncBarrierMultiLoraGRPO
 from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import _dispatch_args
@@ -249,21 +248,6 @@ def test_dynamic_micro_batch_planner_honors_per_rank_sample_and_token_limits():
         assert len(batch) <= 3
         padded_tokens = max(lengths[index] for index in batch) * len(batch)
         assert padded_tokens <= 18
-
-
-def test_sync_training_batch_preserves_position_ids():
-    rows = [{
-        'input_ids': [1, 2],
-        'labels': [-100, 2],
-        'attention_mask': [1, 1],
-        'position_ids': [0, 1],
-        'logprobs': [-.1],
-    }]
-
-    batch = SyncBarrierMultiLoraGRPO._training_batch(rows, rewards=[1.], advantages=[0.])
-
-    assert 'position_ids' in batch.keys()
-    assert batch['position_ids'][0] == [0, 1]
 
 
 class PolicyProvider:

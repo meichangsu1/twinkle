@@ -432,6 +432,7 @@ class TestFutureManager:
         assert result.queue_state == 'paused_rate_limit'
         assert result.queue_state_reason == 'Rate limit hit'
 
+
 # ============================================================
 # Cascade Cleanup Consistency (merged from test_cleanup_cascade_consistency)
 # ============================================================

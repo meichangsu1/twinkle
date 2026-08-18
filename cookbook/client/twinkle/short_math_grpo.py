@@ -82,12 +82,6 @@ class GSM8KBrevityReward(Reward):
 # ========== Configuration ==========
 BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
 MODEL_ID = f'ms://{BASE_MODEL}'
-TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
-TEMPLATE_CLS = os.environ.get(
-    'TWINKLE_TEMPLATE_CLS',
-    'Qwen3_5Template' if ('Qwen3.5' in BASE_MODEL or 'Qwen3.6' in BASE_MODEL) else 'Template',
-)
-DATASET_ID = os.environ.get('TWINKLE_DATASET_ID', 'ms://modelscope/gsm8k')
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 2e-5
@@ -107,8 +101,8 @@ SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minim
                  'and put your final answer within \\boxed{}.')
 
 def create_gsm8k_dataset():
-    dataset = Dataset(DatasetMeta(DATASET_ID, subset_name='main', split='train', data_slice=range(DATA_NUM)))
-    dataset.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID, max_length=2048, enable_thinking=False)
+    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
+    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
@@ -185,11 +179,11 @@ def train():
 
     # Set processor and template for encoding inputs
     model.set_processor('InputProcessor')
-    model.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 4: Configure the sampler
     sampler = vLLMSampler(model_id=MODEL_ID)
-    sampler.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
 
     # Step 5: Setup metrics and advantage function
     advantage_fn = GRPOAdvantage()
