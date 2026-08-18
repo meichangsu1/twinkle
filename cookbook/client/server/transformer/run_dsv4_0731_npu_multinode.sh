@@ -25,7 +25,7 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
 CONFIG_PATH="$SCRIPT_DIR/server_config_dsv4_0731_npu_multinode.yaml"
-MODEL_ID="hf://deepseek-ai/DeepSeek-V4-Flash-0731"
+export DSV4_MODEL_ID="${DSV4_MODEL_ID:-hf://deepseek-ai/DeepSeek-V4-Flash-0731}"
 DATASET_PATH="${DATASET_ID:-/model/ljl/dataset/self-cognition.jsonl}"
 
 NPU_PER_NODE=16
@@ -69,13 +69,13 @@ fi
 test -f "$CONFIG_PATH"
 test -f "$DATASET_PATH"
 
-if [[ "$MODEL_ID" == hf://* || "$MODEL_ID" == ms://* ]]; then
-    echo "Model will be downloaded through the configured Hub backend: $MODEL_ID"
-elif [[ -d "$MODEL_ID" ]]; then
-    test -f "$MODEL_ID/config.json"
-    test -f "$MODEL_ID/tokenizer.json"
+if [[ "$DSV4_MODEL_ID" == hf://* || "$DSV4_MODEL_ID" == ms://* ]]; then
+    echo "Model will be downloaded through the configured Hub backend: $DSV4_MODEL_ID"
+elif [[ -d "$DSV4_MODEL_ID" ]]; then
+    test -f "$DSV4_MODEL_ID/config.json"
+    test -f "$DSV4_MODEL_ID/tokenizer.json"
 else
-    echo "Invalid MODEL_ID: use an existing local directory or an explicit hf:// or ms:// ID." >&2
+    echo "Invalid DSV4_MODEL_ID: use an existing local directory or an explicit hf:// or ms:// ID." >&2
     exit 1
 fi
 

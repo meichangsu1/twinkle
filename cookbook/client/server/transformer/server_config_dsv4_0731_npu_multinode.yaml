@@ -51,7 +51,8 @@ applications:
       backend: transformers
       # Twinkle treats an unprefixed ID as ModelScope. Keep the hf:// prefix
       # here to select Hugging Face explicitly.
-      model_id: hf://deepseek-ai/DeepSeek-V4-Flash-0731
+      # Resolved from the launch environment on the head node.
+      model_id: ${oc.env:DSV4_MODEL_ID,hf://deepseek-ai/DeepSeek-V4-Flash-0731}
       nproc_per_node: 16
       max_loras: 2
       max_r: 8
