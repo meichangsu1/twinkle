@@ -28,7 +28,7 @@ applications:
     import_path: server
     args:
       server_config:
-        per_token_model_limit: 2
+        per_token_model_limit: 1
       supported_models:
         - deepseek-v4-0731-local
     deployments:
@@ -54,9 +54,9 @@ applications:
       # Resolved from the launch environment on the head node.
       model_id: ${oc.env:DSV4_MODEL_ID,hf://deepseek-ai/DeepSeek-V4-Flash-0731}
       nproc_per_node: 16
-      max_loras: 2
+      max_loras: 1
       max_r: 8
-      max_length: 2048
+      max_length: 8192
       mixed_precision: bf16
       strategy: native_fsdp
       memory_efficient_init: true
@@ -80,7 +80,7 @@ applications:
       queue_config:
         rps_limit: 20
         tps_limit: 100000
-        max_input_tokens: 4096
+        max_input_tokens: 8192
         queue_timeout: 7200
         execution_timeout: 7200
       adapter_config:

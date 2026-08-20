@@ -20,16 +20,26 @@ export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 export TWINKLE_SERVER_URL="${TWINKLE_SERVER_URL:-http://$HEAD_IP:8000}"
 export TWINKLE_SERVER_TOKEN="${TWINKLE_SERVER_TOKEN:-EMPTY_TOKEN}"
 export TWINKLE_MODEL_ID="${TWINKLE_MODEL_ID:-deepseek-v4-0731-local}"
+export ADAPTER_NAMES="${ADAPTER_NAMES:-tenant_a}"
 # The template/encoding side must resolve the same checkpoint as the server.
 export DSV4_MODEL_ID="${DSV4_MODEL_ID:-hf://deepseek-ai/DeepSeek-V4-Flash-0731}"
-export DATASET_ID="${DATASET_ID:-/model/ljl/dataset/self-cognition.jsonl}"
+: "${DATASET_ID:?Set DATASET_ID to a local GSM8K JSON/JSONL file or directory}"
+if [[ "$DATASET_ID" == hf://* || "$DATASET_ID" == ms://* ]]; then
+    echo "DATASET_ID must be local for this recipe, got: $DATASET_ID" >&2
+    exit 1
+fi
+test -e "$DATASET_ID"
+export DATASET_ID
+export DATASET_SUBSET="${DATASET_SUBSET:-default}"
+export DATASET_SPLIT="${DATASET_SPLIT:-train}"
 export OUTPUT_DIR
 
 # forward_backward dispatches one slice to each of the 32 FSDP ranks.
 export BATCH_SIZE="${BATCH_SIZE:-32}"
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
 export MAX_STEPS="${MAX_STEPS:-10}"
-export MAX_LENGTH="${MAX_LENGTH:-2048}"
+export MAX_LENGTH="${MAX_LENGTH:-8192}"
+export TRUNCATION_STRATEGY="${TRUNCATION_STRATEGY:-delete}"
 export LORA_R="${LORA_R:-8}"
 export LORA_ALPHA="${LORA_ALPHA:-32}"
 
