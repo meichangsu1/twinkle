@@ -34,6 +34,7 @@ from twinkle_agentic.async_rl.utils import (
     resolve_context_loss_config,
     resolve_model_attention_implementation,
     resolve_sequence_parallel_size,
+    sample_responses_to_rollout_rows,
     sampler_data_parallel_size,
     validate_context_batch_config,
 )
@@ -298,6 +299,39 @@ def _sample_response(tokens, stop_reason, input_ids):
             )
         ],
     )
+
+
+def test_evaluation_rows_do_not_require_rollout_group_metadata():
+    prompt = {'input_ids': [1, 2], 'labels': [-100, -100]}
+
+    rows = sample_responses_to_rollout_rows(
+        [prompt],
+        [_sample_response([3], 'stop', [1, 2, 3])],
+        policy_version=10,
+    )
+
+    assert len(rows) == 1
+    assert 'group_id' not in rows[0]
+    assert 'generation_idx' not in rows[0]
+    assert rows[0]['rollout_policy_version'] == 10
+
+
+def test_training_rows_preserve_rollout_group_metadata():
+    source = {
+        'input_ids': [1, 2],
+        'labels': [-100, -100],
+        'group_id': 'partition/group_0',
+        'generation_idx': 2,
+    }
+
+    rows = sample_responses_to_rollout_rows(
+        [source],
+        [_sample_response([3], 'stop', [1, 2, 3])],
+        policy_version=4,
+    )
+
+    assert rows[0]['group_id'] == 'partition/group_0'
+    assert rows[0]['generation_idx'] == 2
 
 
 def test_sampler_data_parallel_size_is_derived_from_gpu_and_tp_sizes():

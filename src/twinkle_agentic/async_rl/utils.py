@@ -37,8 +37,6 @@ def sample_responses_to_rollout_rows(
         for sequence in response.sequences:
             row = dict(source)
             row.update(sequence.new_input_feature or {})
-            row.setdefault('group_id', source['group_id'])
-            row.setdefault('generation_idx', source['generation_idx'])
             row['logprobs'] = _extract_sampled_token_logps(sequence.logprobs)
             row['stop_reason'] = sequence.stop_reason
             row['completion_length'] = len(sequence.tokens)
