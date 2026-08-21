@@ -141,10 +141,9 @@ class TargetParameterLoraWrapper(nn.Module):
                 local_parameter.copy_(value.to(device=local_parameter.device, dtype=local_parameter.dtype))
                 return
             if tuple(value.shape) != tuple(parameter.shape):
-                raise ValueError(
-                    f'Cannot restore target-parameter LoRA with shape {tuple(value.shape)} to distributed '
-                    f'parameter with global shape {tuple(parameter.shape)} and local shape '
-                    f'{tuple(local_parameter.shape)}')
+                raise ValueError(f'Cannot restore target-parameter LoRA with shape {tuple(value.shape)} to distributed '
+                                 f'parameter with global shape {tuple(parameter.shape)} and local shape '
+                                 f'{tuple(local_parameter.shape)}')
             from torch.distributed.tensor import distribute_tensor
             distributed = distribute_tensor(
                 value.to(device=parameter.device, dtype=parameter.dtype),
@@ -159,16 +158,14 @@ class TargetParameterLoraWrapper(nn.Module):
         for slot_name, parameter in self.lora_A.items():
             tensor = self._read_parameter(parameter)
             if tensor.is_meta:
-                raise RuntimeError(
-                    f'Target-parameter LoRA slot {self.record.key}.{slot_name} is still on meta; '
-                    'materialize the model before saving its initial weights.')
+                raise RuntimeError(f'Target-parameter LoRA slot {self.record.key}.{slot_name} is still on meta; '
+                                   'materialize the model before saving its initial weights.')
             self._initial_lora_A[slot_name] = tensor.detach().cpu().clone()
 
     def reset_slot(self, slot_name: str) -> None:
         if self.lora_A[slot_name].is_meta or self.lora_B[slot_name].is_meta:
-            raise RuntimeError(
-                f'Target-parameter LoRA slot {self.record.key}.{slot_name} is still on meta; '
-                'materialize the model before resetting it.')
+            raise RuntimeError(f'Target-parameter LoRA slot {self.record.key}.{slot_name} is still on meta; '
+                               'materialize the model before resetting it.')
         with torch.no_grad():
             if slot_name not in self._initial_lora_A:
                 nn.init.kaiming_uniform_(self.lora_A[slot_name], a=math.sqrt(5))

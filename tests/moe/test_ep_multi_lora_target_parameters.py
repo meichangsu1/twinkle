@@ -29,6 +29,50 @@ def test_ep_target_parameter_lora_gather_dim_matches_peft_flattening():
         "model.layers.0.mlp.experts._twinkle_lora_gate_up_proj.lora_B.lora_0.weight") == 0
 
 
+def test_ep_3d_expert_lora_gathers_both_factors_on_expert_dim():
+    _ensure_dummy_zmq()
+    from twinkle.model.transformers.strategy.native_fsdp import (
+        _concat_ep_expert_shards,
+        _ep_expert_state_dict_gather_dim,
+    )
+
+    name = "model.layers.0.mlp.experts.base_layer.lora_B.lora_0.weight"
+    assert _ep_expert_state_dict_gather_dim(name, (8, 4096, 8), 8) == 0
+
+    shards = [torch.full((8, 2, 1), rank) for rank in range(4)]
+    full = _concat_ep_expert_shards(name, shards, {"experts_per_rank": 8, "num_experts": 32})
+    assert full.shape == (32, 2, 1)
+    assert torch.equal(full[:, 0, 0], torch.arange(4).repeat_interleave(8))
+
+
+def test_ep_3d_expert_lora_load_splits_lora_b_on_expert_dim():
+    _ensure_dummy_zmq()
+    from twinkle.model.transformers.strategy.native_fsdp import _split_for_ep_pre_distribute
+
+    class _Box(nn.Module):
+        pass
+
+    model = _Box()
+    model.base_model = _Box()
+    model.base_model.model = _Box()
+    model.base_model.model.model = _Box()
+    model.base_model.model.model.layers = nn.ModuleList([_Box()])
+    mlp = _Box()
+    model.base_model.model.model.layers[0].mlp = mlp
+    mlp._ep_patched = True
+    mlp.experts = _Box()
+    mlp.experts.base_layer = _Box()
+    mlp.experts.base_layer.lora_B = _Box()
+    mlp.experts.base_layer.lora_B.lora_0 = _Box()
+
+    key = 'base_model.model.model.layers.0.mlp.experts.base_layer.lora_B.lora_0.weight'
+    full = torch.arange(32).reshape(32, 1, 1).expand(32, 2, 1)
+    local = _split_for_ep_pre_distribute(model, key, full, ep_world_size=4, ep_rank=2)
+
+    assert local.shape == (8, 2, 1)
+    assert torch.equal(local[:, 0, 0], torch.arange(16, 24))
+
+
 class _FakeTensorExperts(nn.Module):
 
     def __init__(self, *, device="cpu", dtype=torch.float32):

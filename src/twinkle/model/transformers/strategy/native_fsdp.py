@@ -351,16 +351,16 @@ class NativeFSDPStrategy:
             ep_group = ep_fsdp_mesh['ep'].get_group()
             ep_world_size = ep_fsdp_mesh['ep'].size()
 
-        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        expert_specs = _collect_ep_expert_shard_specs(unwrapped) if ep_world_size > 1 else {}
 
         for name, param in unwrapped.named_parameters():
             local_full = torch_util.to_local_tensor(param)
 
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+            if name in expert_specs and ep_world_size > 1 and ep_group is not None:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
+                local_full = _concat_ep_expert_shards(name, gathered, expert_specs[name])
                 state_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
@@ -399,7 +399,7 @@ class NativeFSDPStrategy:
             ep_group = ep_fsdp_mesh['ep'].get_group()
             ep_world_size = ep_fsdp_mesh['ep'].size()
 
-        ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
+        expert_specs = _collect_ep_expert_shard_specs(unwrapped) if ep_world_size > 1 else {}
         adapter_suffix = f'.{adapter_name}.'
 
         for name, param in unwrapped.named_parameters():
@@ -407,17 +407,52 @@ class NativeFSDPStrategy:
                 continue
 
             local_full = torch_util.to_local_tensor(param)
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
+            if name in expert_specs and ep_world_size > 1 and ep_group is not None:
                 local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
+                local_full = _concat_ep_expert_shards(name, gathered, expert_specs[name])
                 state_dict[name] = local_full.cpu()
                 del gathered, local_full
             else:
                 state_dict[name] = local_full.cpu()
                 del local_full
 
+        return state_dict
+
+    def gather_adapter_state_dict(self, model, adapter_state: dict, adapter_name: str) -> dict:
+        """Gather a tenant-filtered Multi-LoRA state dict across the EP group."""
+        unwrapped = self.unwrap_model(model)
+        ep_mesh = self.ep_fsdp_device_mesh
+        if ep_mesh is None or ep_mesh['ep'].size() <= 1:
+            return {name: torch_util.to_local_tensor(param).cpu() for name, param in adapter_state.items()}
+
+        ep_group = ep_mesh['ep'].get_group()
+        slot_suffix = f'.{adapter_name}.'
+        normalized_specs = {
+            _strip_peft_base_prefix(name.replace(slot_suffix, '.')): spec
+            for name, spec in _collect_ep_expert_shard_specs(unwrapped).items()
+        }
+        expert_owner_specs = {
+            name.split('.experts.', 1)[0] + '.experts.': spec
+            for name, spec in normalized_specs.items() if '.experts.' in name
+        }
+        state_dict = {}
+        for name, param in adapter_state.items():
+            local = torch_util.to_local_tensor(param)
+            canonical_name = _strip_peft_base_prefix(name)
+            spec = normalized_specs.get(canonical_name)
+            if spec is None and '.experts.' in canonical_name:
+                owner = canonical_name.split('.experts.', 1)[0] + '.experts.'
+                spec = expert_owner_specs.get(owner)
+            if spec is not None:
+                local = local.contiguous().to(Platform.get_local_device())
+                gathered = [torch.empty_like(local) for _ in range(ep_mesh['ep'].size())]
+                dist.all_gather(gathered, local, group=ep_group)
+                local = _concat_ep_expert_shards(name, gathered, spec)
+                del gathered
+            state_dict[name] = local.cpu()
+            del local
         return state_dict
 
 
@@ -436,17 +471,38 @@ def _detect_ep_expert_names(model: nn.Module) -> Set[str]:
     return candidate_names & actual_param_names
 
 
-def _ep_expert_state_dict_gather_dim(name: str) -> int:
+def _ep_expert_state_dict_gather_dim(
+    name: str,
+    shape: Optional[tuple] = None,
+    experts_per_rank: Optional[int] = None,
+) -> int:
     # PEFT ParamWrapper keeps expert LoRA tensors flattened instead of storing
     # them as [num_experts, ...]: lora_A is [r * num_experts, in] and lora_B is
     # [out, r * num_experts]. EP therefore owns a contiguous expert block on
     # dim 0 for A and dim 1 for B. This is still expert sharding, not LoRA rank
     # parallelism, so the forward pass does not need an EP all-reduce.
+    # Current target-parameter/3D PEFT tensors keep experts explicitly on dim 0:
+    # A=[local_experts, r, in], B=[local_experts, out, r]. Detect this before
+    # applying the legacy flattened-PEFT convention below.
+    if shape and len(shape) == 3:
+        return 0
     if '_twinkle_lora_' in name:
         return 0
     if 'lora_B' in name:
         return 1
     return 0
+
+
+def _concat_ep_expert_shards(name: str, shards: List[torch.Tensor], spec: Dict[str, int]) -> torch.Tensor:
+    if not shards:
+        raise ValueError(f'No EP shards collected for {name}.')
+    local_shape = tuple(shards[0].shape)
+    gather_dim = _ep_expert_state_dict_gather_dim(name, local_shape, spec['experts_per_rank'])
+    result = torch.cat(shards, dim=gather_dim)
+    if local_shape[0] == spec['experts_per_rank'] and result.shape[0] != spec['num_experts']:
+        raise RuntimeError(f"EP adapter parameter '{name}' reconstructed {result.shape[0]} experts; "
+                           f"expected {spec['num_experts']}.")
+    return result
 
 
 def _build_mp_policy(mixed_precision: str) -> 'MixedPrecisionPolicy':
@@ -621,13 +677,11 @@ def _get_local_rank_info() -> tuple[int, int, int, List[int]]:
     local_rank = _get_node_local_rank()
     has_twinkle_topology = TWINKLE_NODE_LOCAL_WORLD_SIZE in os.environ
     if not has_twinkle_topology and 'LOCAL_WORLD_SIZE' not in os.environ and 'LOCAL_SIZE' not in os.environ:
-        raise RuntimeError(
-            'Native FSDP node-local state loading requires Twinkle Ray worker topology, '
-            'LOCAL_WORLD_SIZE, or LOCAL_SIZE.')
+        raise RuntimeError('Native FSDP node-local state loading requires Twinkle Ray worker topology, '
+                           'LOCAL_WORLD_SIZE, or LOCAL_SIZE.')
     local_world_size = _get_node_local_world_size()
     raw_node_ranks = os.environ.get(TWINKLE_NODE_RANKS)
-    if (local_rank < 0 or local_world_size <= 0
-            or (not raw_node_ranks and world_size % local_world_size != 0)):
+    if (local_rank < 0 or local_world_size <= 0 or (not raw_node_ranks and world_size % local_world_size != 0)):
         raise RuntimeError(f'Invalid local rank topology: rank={rank}, world_size={world_size}, '
                            f'local_rank={local_rank}, local_world_size={local_world_size}.')
     if raw_node_ranks:
@@ -839,7 +893,7 @@ def _split_for_ep_pre_distribute(model, model_key: str, value: torch.Tensor, ep_
 
     if not matched:
         return value
-    shard_dim = _ep_expert_state_dict_gather_dim(model_key)
+    shard_dim = _ep_expert_state_dict_gather_dim(model_key, tuple(value.shape))
     chunk = value.size(shard_dim) // ep_world_size
     return value.narrow(shard_dim, ep_rank * chunk, chunk).contiguous()
 
@@ -991,7 +1045,9 @@ def _broadcast_sharded_state_dict(
         local_shape = tuple(sharded_param.size())
         _, source_dtype = adapter_metadata[param_name]
         local_tensor = torch.empty(local_shape, device=device_type, dtype=source_dtype)
-        shard_dim = _ep_expert_state_dict_gather_dim(param_name)
+        spec = expert_shard_specs.get(param_name)
+        experts_per_rank = spec['experts_per_rank'] if spec is not None else None
+        shard_dim = _ep_expert_state_dict_gather_dim(param_name, local_shape, experts_per_rank)
         local_dim = local_shape[shard_dim]
         local_tensor = _scatter_ep_tensor_from_source(
             full_tensor,

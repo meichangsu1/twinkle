@@ -293,8 +293,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
+        slot_name = self.multi_adapter.find_lora_by_tenant(adapter_name).adapter_name
         adapter_state = self.multi_adapter.get_state_dict(adapter_name)
-        return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
+        return self.strategy.gather_adapter_state_dict(self.model, adapter_state, slot_name)
 
     @remote_function(collect='first')
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
