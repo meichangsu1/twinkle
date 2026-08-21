@@ -1,5 +1,5 @@
-# Asynchronous comparison run. It is intentionally identical to the strict
-# baseline except for max_staleness, run_id, and output paths.
+# Asynchronous comparison run. It uses the Worker/TQ pipeline with up to three
+# live partitions and otherwise matches the synchronous barrier baseline.
 runtime:
   run_id: compare_single_lora_gsm8k_async
   model_id: ${oc.env:MODEL_ID,/nas/disk1/Qwen3-4B}
@@ -70,7 +70,7 @@ scheduler:
   train: {policy: sticky, max_consecutive_units: null}
 
 evaluation:
-  enabled: true
+  enabled: false
   interval: 10
   batch_size: 16
   sampling_params:

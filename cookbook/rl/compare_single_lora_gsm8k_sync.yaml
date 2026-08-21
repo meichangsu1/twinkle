@@ -1,7 +1,6 @@
-# Strict on-policy baseline for comparison with compare_single_lora_gsm8k_async.yaml.
-# max_staleness=0 permits only one live rollout partition. The workers may still
-# pipeline groups inside that partition, but no rollout partition can cross a
-# policy-version boundary.
+# Fully synchronous barrier baseline for comparison with
+# compare_single_lora_gsm8k_async.yaml. Run this file with
+# sync_barrier_multi_lora_grpo.py, not async_multi_lora_grpo.py.
 runtime:
   run_id: compare_single_lora_gsm8k_sync
   model_id: ${oc.env:MODEL_ID,/nas/disk1/Qwen3-4B}
@@ -11,7 +10,6 @@ runtime:
   sampler_tp: 1
   sampler_max_loras: 1
   seed: 1
-  max_staleness: 0
   max_steps: 125
   allow_partial_rollout: false
   rollout_max_retries: 2
@@ -72,7 +70,7 @@ scheduler:
   train: {policy: sticky, max_consecutive_units: null}
 
 evaluation:
-  enabled: true
+  enabled: false
   interval: 10
   batch_size: 16
   sampling_params:
