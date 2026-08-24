@@ -121,8 +121,8 @@ lora_contexts:
       temperature: 1.0
       top_p: 1.0
     train:
-      mini_batch_size: 64
-      micro_batch_size: 64
+      mini_batch_size: 16
+      micro_batch_size: 16
       dynamic_batching: true
       max_tokens_per_micro_batch: 4096
       packing_algorithm: ffd
