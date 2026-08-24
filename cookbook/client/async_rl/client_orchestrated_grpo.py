@@ -403,7 +403,7 @@ async def train() -> None:
         )
         model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
         model.set_optimizer('AdamW', lr=2e-5)
-        model.set_processor('InputProcessor', padding_free=True)
+        model.set_processor('InputProcessor', padding_free=False)
         model.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
         sampler.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID)
 
