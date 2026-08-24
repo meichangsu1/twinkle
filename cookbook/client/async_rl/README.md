@@ -1,72 +1,156 @@
-# Client-orchestrated asynchronous RL
+# Client-Orchestrated Async GRPO
 
-This directory demonstrates direct orchestration of the server's Model,
-Sampler, and TransferQueue DataPlane components.
+The client owns the Dataset, Reward, Advantage, rollout partitions, staleness,
+training schedule, and policy publication. The server exposes shared
+Multi-LoRA Model, vLLM Sampler, and TransferQueue DataPlane components without
+owning the GRPO loop.
 
-The client owns its Dataset, multi-turn rollout, Reward, Advantage, policy
-versioning, staleness, and algorithm. There is no central async-RL management,
-runtime, tenant submission API, or server-side RL worker involved.
+This example deploys a dedicated Qwen3.5-4B GRPO server. It does not combine
+different RL algorithms in one deployment. For the YAML-managed multi-tenant
+runtime, see [`cookbook/rl`](../../rl/README.md).
 
-- client_orchestrated_grpo.py maps each DataLoader batch to a private client-side
-  rollout partition. Its Rollout, Advantage, and Trainer workers run as
-  independent asyncio tasks. Prompt groups stream through TQ independently, so
-  ready groups can train while the remaining groups are still sampling. A
-  policy is published once, after the whole partition has trained.
-- client_orchestrated_dpo.py uses Dataset, Reference, and Trainer workers. It is
-  a runnable offline DPO loop and shows that Worker is a role lifecycle rather
-  than a fixed RL stage graph.
+## Resources
 
-Start the component server with
-cookbook/client/server/transformer/server_config.yaml.
+The server configuration uses two GPUs:
+
+| Component | GPUs | Purpose |
+|---|---:|---|
+| Multi-LoRA Model | 1 | GRPO forward, backward, optimizer step, and checkpoint save |
+| Async vLLM Sampler | 1 | Shared continuous-batched rollout generation |
+
+The DataPlane keeps token tensors and sampled log-probabilities server-side.
+The client reads decoded completions for Reward and Advantage, appends those
+values to the same `DataRef`, and sends only references to the Model.
+
+## Quick start
+
+Install the server, client, and async-RL dependencies:
 
 ```bash
-pip install -e '.[async-rl,client]'
-twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml
+pip install -e '.[async-rl,client,server]'
 ```
 
-Then start one or more independent client orchestrators:
+Terminal 1 — start the dedicated component server:
 
 ```bash
+export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
+export CUDA_VISIBLE_DEVICES=0,1
+bash cookbook/client/async_rl/run_server.sh
+```
+
+The server script starts a local Ray cluster when needed, validates
+`server_config.yaml`, and launches Ray Serve on port 8000.
+
+Terminal 2 — start one GRPO client:
+
+```bash
+export TWINKLE_SERVER_URL=http://127.0.0.1:8000
+export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
+export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
+export TWINKLE_DATASET_ID=/absolute/path/to/gsm8k
 python cookbook/client/async_rl/client_orchestrated_grpo.py
 ```
 
-The training loop composes only the low-level component methods:
+`TWINKLE_TEMPLATE_MODEL_ID` is the tokenizer/template model path used in the
+client process. The template class is fixed to `Qwen3_5Template`; a model ID
+such as `Qwen/Qwen3.5-4B` is not a template class name.
 
-- `sampler.sample_to_data_plane(...)` / `sampler.asample_to_data_plane(...)`
-- `model.forward_only_from_data_plane(...)`
-- `model.forward_backward_from_data_plane(...)`
-- `model.clip_grad_and_step(...)`
-- `model.save(...)`
-- `data_plane.put/get/append/release(...)` and
-  `aput/aget/aget_batch/aappend/arelease(...)`
+## Execution model
 
-There is no additional RL runtime or orchestration protocol. The GRPO example
-uses `asample_to_data_plane()` so the Sampler's output `DataRef` remains in TQ. Each
-generation is one row tagged with its group, generation index, rollout policy,
-and status. The Advantage worker reads only decoded completions and appends
-reward and advantage to the same keys. Token tensors and sampled log-probabilities
-remain server-side. The Trainer passes one or more `DataRef` values to
-`forward_backward_from_data_plane()` and releases them in a local `finally` block. `asample()`
-remains the materialized-response convenience API.
+Each DataLoader batch becomes a private client-side `_RolloutPartition` bound
+to one immutable adapter checkpoint:
 
-`_RolloutPartition` is a private client record, not a server resource or SDK
-API. The local FIFO limits live DataLoader batches before rollout, ready prompt
-groups immediately use the Model primitives above, and the client calls
-`save()` once after a whole batch has trained. `WorkerPipeline` only
-starts, joins, and fail-fast cancels concrete roles; queues and algorithm state
-remain ordinary client Python code.
-
-Different client processes may run GRPO and DPO against the same component
-server. Model adapters are session-scoped. DataRefs are opaque capabilities
-whose UUID identifies an independent physical TQ partition; DataPlane storage
-does not know about tokens or sessions. The client remains the single writer
-and algorithm owner for its adapter. Async Sampler requests share vLLM
-continuous batching; this example does not promise strict round-robin fairness
-between sampler tenants.
-
-The original YAML-managed runtime is still separate and can be started with:
-
-```bash
-python cookbook/rl/async_multi_lora_grpo.py \
-  --config cookbook/rl/async_multi_lora_grpo.yaml
+```text
+DataLoader
+    -> Rollout Worker
+    -> async vLLM Sampler
+    -> DataPlane DataRef
+    -> Advantage Worker
+    -> Trainer Worker
+    -> save and publish policy
 ```
+
+The workers are independent asyncio tasks:
+
+- Prompt groups are submitted separately through
+  `sampler.asample_to_data_plane()`.
+- A complete group is rewarded and made trainable without waiting for the rest
+  of its partition.
+- The Trainer consumes `TRAIN_MINI_BATCH_SIZE / NUM_GENERATIONS` ready groups
+  at a time.
+- Partitions train and publish in FIFO order.
+- A policy version advances only after every group in its partition has
+  trained and the new checkpoint has been saved.
+
+`MAX_STALENESS` controls the number of live partitions. Setting it to zero
+still permits rollout/training overlap inside one partition; values above zero
+also permit cross-partition overlap.
+
+## Training metrics
+
+After every `clip_grad_and_step()`, the Trainer calls:
+
+```python
+model.calculate_metric(is_training=True)
+```
+
+and prints the returned metrics to client stdout:
+
+```text
+optimizer_step=1 grad_norm=0.42 learning_rate=2e-05 loss=0.031
+```
+
+Partition publication is logged separately:
+
+```text
+partition=0 policy=1 optimizer_step=8 staleness=0
+```
+
+## Client settings
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `TWINKLE_SERVER_URL` | `http://localhost:8000` | Server base URL |
+| `TWINKLE_SERVER_TOKEN` | `EMPTY_TOKEN` | Request authentication token |
+| `TWINKLE_TEMPLATE_MODEL_ID` | `ms://Qwen/Qwen3.5-4B` | Client tokenizer/template source |
+| `TWINKLE_DATASET_ID` | `ms://modelscope/gsm8k` | GSM8K dataset source |
+| `TWINKLE_ADAPTER_NAME` | `client-grpo` | LoRA adapter name |
+| `TWINKLE_MAX_PARTITIONS` | `100` | Maximum DataLoader batches admitted |
+| `TWINKLE_MAX_STALENESS` | `2` | Maximum extra live partitions |
+| `TWINKLE_ROLLOUT_CONCURRENCY` | `8` | Concurrent prompt-group submissions |
+| `TWINKLE_NUM_GENERATIONS` | `4` | Generations per prompt group |
+| `TWINKLE_BATCH_SIZE` | `8` | Prompt groups per partition |
+| `TWINKLE_TRAIN_MINI_BATCH_SIZE` | `8` | Samples per optimizer step |
+| `TWINKLE_MICRO_BATCH_SIZE` | `4` | Model micro-batch size |
+| `TWINKLE_MAX_TOKENS_PER_MICRO_BATCH` | `4096` | Dynamic batching token limit |
+
+The following must hold:
+
+```text
+TWINKLE_TRAIN_MINI_BATCH_SIZE % TWINKLE_NUM_GENERATIONS == 0
+TWINKLE_BATCH_SIZE % (
+    TWINKLE_TRAIN_MINI_BATCH_SIZE / TWINKLE_NUM_GENERATIONS
+) == 0
+```
+
+## Files
+
+| File | Role |
+|---|---|
+| `client_orchestrated_grpo.py` | Client-side async GRPO orchestration |
+| `run_server.sh` | Start Ray and the dedicated component server |
+| `server_config.yaml` | Qwen3.5-4B Model, Sampler, DataPlane, Gateway, and Processor deployment |
+
+## Troubleshooting
+
+- **Client receives HTTP 404 for the model** — use the provided server config;
+  its public route is fixed to `Qwen/Qwen3.5-4B`, matching the client.
+- **The process tries to access ModelScope while offline** — set both
+  `TWINKLE_LOCAL_MODEL_PATH` on the server and
+  `TWINKLE_TEMPLATE_MODEL_ID`/`TWINKLE_DATASET_ID` on the client to local
+  paths.
+- **No loss is printed** — confirm the Model request completed and look for an
+  `optimizer_step=...` line. Metrics are calculated after every optimizer
+  step, not after each rollout group.
+- **Only one GPU is active** — verify Ray sees two GPUs and that Model and
+  Sampler placement groups were assigned to different devices.

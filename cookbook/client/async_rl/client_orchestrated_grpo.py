@@ -21,13 +21,11 @@ from twinkle_client.common.json_utils import json_safe
 from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.sampler import vLLMSampler
 
-BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+BASE_MODEL = 'Qwen/Qwen3.5-4B'
 MODEL_ID = f'ms://{BASE_MODEL}'
 TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
-TEMPLATE_CLS = os.environ.get(
-    'TWINKLE_TEMPLATE_CLS',
-    'Qwen3_5Template' if ('Qwen3.5' in BASE_MODEL or 'Qwen3.6' in BASE_MODEL) else 'Template',
-)
+TEMPLATE_CLS = 'Qwen3_5Template'
+DATASET_ID = os.environ.get('TWINKLE_DATASET_ID', 'ms://modelscope/gsm8k')
 ADAPTER_NAME = os.environ.get('TWINKLE_ADAPTER_NAME', 'client-grpo')
 MAX_PARTITIONS = int(os.environ.get('TWINKLE_MAX_PARTITIONS', '100'))
 MAX_STALENESS = int(os.environ.get('TWINKLE_MAX_STALENESS', '2'))
@@ -121,7 +119,7 @@ class _GRPOState:
 
 
 def create_dataset() -> Dataset:
-    dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
+    dataset = Dataset(DatasetMeta(DATASET_ID, subset_name='main', split='train'))
     dataset.set_template(TEMPLATE_CLS, model_id=TEMPLATE_MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))
     dataset.encode(add_generation_prompt=True)
@@ -319,6 +317,14 @@ class _TrainerWorker(Worker):
             )
             await _submit(self.model.clip_grad_and_step, max_grad_norm=1.0)
             self.optimizer_step += 1
+            metric_response = await _submit(self.model.calculate_metric, is_training=True)
+            metrics = dict(
+                metric_response['result']
+                if isinstance(metric_response, dict)
+                else metric_response.result
+            )
+            values = ' '.join(f'{name}={value}' for name, value in sorted(metrics.items()))
+            print(f'optimizer_step={self.optimizer_step} {values}'.rstrip())
         finally:
             await asyncio.gather(*(self.data_plane.arelease(ref) for ref in refs))
 

@@ -3,6 +3,12 @@ import pytest
 from twinkle.model.multi_lora import MultiLora
 
 
+def test_multi_lora_transformers_save_disables_lazy_collect():
+    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+
+    assert MultiLoraTransformersModel.save._lazy_collect is False
+
+
 def test_check_length_checks_each_sample_independently():
     multi_lora = MultiLora(max_length=4)
 

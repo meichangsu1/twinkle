@@ -6,6 +6,7 @@ runtime:
   sampler_gpus: 1
   sampler_tp: 1
   sampler_max_loras: 4
+  seed: 1
   max_staleness: 1
   max_steps: null
   allow_partial_rollout: false
@@ -73,8 +74,8 @@ lora:
   learning_rate: 5.0e-5
   lr_scheduler:
     cls: CosineAnnealingLR
-    # One optimizer step per prompt group with mini_batch_size=4.
-    T_max: 2000
+    # 128 prompts / 16 prompts per partition * 16 groups per partition.
+    T_max: 128
     eta_min: 0.0
 
 loss:

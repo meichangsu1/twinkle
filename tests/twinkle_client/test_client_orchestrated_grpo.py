@@ -22,7 +22,7 @@ def _load_module():
     return module
 
 
-def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> None:
+def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch, capsys) -> None:
     module = _load_module()
     monkeypatch.setattr(module, 'BATCH_SIZE', 2)
     monkeypatch.setattr(module, 'NUM_GENERATIONS', 2)
@@ -74,6 +74,9 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> 
         async def clip_grad_and_step(self, **_kwargs):
             self.steps += 1
 
+        async def calculate_metric(self, **_kwargs):
+            return {'result': {'loss': 1.0 / self.steps, 'grad_norm': 0.5}}
+
     class FakeDataPlane:
         def __init__(self):
             self.released = []
@@ -116,6 +119,10 @@ def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch) -> 
     assert snapshots['p1-g0'] == (0, '/checkpoints/policy-0')
     assert snapshots['p2-g0'][0] in (1, 2)
     assert snapshots['p2-g0'][1] == f'/checkpoints/policy-{snapshots["p2-g0"][0]}'
+    output = capsys.readouterr().out
+    assert 'optimizer_step=1' in output
+    assert 'loss=1.0' in output
+    assert 'grad_norm=0.5' in output
 
 
 def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
@@ -157,6 +164,9 @@ def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
 
         async def clip_grad_and_step(self, **_kwargs):
             return None
+
+        async def calculate_metric(self, **_kwargs):
+            return {'result': {'loss': 1.0}}
 
     class FakeDataPlane:
         async def aget(self, ref, *, fields=None):
