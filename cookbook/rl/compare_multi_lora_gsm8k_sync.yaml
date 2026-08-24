@@ -4,7 +4,7 @@ runtime:
   run_id: compare_multi_lora_gsm8k_sync
   model_id: ${oc.env:MODEL_ID,/nas/disk1/Qwen3-4B}
   mode: ray
-  model_gpus: 2
+  model_gpus: 1
   sampler_gpus: 1
   sampler_tp: 1
   sampler_max_loras: 4
