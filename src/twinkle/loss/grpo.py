@@ -105,7 +105,8 @@ class GRPOLoss(Loss):
         """
         Aggregate per-token loss to scalar.
 
-        Mean over response tokens within each sequence, then over sequences.
+        Override this method in subclasses for different normalization.
+        Default: mean over sequences, then mean over batch.
 
         Args:
             per_token_loss: [batch, seq_len] per-token loss values
@@ -115,6 +116,7 @@ class GRPOLoss(Loss):
         Returns:
             loss: scalar loss value
         """
+        # Per-sequence mean, then batch mean (aligned with Swift/TRL GRPO).
         # Each sequence contributes equally regardless of length.
         return ((per_token_loss * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).mean()
 

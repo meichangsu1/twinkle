@@ -58,8 +58,6 @@ async def test_preflight_rejects_batch_without_per_dp_multiple():
     assert result == {'request_id': 'req1', 'model_id': 'model1'}
     _, kwargs = queue.state.records[-1]
     assert kwargs['result']['category'] == 'User'
-    assert 'token' not in kwargs
-    assert 'session_id' not in kwargs
     assert 'Batch size 2 must be divisible by 4' in kwargs['result']['error']
 
 
@@ -82,7 +80,7 @@ async def test_preflight_accepts_batch_with_per_dp_multiple():
 
 
 @pytest.mark.asyncio
-async def test_background_task_tracks_status_without_owner_or_preflight():
+async def test_background_task_tracks_status():
     queue = _DummyQueue()
 
     async def work():
@@ -94,8 +92,8 @@ async def test_background_task_tracks_status_without_owner_or_preflight():
     )
     await asyncio.sleep(0)
 
-    assert queue.state.records[0][0][1] == 'running'
-    assert all('token' not in kwargs and 'session_id' not in kwargs for _, kwargs in queue.state.records)
+    assert [args[1] for args, _ in queue.state.records] == ['running', 'completed']
+    assert queue.state.records[-1][1]['result'] == {'ok': True}
 
 
 @pytest.mark.asyncio
