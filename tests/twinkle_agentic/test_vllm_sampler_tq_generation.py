@@ -292,32 +292,6 @@ def test_server_waiter_retries_cancelled_status_poll() -> None:
     assert not sampler.cancelled
 
 
-def test_unload_lora_paths_does_not_require_pruned_checkpoint(tmp_path):
-    removed_paths = []
-
-    class Engine:
-        async def unload_lora_paths(self, paths):
-            removed_paths.extend(paths)
-
-    class Completed:
-        @staticmethod
-        def result():
-            return None
-
-    sampler = object.__new__(VLLMSamplerTQ)
-    sampler.engine = Engine()
-
-    def submit(coro):
-        asyncio.run(coro)
-        return Completed()
-
-    sampler._submit_in_loop = submit
-    pruned_path = tmp_path / 'already-pruned'
-    sampler.unload_lora_paths([str(pruned_path)])
-
-    assert removed_paths == [str(pruned_path.resolve())]
-
-
 def test_sampler_dp_dispatch_slices_complete_groups_without_duplication():
     mesh = DeviceMesh.from_sizes(world_size=4, dp_size=2, tp_size=2)
     groups = ['group_0', 'group_1', 'group_2', 'group_3']

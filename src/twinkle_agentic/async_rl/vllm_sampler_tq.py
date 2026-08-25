@@ -201,14 +201,6 @@ class VLLMSamplerTQ(vLLMSampler):
     def unregister_reward(self, context_key: str) -> None:
         self.reward_registry.pop(context_key, None)
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False)
-    def unload_lora_paths(self, adapter_paths: list[str]) -> None:
-        # Unloading is keyed by the normalized path stored in VLLMEngine's
-        # request cache. The checkpoint itself may already have been pruned,
-        # so unlike loading this must not require the path to still exist.
-        local_paths = [os.path.abspath(os.path.expanduser(str(path))) for path in adapter_paths]
-        self._submit_in_loop(self.engine.unload_lora_paths(local_paths)).result()
-
     @remote_function(dispatch='slice_dp', collect='none', lazy_collect=False)
     def submit_prompt_groups(
         self,

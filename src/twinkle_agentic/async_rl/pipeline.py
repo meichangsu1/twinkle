@@ -701,5 +701,5 @@ def _remove_adapter_snapshot(sampler: Any, adapter_path: str) -> None:
     """Unload an unreferenced policy from vLLM before deleting its checkpoint."""
     from .workers import _remove_local_adapter
 
-    sampler.unload_lora_paths([adapter_path])
+    sampler.unload_adapter_paths([adapter_path])
     _remove_local_adapter(adapter_path)
