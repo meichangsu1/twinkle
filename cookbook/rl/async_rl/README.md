@@ -113,6 +113,48 @@ writing one JSONL file per completed prompt group.
 | `async_multi_lora_grpo.yaml` | Model, sampler, scheduler, LoRA, dataset, reward, and tenant configuration |
 | `run_async_multi_lora_grpo.sh` | Validate required environment variables, start local Ray if needed, and launch training |
 
+## Synchronous and asynchronous comparisons
+
+The comparison configurations keep each synchronous/asynchronous pair aligned
+on model, data, rollout, LoRA, and train batch settings. The synchronous files
+use `sync_barrier_multi_lora_grpo.py`; they are not async runs with
+`max_staleness=0`.
+
+| Dataset | Tenants | Synchronous config | Asynchronous config |
+|---|---:|---|---|
+| GSM8K | 1 | `compare_single_lora_gsm8k_sync.yaml` | `compare_single_lora_gsm8k_async.yaml` |
+| GSM8K | 2 | `compare_multi_lora_gsm8k_sync.yaml` | `compare_multi_lora_gsm8k_async.yaml` |
+| DAPO-Math | 1 | `compare_single_lora_dapo_sync.yaml` | `compare_single_lora_dapo_async.yaml` |
+| DAPO-Math | 2 | `compare_multi_lora_dapo_sync.yaml` | `compare_multi_lora_dapo_async.yaml` |
+
+Prepare two deterministic 500-row GSM8K datasets:
+
+```bash
+python cookbook/rl/async_rl/prepare_multi_tenant_gsm8k.py \
+  --source /data/gsm8k/train.jsonl \
+  --samples-per-tenant 500 \
+  --output-dir /data/gsm8k_multi_tenant
+```
+
+Run the GSM8K comparisons after exporting their required dataset paths:
+
+```bash
+bash cookbook/rl/async_rl/run_compare_single_lora_gsm8k_sync.sh
+bash cookbook/rl/async_rl/run_compare_single_lora_gsm8k_async.sh
+bash cookbook/rl/async_rl/run_compare_multi_lora_gsm8k_sync.sh
+bash cookbook/rl/async_rl/run_compare_multi_lora_gsm8k_async.sh
+```
+
+DAPO-Math comparison scripts validate the required dataset environment
+variables and select three visible GPUs by default:
+
+```bash
+bash cookbook/rl/async_rl/run_compare_single_lora_dapo_sync.sh
+bash cookbook/rl/async_rl/run_compare_single_lora_dapo_async.sh
+bash cookbook/rl/async_rl/run_compare_multi_lora_dapo_sync.sh
+bash cookbook/rl/async_rl/run_compare_multi_lora_dapo_async.sh
+```
+
 ## Troubleshooting
 
 - **A placement group stays pending** — the default run needs three visible
