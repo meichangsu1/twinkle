@@ -10,7 +10,7 @@ runtime:
   sampler_max_loras: 1
   seed: 1
   max_staleness: 2
-  max_steps: 125
+  max_steps: null
   allow_partial_rollout: false
   rollout_max_retries: 2
   rollout_retry_delay_s: 0.5
@@ -99,7 +99,7 @@ lora_contexts:
       dataset_id: ${oc.env:GSM8K_TRAIN_DATASET_ID,ms://modelscope/gsm8k}
       subset_name: main
       split: train
-      data_num: 2000
+      data_num: 500
       max_length: 1024
       processor: GSM8KProcessor
       system_prompt: 'You are a helpful math assistant. Solve the problem step by step and put your final answer within \boxed{}.'

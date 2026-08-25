@@ -73,14 +73,9 @@ evaluation:
 lora:
   target_modules: all-linear
   r: 16
-  alpha: 32
-  dropout: 0.05
-  learning_rate: 5.0e-5
-  lr_scheduler:
-    cls: CosineAnnealingLR
-    # 2000 prompts / 16 prompts per partition * 64 samples / 16 samples per step.
-    T_max: 500
-    eta_min: 0.0
+  alpha: 16
+  dropout: 0.0
+  learning_rate: 1.7e-5
 
 loss:
   cls: GRPOLoss
@@ -96,7 +91,7 @@ lora_contexts:
       dataset_id: ${oc.env:TENANT_A_DATASET_ID}
       subset_name: main
       split: train
-      data_num: 2000
+      data_num: 500
       max_length: 8192
       processor: GSM8KProcessor
       system_prompt: >-
@@ -124,7 +119,7 @@ lora_contexts:
       dataset_id: ${oc.env:TENANT_B_DATASET_ID}
       subset_name: main
       split: train
-      data_num: 2000
+      data_num: 500
       max_length: 8192
       processor: GSM8KProcessor
       system_prompt: >-
