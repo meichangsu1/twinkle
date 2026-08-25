@@ -51,10 +51,10 @@ model:
 
 sampler:
   max_model_len: 12288
-  max_num_batched_tokens: 16384
-  gpu_memory_utilization: 0.8
-  max_num_seqs: 32
-  enforce_eager: true
+  max_num_batched_tokens: 32768
+  gpu_memory_utilization: 0.9
+  max_num_seqs: 64
+  enforce_eager: false
 
 rollout_output:
   enabled: true
@@ -99,16 +99,18 @@ lora_contexts:
       dataset_id: ${oc.env:DAPO_TRAIN_DATASET_ID,ms://BytedTsinghua-SIA/DAPO-Math-17k}
       subset_name: default
       split: train
-      data_num: 1000
+      data_num: 500
       max_length: 4096
       processor: DAPOMathProcessor
     rollout:
       batch_size: 16
-      num_generations: 8
+      num_generations: 4
       max_tokens: 8192
       temperature: 1.0
       top_p: 0.95
     train:
       mini_batch_size: 32
-      micro_batch_size: 1
-      dynamic_batching: false
+      micro_batch_size: 2
+      dynamic_batching: true
+      max_tokens_per_micro_batch: 16384
+      packing_algorithm: ffd
