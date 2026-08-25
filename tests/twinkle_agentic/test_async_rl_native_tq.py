@@ -13,6 +13,7 @@ from twinkle_agentic.async_rl import (AsyncMultiLoraGRPOPipeline, ContextSchedul
 from twinkle_agentic.async_rl.metrics import training_policy_metrics
 from twinkle_agentic.async_rl.native_tq import ContextGRPOGroupNSampler
 from twinkle_agentic.async_rl.pipeline import (
+    _collect_adapter_path,
     _require_adapter_path,
     _train_batch,
     create_cpu_actor,
@@ -219,6 +220,14 @@ def test_adapter_path_rejects_uncollected_remote_result():
 
     with pytest.raises(TypeError, match='must return a non-empty checkpoint path string'):
         _require_adapter_path(lazy_result, operation='test save')
+
+
+def test_adapter_path_collects_lazy_remote_result():
+    def lazy_result():
+        return '/tmp/policy'
+
+    lazy_result._is_lazy_collect = True
+    assert _collect_adapter_path(lazy_result, operation='test save') == '/tmp/policy'
 
 
 def test_training_policy_metrics_use_final_version_and_partial_span():

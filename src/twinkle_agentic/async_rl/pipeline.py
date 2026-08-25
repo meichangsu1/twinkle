@@ -289,7 +289,7 @@ class AsyncMultiLoraGRPOPipeline:
                     eval_dataset.get('reward'),
                     context_key=f'{context.key} evaluation',
                 )
-            initial_paths[context.key] = _require_adapter_path(
+            initial_paths[context.key] = _collect_adapter_path(
                 model.save(
                     f'async-{context.adapter_name}-initial',
                     output_dir=runtime['output_dir'],
@@ -672,7 +672,7 @@ def _train_batch_with_config(
 
 
 def _save_adapter(model: Any, output_dir: str, admission: PartitionAdmission) -> str:
-    return _require_adapter_path(
+    return _collect_adapter_path(
         model.save(
             f'async-{admission.context.adapter_name}-v{admission.step + 1}',
             output_dir=output_dir,
@@ -680,6 +680,13 @@ def _save_adapter(model: Any, output_dir: str, admission: PartitionAdmission) ->
         ),
         operation=f'adapter save for {admission.partition_id}',
     )
+
+
+def _collect_adapter_path(value: Any, *, operation: str) -> str:
+    """Collect a lazy model.save result at the async-RL publication boundary."""
+    if callable(value) and getattr(value, '_is_lazy_collect', False):
+        value = value()
+    return _require_adapter_path(value, operation=operation)
 
 
 def _require_adapter_path(value: Any, *, operation: str) -> str:
