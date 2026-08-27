@@ -36,6 +36,10 @@ TRUNCATION_STRATEGY = os.environ.get('TRUNCATION_STRATEGY', 'delete')
 LR = float(os.environ.get('LR', '1e-4'))
 LORA_R = int(os.environ.get('LORA_R', '8'))
 LORA_ALPHA = int(os.environ.get('LORA_ALPHA', '32'))
+ROUTED_EXPERT_TARGET_PARAMETERS = [
+    'mlp.experts.gate_up_proj',
+    'mlp.experts.down_proj',
+]
 
 
 def _assert_finite_output(value, path='result') -> None:
@@ -85,12 +89,11 @@ def _build_lora_config() -> LoraConfig:
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
         lora_dropout=0.0,
-        target_modules='all-linear',
-        exclude_modules=['o_a_proj'],
-        target_parameters=[
-            'mlp.experts.gate_up_proj',
-            'mlp.experts.down_proj',
-        ],
+        # Train only the fused 3D routed-expert parameters. Do not install
+        # module LoRA on attention, router, shared experts, or the LM head.
+        target_modules=None,
+        target_parameters=ROUTED_EXPERT_TARGET_PARAMETERS,
+        bias='none',
     )
 
 
