@@ -9,6 +9,15 @@ from twinkle.utils import get_logger
 logger = get_logger()
 
 
+def _gpu_placement_group_cpus(node_cpu: int, nproc_per_node: int) -> int:
+    """Return the logical CPUs reserved by one GPU placement group."""
+    cpus_per_proc = int(os.environ.get('TWINKLE_GPU_PG_CPUS_PER_PROC', 4))
+    cpus_per_proc = max(cpus_per_proc, 1)
+    required_cpus = max(nproc_per_node * cpus_per_proc, 1)
+    node_cap = max(node_cpu // 4, 1)
+    return min(required_cpus, node_cap)
+
+
 class ResourceManager:
 
     def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: List[DeviceGroup]):
@@ -97,7 +106,10 @@ class ResourceManager:
                 except IndexError:
                     node = self.nodes[0]
                 node_cpu = int(node['Resources']['CPU'])
-                bundles.append({device_type: nproc_per_node, 'CPU': max(nproc_per_node, 1)})
+                bundles.append({
+                    device_type: nproc_per_node,
+                    'CPU': _gpu_placement_group_cpus(node_cpu, nproc_per_node),
+                })
 
         # CPU placement groups: only create when there are actual CPU processes to allocate.
         if cpu_proc_count > 0:
