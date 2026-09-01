@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -18,6 +19,18 @@ class _DeviceTrackingModel(nn.Module):
         device = args[0] if args else kwargs.get('device')
         self.to_devices.append(torch.device(device))
         return super().to(*args, **kwargs)
+
+
+class _FSDPRoot:
+
+    def __init__(self):
+        self.events = []
+
+    def unshard(self):
+        self.events.append('unshard')
+
+    def reshard(self):
+        self.events.append('reshard')
 
 
 def test_native_fsdp_singleton_mesh_places_model_on_local_device(monkeypatch):
@@ -43,3 +56,24 @@ def test_native_fsdp_singleton_mesh_places_model_on_local_device(monkeypatch):
     assert model.to_devices == [torch.device('cpu')]
     assert all(param.device.type == 'cpu' for param in model.parameters())
     assert list(optimizer.param_groups[0]['params']) == original_optimizer_params
+
+
+def test_native_fsdp_generation_context_unshards_and_restores_root():
+    strategy = NativeFSDPStrategy(device_mesh=None, enable_ep=False)
+    model = _FSDPRoot()
+
+    with strategy.generation_context(model):
+        model.events.append('generate')
+
+    assert model.events == ['unshard', 'generate', 'reshard']
+
+
+def test_native_fsdp_generation_context_reshards_after_failure():
+    strategy = NativeFSDPStrategy(device_mesh=None, enable_ep=False)
+    model = _FSDPRoot()
+
+    with pytest.raises(RuntimeError, match='generation failed'):
+        with strategy.generation_context(model):
+            raise RuntimeError('generation failed')
+
+    assert model.events == ['unshard', 'reshard']

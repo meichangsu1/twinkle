@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -43,9 +44,20 @@ class _GenerateModel:
 
 class _Strategy:
 
+    def __init__(self):
+        self.generation_events = []
+
     @staticmethod
     def unwrap_model(model):
         return model
+
+    @contextmanager
+    def generation_context(self, model):
+        self.generation_events.append(('enter', model))
+        try:
+            yield
+        finally:
+            self.generation_events.append(('exit', model))
 
 
 def _model_wrapper():
@@ -81,6 +93,10 @@ def test_generate_encodes_trajectory_and_returns_completion_only():
         'text': '20 2',
         'stop_reason': 'stop',
     }]
+    assert wrapper.strategy.generation_events == [
+        ('enter', wrapper.model),
+        ('exit', wrapper.model),
+    ]
     assert torch.equal(torch.get_rng_state(), rng_state)
 
 

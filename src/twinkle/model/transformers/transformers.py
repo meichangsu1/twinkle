@@ -894,7 +894,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Restore the training RNG afterwards so an evaluation request does
             # not perturb dropout or any later stochastic training operation.
             Torch.seed_everything(seed)
-            with torch.no_grad():
+            generation_context = getattr(self.strategy, 'generation_context', None)
+            fsdp_root_context = (
+                generation_context(generate_model) if generation_context is not None else contextlib.nullcontext())
+            with torch.no_grad(), fsdp_root_context:
                 sequences = generate_model.generate(**model_inputs, **gen_kwargs)
         finally:
             self._set_training_rng_state(rng_state)

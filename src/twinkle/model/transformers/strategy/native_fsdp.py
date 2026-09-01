@@ -2,6 +2,7 @@
 import os
 import torch
 import torch.distributed as dist
+from contextlib import contextmanager
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
@@ -263,6 +264,28 @@ class NativeFSDPStrategy:
             optimizer = _rebind_optimizer(optimizer, model)
 
         return model, optimizer
+
+    @contextmanager
+    def generation_context(self, model):
+        """Materialize root FSDP parameters while PEFT delegates generation.
+
+        ``PeftModel.generate()`` calls ``get_base_model().generate()`` directly,
+        bypassing the outer PEFT module's forward hooks.  When that outer module
+        is an FSDP2 root, its directly managed parameters (for example token
+        embeddings and ``lm_head``) would otherwise remain DTensors while the
+        generation inputs are regular tensors.
+        """
+        unshard = getattr(model, 'unshard', None)
+        reshard = getattr(model, 'reshard', None)
+        if not callable(unshard) or not callable(reshard):
+            yield
+            return
+
+        unshard()
+        try:
+            yield
+        finally:
+            reshard()
 
     def _prepare_optimizer_state_dict_options(self, *, for_load: bool):
         from torch.distributed.checkpoint.state_dict import StateDictOptions
