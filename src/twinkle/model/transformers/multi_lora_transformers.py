@@ -191,6 +191,33 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    def generate(self,
+                 *,
+                 inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+                 generation_config: Optional[Dict[str, Any]] = None,
+                 **kwargs):
+        adapter_name = kwargs.pop('adapter_name', None)
+        disable_lora = kwargs.pop('disable_lora', False)
+        self._check_adapter_valid(adapter_name)
+        # Target-parameter LoRA uses a temporary parametrization while active.
+        # FSDP must shard the unparametrized model, so finish lazy wrapping
+        # before entering the adapter context when generate() is the first call.
+        self._lazy_wrap_model()
+        # Generation invokes many forwards inside one context. Do not retain a
+        # parametrized expert weight across FSDP reshard boundaries; recompute
+        # the routed-expert LoRA delta when each decoder forward accesses it.
+        with self.multi_adapter.adapter(
+                adapter_name,
+                disable_lora=disable_lora,
+                cache_target_parameters=False):
+            return super().generate(
+                inputs=inputs,
+                adapter_name=adapter_name,
+                generation_config=generation_config,
+                **kwargs,
+            )
+
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))

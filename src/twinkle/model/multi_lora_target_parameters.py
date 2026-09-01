@@ -227,7 +227,7 @@ class TargetParameterLoraWrapper(nn.Module):
         return torch.einsum('e o r, e r i -> e i o', weight_B, weight_A) * self.scaling[slot_name]
 
     @contextmanager
-    def activate(self, slot_name: str | None, disable_lora: bool = False):
+    def activate(self, slot_name: str | None, disable_lora: bool = False, cache: bool = True):
         if disable_lora or slot_name is None or slot_name not in self.lora_A:
             yield
             return
@@ -246,7 +246,10 @@ class TargetParameterLoraWrapper(nn.Module):
             )
             module.parametrizations[param_name].original.requires_grad_(requires_grad_before)
         try:
-            with nn.utils.parametrize.cached():
+            if cache:
+                with nn.utils.parametrize.cached():
+                    yield
+            else:
                 yield
         finally:
             if not already_parametrized:
@@ -412,11 +415,11 @@ class TargetParameterLoraManager:
             wrapper.save_initial_weights()
 
     @contextmanager
-    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
+    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False, cache: bool = True):
         slot_name = self.tenant_to_slot.get(tenant_adapter_name)
         with ExitStack() as stack:
             for wrapper in self.wrappers:
-                stack.enter_context(wrapper.activate(slot_name, disable_lora=disable_lora))
+                stack.enter_context(wrapper.activate(slot_name, disable_lora=disable_lora, cache=cache))
             yield
 
     def parameters_for_tenant(self, tenant_adapter_name: str) -> list[nn.Parameter]:
