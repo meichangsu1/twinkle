@@ -131,9 +131,15 @@ class NativeFSDPStrategy:
         return ep_mesh.to_torch_device_mesh()
 
     def wrap_model(self, model, optimizer=None):
-        if self.device_mesh is None:
+        fsdp_mesh = _build_fsdp_mesh(self.device_mesh) if self.device_mesh is not None else None
+        if fsdp_mesh is None:
+            # FSDP normally materializes/moves parameters onto the mesh device
+            # while wrapping.  A singleton (or absent) mesh skips FSDP, so do
+            # the equivalent device placement explicitly.  Without this, a
+            # model loaded by ``from_pretrained`` remains on CPU while the
+            # input processor creates tensors on the actor's CUDA/NPU device.
+            model = model.to(torch.device(Platform.get_local_device()))
             return model, optimizer
-        fsdp_mesh = _build_fsdp_mesh(self.device_mesh)
         if fsdp_mesh is not None:
             ep_enabled = (self.enable_ep and self.ep_fsdp_device_mesh is not None)
 
