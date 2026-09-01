@@ -2,15 +2,23 @@
 from __future__ import annotations
 
 import inspect
+import os
 import torch
 import torch.distributed as dist
 from dataclasses import dataclass
 from torch import nn
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from twinkle import get_logger
 from twinkle.kernel.ops import ep_forward
 from twinkle.model.transformers.moe.ep_utils import preprocess, token_pre_all2all, tokens_post_all2all
 from twinkle.utils import DeviceMesh
+
+logger = get_logger()
+
+
+def _ep_diagnostics_enabled() -> bool:
+    return os.environ.get('TWINKLE_EP_DIAGNOSTICS', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
 @dataclass
@@ -262,6 +270,32 @@ def patch_forward(
             num_global_sum_tokens_per_local_expert,
         ) = preprocess(expert_mask, num_experts, ep_group)
 
+        log_diagnostics = _ep_diagnostics_enabled() and not getattr(block, '_ep_diagnostics_logged', False)
+        if log_diagnostics:
+            expected_assignments = hidden_states_2d.shape[0] * top_k
+            actual_assignments = int(input_splits.sum().item())
+            if actual_assignments != expected_assignments:
+                raise RuntimeError(
+                    f'EP routing assignment mismatch for {block_name}: '
+                    f'input_splits={actual_assignments}, expected={expected_assignments}.')
+            selected_preview = selected_experts[:min(8, selected_experts.shape[0])].detach().cpu().tolist()
+            weights_preview = routing_weights[:min(8, routing_weights.shape[0])].float().detach().cpu().tolist()
+            logger.warning(
+                '[EP_DIAG] rank=%s ep_rank=%s block=%s expert_range=[%s,%s) tokens=%s top_k=%s '
+                'input_splits=%s output_splits=%s selected_experts=%s routing_weights=%s',
+                dist.get_rank(),
+                block._ep_rank,
+                block_name,
+                block._ep_local_start,
+                block._ep_local_end,
+                hidden_states_2d.shape[0],
+                top_k,
+                input_splits.tolist(),
+                output_splits.tolist(),
+                selected_preview,
+                weights_preview,
+            )
+
         # 2. token_pre_all2all: permute → all_to_all → sort_chunks
         (
             global_permuted_hidden_states,
@@ -316,6 +350,21 @@ def patch_forward(
 
         if len(orig_shape) == 3:
             final_hidden = final_hidden.view(batch_size, seq_len, hidden_dim)
+
+        if log_diagnostics:
+            flat_output = final_hidden.detach().reshape(-1)
+            preview = flat_output[:min(8, flat_output.numel())].float().cpu().tolist()
+            finite = bool(torch.isfinite(final_hidden).all().item())
+            logger.warning(
+                '[EP_DIAG] rank=%s ep_rank=%s block=%s output_shape=%s output_finite=%s output_preview=%s',
+                dist.get_rank(),
+                block._ep_rank,
+                block_name,
+                tuple(final_hidden.shape),
+                finite,
+                preview,
+            )
+            block._ep_diagnostics_logged = True
 
         if cfg.keep_router_logits and returns_router_logits:
             return final_hidden, router_logits

@@ -11,6 +11,7 @@ result.
 """
 from __future__ import annotations
 
+import os
 import torch
 from abc import ABC, abstractmethod
 from torch import nn
@@ -51,6 +52,11 @@ class EpExpertsGmm(ABC):
 _IMPLS: list[EpExpertsGmm] | None = None
 _PATH_LOGGED = False
 _WARN_LOGGED = False
+_FORCE_LOOP_LOGGED = False
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
 def _get_impls() -> list[EpExpertsGmm]:
@@ -59,6 +65,14 @@ def _get_impls() -> list[EpExpertsGmm]:
     Each backend module is imported defensively: platforms lacking its
     dependencies (e.g. no torch_npu) simply skip that backend.
     """
+    global _FORCE_LOOP_LOGGED
+    if _env_flag('TWINKLE_EP_FORCE_LOOP'):
+        from .loop import LoopEpExpertsGmm
+        if not _FORCE_LOOP_LOGGED:
+            logger.warning('EP experts compute: TWINKLE_EP_FORCE_LOOP=1; forcing the per-expert F.linear loop.')
+            _FORCE_LOOP_LOGGED = True
+        return [LoopEpExpertsGmm()]
+
     global _IMPLS
     if _IMPLS is None:
         _IMPLS = []

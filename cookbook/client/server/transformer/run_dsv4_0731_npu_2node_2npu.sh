@@ -31,7 +31,10 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
-CONFIG_PATH="$SCRIPT_DIR/server_config_dsv4_0731_npu_2node_2npu.yaml"
+CONFIG_PATH="${TWINKLE_SERVER_CONFIG_PATH:-$SCRIPT_DIR/server_config_dsv4_0731_npu_2node_2npu.yaml}"
+if [[ "$CONFIG_PATH" != /* ]]; then
+    CONFIG_PATH="$PROJECT_DIR/$CONFIG_PATH"
+fi
 
 export DSV4_MODEL_ID="${DSV4_MODEL_ID:-hf://deepseek-ai/DeepSeek-V4-Flash-0731}"
 DATASET_PATH="${DATASET_ID:-/model/ljl/dataset/self-cognition.jsonl}"
@@ -55,6 +58,8 @@ export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export TWINKLE_TRUST_REMOTE_CODE=1
 export TWINKLE_FAIL_FAST=1
+export TWINKLE_EP_FORCE_LOOP="${TWINKLE_EP_FORCE_LOOP:-0}"
+export TWINKLE_EP_DIAGNOSTICS="${TWINKLE_EP_DIAGNOSTICS:-0}"
 export TOKENIZERS_PARALLELISM=true
 export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
 export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
@@ -70,7 +75,9 @@ if [[ "${#VISIBLE_NPUS[@]}" -ne "$NPU_PER_NODE" ]]; then
 fi
 
 test -f "$CONFIG_PATH"
-test -f "$DATASET_PATH"
+if [[ "${SKIP_DATASET_CHECK:-0}" != "1" ]]; then
+    test -f "$DATASET_PATH"
+fi
 
 if [[ "$DSV4_MODEL_ID" == hf://* || "$DSV4_MODEL_ID" == ms://* ]]; then
     echo "Model will be downloaded through the configured Hub backend: $DSV4_MODEL_ID"
@@ -157,5 +164,7 @@ finally:
 PY
 
 python3 -m twinkle.server check-config --config "$CONFIG_PATH"
+echo "Twinkle config: $CONFIG_PATH"
+echo "EP diagnostics: force_loop=$TWINKLE_EP_FORCE_LOOP diagnostics=$TWINKLE_EP_DIAGNOSTICS"
 echo "Launching Twinkle Server at http://$HEAD_IP:8000"
 exec python3 -m twinkle.server launch --config "$CONFIG_PATH"

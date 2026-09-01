@@ -1,0 +1,117 @@
+# Four-layer DeepSeek-V4 diagnostic: FSDP2 + EP on two nodes, two NPUs per node.
+# DSV4_MODEL_ID must point to a structurally complete four-layer BF16 checkpoint.
+
+proxy_location: EveryNode
+
+http_options:
+  host: 0.0.0.0
+  port: 8000
+
+telemetry:
+  enabled: false
+  otlp_endpoint: http://localhost:4317
+
+persistence:
+  mode: memory
+  key_prefix: dsv4-4layer-diag-ep
+
+applications:
+  - name: server
+    route_prefix: /api/v1
+    import_path: server
+    args:
+      server_config:
+        per_token_model_limit: 1
+      supported_models:
+        - deepseek-v4-0731-local
+    deployments:
+      - name: TinkerCompatServer
+        max_ongoing_requests: 4
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 1
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_FAIL_FAST: "1"
+
+  - name: models-deepseek-v4-0731-local
+    route_prefix: /api/v1/model/deepseek-v4-0731-local
+    import_path: model
+    args:
+      backend: transformers
+      model_id: ${oc.env:DSV4_MODEL_ID}
+      nproc_per_node: 2
+      max_loras: 1
+      max_r: 8
+      max_length: 512
+      mixed_precision: bf16
+      strategy: native_fsdp
+      memory_efficient_init: true
+      target_modules: all-linear
+      fsdp_config:
+        reshard_after_forward: true
+        expert_parallel:
+          enabled: true
+          ep_size: 4
+          router_dtype: fp32
+          keep_router_logits: false
+      device_group:
+        name: model
+        ranks: 4
+        device_type: npu
+      device_mesh:
+        device_type: npu
+        fsdp_size: 4
+        dp_size: 1
+        ep_size: 4
+      queue_config:
+        rps_limit: 1
+        tps_limit: 10000
+        max_input_tokens: 512
+        queue_timeout: 7200
+        execution_timeout: 7200
+      adapter_config:
+        adapter_timeout: 60
+        adapter_max_lifetime: 7200
+    deployments:
+      - name: ModelManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 1
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"
+              TWINKLE_EP_FORCE_LOOP: ${oc.env:TWINKLE_EP_FORCE_LOOP,0}
+              TWINKLE_EP_DIAGNOSTICS: ${oc.env:TWINKLE_EP_DIAGNOSTICS,1}
+
+  - name: processor
+    route_prefix: /api/v1/processor
+    import_path: processor
+    args:
+      ncpu_proc_per_node: 1
+      device_group:
+        name: processor
+        ranks: 2
+        device_type: CPU
+      device_mesh:
+        device_type: CPU
+        dp_size: 2
+    deployments:
+      - name: ProcessorManagement
+        autoscaling_config:
+          min_replicas: 1
+          max_replicas: 1
+          target_ongoing_requests: 1
+        ray_actor_options:
+          num_cpus: 0.1
+          runtime_env:
+            env_vars:
+              TWINKLE_TRUST_REMOTE_CODE: "1"
+              TWINKLE_FAIL_FAST: "1"
