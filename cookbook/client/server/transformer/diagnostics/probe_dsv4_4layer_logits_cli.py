@@ -2,8 +2,10 @@
 """Run a four-layer DeepSeek-V4 logits probe directly with torchrun.
 
 This is the local/CLI counterpart of ``probe_dsv4_4layer_logits.py``.  It
-constructs ``TransformersModel`` in every torchrun process and therefore does
-not use GatewayServer, Ray Serve, sessions, tenants, or LoRA slots.
+constructs ``MultiLoraTransformersModel`` in every torchrun process and
+therefore does not use GatewayServer, Ray Serve, sessions, tenants, or
+server-side LoRA capacity.  A disabled diagnostic adapter is installed to
+match the production initialization path.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from typing import Any
 
 
 DEFAULT_INPUT_IDS = [0, 128803, 2788, 6573, 70979, 36005, 320, 128804, 128821]
+TARGET_PARAMETERS = ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,11 +128,12 @@ def main() -> None:
 
     import torch
     import torch.distributed as dist
+    from peft import LoraConfig
     from transformers import AutoConfig
 
     import twinkle
     from twinkle import DeviceMesh, Platform
-    from twinkle.model import TransformersModel
+    from twinkle.model import MultiLoraTransformersModel
 
     device_mesh = DeviceMesh.from_sizes(
         fsdp_size=world_size,
@@ -145,13 +149,18 @@ def main() -> None:
     )
 
     config = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True)
-    model = TransformersModel(
+    adapter_name = f'dsv4_diag_{args.mode}'
+    model = MultiLoraTransformersModel(
         model_id=args.model_id,
         config=config,
         device_mesh=device_mesh,
         strategy='native_fsdp',
         mixed_precision=args.mixed_precision,
         memory_efficient_init=not args.disable_memory_efficient_init,
+        max_loras=1,
+        max_r=8,
+        max_length=512,
+        target_modules='all-linear',
         fsdp_config={
             'reshard_after_forward': True,
             'expert_parallel': {
@@ -162,7 +171,24 @@ def main() -> None:
             },
         },
     )
-    model.set_processor('InputProcessor', padding_side='left', padding_free=False)
+    model.add_adapter_to_model(
+        adapter_name,
+        LoraConfig(
+            r=8,
+            lora_alpha=32,
+            lora_dropout=0.0,
+            target_modules=None,
+            target_parameters=TARGET_PARAMETERS,
+            bias='none',
+        ),
+        gradient_accumulation_steps=1,
+    )
+    model.set_processor(
+        'InputProcessor',
+        adapter_name=adapter_name,
+        padding_side='left',
+        padding_free=False,
+    )
 
     raw_input = {
         'input_ids': input_ids,
@@ -171,6 +197,8 @@ def main() -> None:
     }
     response = model.forward_only(
         inputs=[raw_input],
+        adapter_name=adapter_name,
+        disable_lora=True,
         return_logits=True,
     )
     last_logits = _extract_logits(response)

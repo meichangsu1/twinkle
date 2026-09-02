@@ -154,14 +154,17 @@ torchrun。driver 直接通过 Ray 创建两节点 NPU 模型 Actor：
 ```text
 Python driver
   -> Ray placement group
-  -> 两节点、每节点两个 TransformersModel Actor
+  -> 两节点、每节点两个 MultiLoraTransformersModel Actor
   -> native_fsdp + HCCL + EP
   -> logits 返回 driver
 ```
 
-该模式不启动 Ray Serve、GatewayServer 或 ModelManagement，不创建 HTTP session、
-租户或 LoRA adapter，因此不受槽位、心跳和接口限流影响；同时仍然覆盖 Ray 多机
-Actor、node-local 权重加载、`_broadcast_sharded_state_dict`、FSDP 和 EP。
+该模式不启动 Ray Serve、GatewayServer 或 ModelManagement，不创建 HTTP session
+或租户，因此不受服务端槽位、心跳和接口限流影响。模型内部会创建一个禁用 delta
+的诊断 adapter，以复用生产 `MultiLoraTransformersModel` 在 FSDP 包装前安装槽位和
+对齐 dtype 的相同初始化路径；该 adapter 不登记到 ServerState 容量中。该模式仍然
+覆盖 Ray 多机 Actor、node-local 权重加载、`_broadcast_sharded_state_dict`、FSDP
+和 EP。
 
 先创建短临时目录和持久化结果目录：
 
@@ -268,6 +271,19 @@ ray_ep_loop_last_logits.pt/json
 ray_ep_gmm_last_logits.pt/json
 ```
 
+如果首次 forward 报错：
+
+```text
+AssertionError: FSDP expects uniform original parameter dtype but got
+{torch.bfloat16, torch.float32}
+```
+
+说明运行的是旧版 Ray probe：它实例化了纯 `TransformersModel`，没有进入生产
+Multi-LoRA 的槽位安装和 `_ensure_lora_dtype()` 路径。使用更新后的
+`probe_dsv4_4layer_logits_ray.py`；它直接构造 `MultiLoraTransformersModel`，先安装
+禁用的诊断 adapter，再进入 `_lazy_wrap_model()`。无需修改公共
+`TransformersModel._lazy_wrap_model()`，Ray 集群也无需重启。
+
 比较方式：
 
 ```bash
@@ -284,8 +300,10 @@ python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logit
 
 ## 3B. 可选的本地/torchrun 基准
 
-CLI 模式直接在 torchrun 进程中构造 `TransformersModel`，不启动 Ray、Gateway
-或 ModelManagement，也不会创建 session、租户和 LoRA 槽位。该步骤验证：
+CLI 模式直接在 torchrun 进程中构造 `MultiLoraTransformersModel`，不启动 Ray、
+Gateway 或 ModelManagement，也不会创建 session、租户或登记服务端 LoRA 容量。
+它会在每个进程内安装一个禁用 delta 的诊断 adapter，使 dtype 对齐和 FSDP 包装
+顺序与生产服务一致。该步骤验证：
 
 ```text
 Transformers checkpoint 转换
