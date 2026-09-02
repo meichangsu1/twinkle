@@ -21,6 +21,12 @@ def _ep_diagnostics_enabled() -> bool:
     return os.environ.get('TWINKLE_EP_DIAGNOSTICS', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _split_sizes_to_list(split_sizes: list[int] | torch.Tensor) -> list[int]:
+    if isinstance(split_sizes, torch.Tensor):
+        return [int(value) for value in split_sizes.detach().cpu().tolist()]
+    return [int(value) for value in split_sizes]
+
+
 @dataclass
 class ExpertParallelConfig:
     enabled: bool = True
@@ -272,8 +278,10 @@ def patch_forward(
 
         log_diagnostics = _ep_diagnostics_enabled() and not getattr(block, '_ep_diagnostics_logged', False)
         if log_diagnostics:
+            input_splits_list = _split_sizes_to_list(input_splits)
+            output_splits_list = _split_sizes_to_list(output_splits)
             expected_assignments = hidden_states_2d.shape[0] * top_k
-            actual_assignments = int(input_splits.sum().item())
+            actual_assignments = sum(input_splits_list)
             if actual_assignments != expected_assignments:
                 raise RuntimeError(
                     f'EP routing assignment mismatch for {block_name}: '
@@ -290,8 +298,8 @@ def patch_forward(
                 block._ep_local_end,
                 hidden_states_2d.shape[0],
                 top_k,
-                input_splits.tolist(),
-                output_splits.tolist(),
+                input_splits_list,
+                output_splits_list,
                 selected_preview,
                 weights_preview,
             )
