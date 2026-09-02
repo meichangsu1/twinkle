@@ -87,6 +87,12 @@ def _wait_for_free_lora(client: Any, timeout: float, poll_interval: float) -> An
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if capacity.max_loras == 0:
+                raise RuntimeError(
+                    'Timed out waiting for ModelManagement capacity: '
+                    'max_loras=0, used_loras=0. No model replica registered its '
+                    'capacity; inspect the ModelManagement startup and replica '
+                    'registration logs.')
             raise RuntimeError(
                 'Timed out waiting for a free LoRA slot: '
                 f'max_loras={capacity.max_loras}, used_loras={capacity.used_loras}, '
@@ -116,13 +122,16 @@ def main() -> None:
         session_heartbeat_interval=10,
     )
     try:
+        # ModelManagement registers its capacity lazily on the first model
+        # request.  ``MultiLoraTransformersModel.__init__`` calls /create,
+        # ensuring get_capacity_info() reports 0/max_loras instead of 0/0.
+        model = MultiLoraTransformersModel(model_id=args.served_model)
         _wait_for_free_lora(
             client,
             timeout=args.capacity_wait_seconds,
             poll_interval=args.capacity_poll_seconds,
         )
 
-        model = MultiLoraTransformersModel(model_id=args.served_model)
         model.add_adapter_to_model(
             f'dsv4_diag_{args.mode}',
             LoraConfig(
