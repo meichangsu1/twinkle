@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--served-model', default='deepseek-v4-0731-local')
     parser.add_argument('--output-dir', type=Path, default=Path('output/dsv4_ep_diag'))
     parser.add_argument('--input-ids', default=','.join(str(item) for item in DEFAULT_INPUT_IDS))
+    parser.add_argument(
+        '--capacity-wait-seconds',
+        type=float,
+        default=90.0,
+        help='Wait this long for a previous diagnostic adapter to expire (default: 90).',
+    )
+    parser.add_argument(
+        '--capacity-poll-seconds',
+        type=float,
+        default=5.0,
+        help='Seconds between LoRA-capacity checks (default: 5).',
+    )
     return parser.parse_args()
 
 
@@ -59,6 +72,38 @@ def _tensor_sha256(tensor: torch.Tensor) -> str:
     return hashlib.sha256(values).hexdigest()
 
 
+def _wait_for_free_lora(client: Any, timeout: float, poll_interval: float) -> Any:
+    """Wait for the prior probe's session-bound adapter to expire."""
+    if timeout < 0:
+        raise ValueError('--capacity-wait-seconds must be non-negative')
+    if poll_interval <= 0:
+        raise ValueError('--capacity-poll-seconds must be positive')
+
+    deadline = time.monotonic() + timeout
+    while True:
+        capacity = client.get_capacity_info()
+        if capacity.free_loras >= 1:
+            return capacity
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                'Timed out waiting for a free LoRA slot: '
+                f'max_loras={capacity.max_loras}, used_loras={capacity.used_loras}, '
+                f'free_loras={capacity.free_loras}. The previous diagnostic adapter '
+                'did not expire; inspect the ModelManagement cleanup logs or restart '
+                'the diagnostic server.')
+
+        sleep_seconds = min(poll_interval, remaining)
+        print(
+            'Waiting for a free LoRA slot: '
+            f'used={capacity.used_loras}/{capacity.max_loras}, '
+            f'remaining={remaining:.1f}s',
+            flush=True,
+        )
+        time.sleep(sleep_seconds)
+
+
 def main() -> None:
     args = parse_args()
     input_ids = [int(item.strip()) for item in args.input_ids.split(',') if item.strip()]
@@ -71,9 +116,11 @@ def main() -> None:
         session_heartbeat_interval=10,
     )
     try:
-        capacity = client.get_capacity_info()
-        if capacity.free_loras < 1:
-            raise RuntimeError('No free LoRA slot. Restart the diagnostic server before running the probe.')
+        _wait_for_free_lora(
+            client,
+            timeout=args.capacity_wait_seconds,
+            poll_interval=args.capacity_poll_seconds,
+        )
 
         model = MultiLoraTransformersModel(model_id=args.served_model)
         model.add_adapter_to_model(
