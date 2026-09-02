@@ -68,8 +68,10 @@ applications:
         dp_size: 1
         ep_size: 4
       queue_config:
-        rps_limit: 1
-        tps_limit: 10000
+        # Functional diagnostics issue several serial setup requests in quick
+        # succession; do not let the production-style limiter mask EP results.
+        rps_limit: 100
+        tps_limit: 100000
         max_input_tokens: 512
         queue_timeout: 7200
         execution_timeout: 7200

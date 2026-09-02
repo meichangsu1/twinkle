@@ -37,6 +37,8 @@
 诊断工具：
 
 - `cookbook/client/server/transformer/diagnostics/test_dsv4_npu_gmm_layout.py`
+- `cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_ray.py`
+- `cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py`
 - `cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits.py`
 - `cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py`
 
@@ -71,7 +73,7 @@ hidden_size == 2 * moe_intermediate_size == 4096
 
 ```bash
 PROJECT_DIR=/opt/twinkle
-MODEL_DIR=/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16-4layers
+MODEL_DIR=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
 
 cd "$PROJECT_DIR"
 git rev-parse HEAD
@@ -96,16 +98,16 @@ Ray 的 Unix socket 路径必须短，但缓存又不应写入只有 10 GiB 的�
 
 ```bash
 mkdir -p /dev/shm/rh
-mkdir -p /highcode/shared_data/dsv4_ep_diag/tmp
-mkdir -p /highcode/shared_data/dsv4_ep_diag/logs
-mkdir -p /highcode/shared_data/dsv4_ep_diag/results
+mkdir -p /nas/disk6/ljl/dsv4_ep_diag/tmp
+mkdir -p /nas/disk6/ljl/dsv4_ep_diag/logs
+mkdir -p /nas/disk6/ljl/dsv4_ep_diag/results
 ```
 
 之后使用：
 
 ```bash
 export RAY_TMPDIR=/dev/shm/rh
-export TMPDIR=/highcode/shared_data/dsv4_ep_diag/tmp
+export TMPDIR=/nas/disk6/ljl/dsv4_ep_diag/tmp
 export RAY_ROTATION_MAX_BYTES=20971520
 export RAY_ROTATION_BACKUP_COUNT=1
 ```
@@ -131,7 +133,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 \
 PYTHONPATH=/opt/twinkle/src \
 python3 cookbook/client/server/transformer/diagnostics/test_dsv4_npu_gmm_layout.py \
   --device npu:0 \
-  --output /highcode/shared_data/dsv4_ep_diag/results/npu_gmm_layout.json
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/npu_gmm_layout.json
 ```
 
 成功时：
@@ -143,6 +145,278 @@ old_bug_max_abs_diff 明显大于修复后的 max_abs_diff
 ```
 
 如果这里失败，不要启动分布式服务，先处理 NPU GMM 与 `F.linear` 的数值差异。
+
+## 3A. 多机 Ray CLI 基准（推荐）
+
+这里的“CLI”表示在 Head 节点运行一个普通 Python driver，而不是必须使用
+torchrun。driver 直接通过 Ray 创建两节点 NPU 模型 Actor：
+
+```text
+Python driver
+  -> Ray placement group
+  -> 两节点、每节点两个 TransformersModel Actor
+  -> native_fsdp + HCCL + EP
+  -> logits 返回 driver
+```
+
+该模式不启动 Ray Serve、GatewayServer 或 ModelManagement，不创建 HTTP session、
+租户或 LoRA adapter，因此不受槽位、心跳和接口限流影响；同时仍然覆盖 Ray 多机
+Actor、node-local 权重加载、`_broadcast_sharded_state_dict`、FSDP 和 EP。
+
+先创建短临时目录和持久化结果目录：
+
+```bash
+mkdir -p /dev/shm/rh
+mkdir -p /nas/disk6/ljl/dsv4_ep_diag/tmp
+mkdir -p /nas/disk6/ljl/dsv4_ep_diag/logs
+mkdir -p /nas/disk6/ljl/dsv4_ep_diag/results
+```
+
+Head 节点：
+
+```bash
+cd /opt/twinkle
+
+export HEAD_IP=172.61.10.254
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export HCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export PYTHONPATH=/opt/twinkle/src
+export TMPDIR=/nas/disk6/ljl/dsv4_ep_diag/tmp
+
+ray stop --force || true
+ray start \
+  --head \
+  --node-ip-address="$HEAD_IP" \
+  --port=6379 \
+  --num-cpus="$(nproc)" \
+  --resources='{"NPU": 2}' \
+  --temp-dir=/dev/shm/rh \
+  --disable-usage-stats \
+  --include-dashboard=false
+```
+
+Worker 节点：
+
+```bash
+cd /opt/twinkle
+
+export HEAD_IP=172.61.10.254
+export NODE_IP=172.61.12.251
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export HCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export PYTHONPATH=/opt/twinkle/src
+export TMPDIR=/nas/disk6/ljl/dsv4_ep_diag/tmp
+
+ray stop --force || true
+ray start \
+  --address="$HEAD_IP:6379" \
+  --node-ip-address="$NODE_IP" \
+  --num-cpus="$(nproc)" \
+  --resources='{"NPU": 2}' \
+  --temp-dir=/dev/shm/rh \
+  --disable-usage-stats
+```
+
+Worker 加入后，只在 Head 节点运行 driver：
+
+```bash
+cd /opt/twinkle
+
+export DSV4_MODEL_ID=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export HCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export PYTHONPATH=/opt/twinkle/src
+export TMPDIR=/nas/disk6/ljl/dsv4_ep_diag/tmp
+
+python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_ray.py \
+  --ray-address auto \
+  --world-size 4 \
+  --nproc-per-node 2 \
+  --mode no_ep \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results \
+  2>&1 | tee /nas/disk6/ljl/dsv4_ep_diag/logs/ray_no_ep.log
+```
+
+完成后，Ray 集群保持运行。分别重新执行 driver，只修改模式和日志名：
+
+```bash
+python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_ray.py \
+  --ray-address auto --world-size 4 --nproc-per-node 2 \
+  --mode ep_loop \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results \
+  2>&1 | tee /nas/disk6/ljl/dsv4_ep_diag/logs/ray_ep_loop.log
+
+python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_ray.py \
+  --ray-address auto --world-size 4 --nproc-per-node 2 \
+  --mode ep_gmm \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results \
+  2>&1 | tee /nas/disk6/ljl/dsv4_ep_diag/logs/ray_ep_gmm.log
+```
+
+每个 driver 结束时只删除自己创建的模型 Actor 和 placement group，不执行
+`ray stop`。输出文件为：
+
+```text
+ray_no_ep_last_logits.pt/json
+ray_ep_loop_last_logits.pt/json
+ray_ep_gmm_last_logits.pt/json
+```
+
+比较方式：
+
+```bash
+python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
+  /nas/disk6/ljl/dsv4_ep_diag/results/ray_no_ep_last_logits.pt \
+  /nas/disk6/ljl/dsv4_ep_diag/results/ray_ep_loop_last_logits.pt \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_ray_no_ep_vs_ep_loop.json
+
+python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
+  /nas/disk6/ljl/dsv4_ep_diag/results/ray_ep_loop_last_logits.pt \
+  /nas/disk6/ljl/dsv4_ep_diag/results/ray_ep_gmm_last_logits.pt \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_ray_ep_loop_vs_ep_gmm.json
+```
+
+## 3B. 可选的本地/torchrun 基准
+
+CLI 模式直接在 torchrun 进程中构造 `TransformersModel`，不启动 Ray、Gateway
+或 ModelManagement，也不会创建 session、租户和 LoRA 槽位。该步骤验证：
+
+```text
+Transformers checkpoint 转换
+native_fsdp 包装和权重加载
+EP 专家切分与通信
+loop/GMM 专家计算
+```
+
+它不会验证 Ray Actor 和服务端 `_broadcast_sharded_state_dict` 路径，因此 CLI
+通过后仍需执行后面的 C/S 对照。
+
+### 单节点四张 NPU
+
+```bash
+cd /opt/twinkle
+
+export DSV4_MODEL_ID=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export HCCL_SOCKET_IFNAME=bond0
+export GLOO_SOCKET_IFNAME=bond0
+export PYTHONPATH=/opt/twinkle/src
+
+torchrun --standalone --nproc-per-node=4 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode no_ep \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
+
+torchrun --standalone --nproc-per-node=4 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode ep_loop \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
+
+torchrun --standalone --nproc-per-node=4 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode ep_gmm \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
+```
+
+每种模式必须启动一组新的 torchrun 进程，不能在同一 Python 进程内切换
+`TWINKLE_EP_FORCE_LOOP`。
+
+### 两节点、每节点两张 NPU
+
+以下示例中 Head 为 `172.61.10.254`，Worker 为 `172.61.12.251`。先在 Head
+执行 rank 0 命令，它会等待 Worker；然后在 Worker 执行 rank 1 命令。
+
+Head：
+
+```bash
+cd /opt/twinkle
+
+export DSV4_MODEL_ID=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export HCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export PYTHONPATH=/opt/twinkle/src
+
+torchrun \
+  --nnodes=2 \
+  --nproc-per-node=2 \
+  --node-rank=0 \
+  --master-addr=172.61.10.254 \
+  --master-port=29610 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode no_ep \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
+```
+
+Worker：
+
+```bash
+cd /opt/twinkle
+
+export DSV4_MODEL_ID=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export HCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export PYTHONPATH=/opt/twinkle/src
+
+torchrun \
+  --nnodes=2 \
+  --nproc-per-node=2 \
+  --node-rank=1 \
+  --master-addr=172.61.10.254 \
+  --master-port=29610 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode no_ep \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
+```
+
+完成 `no_ep` 后，把两个节点命令中的 `--mode no_ep` 同时改成
+`--mode ep_loop` 再运行一次，然后改成 `--mode ep_gmm`。上一组 torchrun 已经
+完全退出后可以复用端口 `29610`；如果仍有残留进程，则先终止残留进程或换一个
+未占用端口。
+
+只使用一张 NPU 时只能验证 `no_ep`：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+PYTHONPATH=/opt/twinkle/src \
+python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode no_ep \
+  --model-id /nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
+```
+
+CLI 输出：
+
+```text
+cli_no_ep_last_logits.pt/json
+cli_ep_loop_last_logits.pt/json
+cli_ep_gmm_last_logits.pt/json
+```
+
+报告中的 `max_rank_diff` 应接近 0。使用现有比较脚本比较 CLI 三组结果：
+
+```bash
+python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
+  /nas/disk6/ljl/dsv4_ep_diag/results/cli_no_ep_last_logits.pt \
+  /nas/disk6/ljl/dsv4_ep_diag/results/cli_ep_loop_last_logits.pt \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_cli_no_ep_vs_ep_loop.json
+
+python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
+  /nas/disk6/ljl/dsv4_ep_diag/results/cli_ep_loop_last_logits.pt \
+  /nas/disk6/ljl/dsv4_ep_diag/results/cli_ep_gmm_last_logits.pt \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_cli_ep_loop_vs_ep_gmm.json
+```
+
+还可以将 `cli_<mode>_last_logits.pt` 与 C/S 产生的
+`<mode>_last_logits.pt` 比较。CLI 一致而 C/S 不一致时，重点排查 Ray/服务端权重
+分发；CLI 本身已经不一致时，重点排查 FSDP/EP/GMM。
 
 ## 4. 三组服务端对照模式
 
@@ -181,8 +455,8 @@ rank 3 / ep_rank 3: experts 192..255
 以下示例使用：
 
 ```text
-Head:   172.61.10.111
-Worker: 172.61.12.165
+Head:   172.61.10.254
+Worker: 172.61.12.251
 网卡:   eth0
 ```
 
@@ -193,15 +467,15 @@ Head 节点执行：
 ```bash
 cd /opt/twinkle
 
-export DSV4_MODEL_ID=/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16-4layers
-export HEAD_IP=172.61.10.111
-export WORKER_IP=172.61.12.165
-export NODE_IP=172.61.10.111
+export DSV4_MODEL_ID=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
+export HEAD_IP=172.61.10.254
+export WORKER_IP=172.61.12.251
+export NODE_IP=172.61.10.254
 export NETWORK_IFACE=eth0
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 export RESET_RAY=1
 export RAY_TMPDIR=/dev/shm/rh
-export TMPDIR=/highcode/shared_data/dsv4_ep_diag/tmp
+export TMPDIR=/nas/disk6/ljl/dsv4_ep_diag/tmp
 export RAY_ROTATION_MAX_BYTES=20971520
 export RAY_ROTATION_BACKUP_COUNT=1
 ```
@@ -211,15 +485,15 @@ Worker 节点执行：
 ```bash
 cd /opt/twinkle
 
-export DSV4_MODEL_ID=/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16-4layers
-export HEAD_IP=172.61.10.111
-export WORKER_IP=172.61.12.165
-export NODE_IP=172.61.12.165
+export DSV4_MODEL_ID=/nas/disk6/ljl/DeepSeek-V4-Flash-0731-BF16-4layers
+export HEAD_IP=172.61.10.254
+export WORKER_IP=172.61.12.251
+export NODE_IP=172.61.12.251
 export NETWORK_IFACE=eth0
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 export RESET_RAY=1
 export RAY_TMPDIR=/dev/shm/rh
-export TMPDIR=/highcode/shared_data/dsv4_ep_diag/tmp
+export TMPDIR=/nas/disk6/ljl/dsv4_ep_diag/tmp
 export RAY_ROTATION_MAX_BYTES=20971520
 export RAY_ROTATION_BACKUP_COUNT=1
 ```
@@ -232,7 +506,7 @@ export RAY_ROTATION_BACKUP_COUNT=1
 
 ```bash
 nohup bash cookbook/client/server/transformer/run_dsv4_4layer_ep_diagnostic.sh head no_ep \
-  >/highcode/shared_data/dsv4_ep_diag/logs/no_ep_head.log 2>&1 </dev/null &
+  >/nas/disk6/ljl/dsv4_ep_diag/logs/no_ep_head.log 2>&1 </dev/null &
 
 echo "head pid=$!"
 ```
@@ -241,7 +515,7 @@ echo "head pid=$!"
 
 ```bash
 nohup bash cookbook/client/server/transformer/run_dsv4_4layer_ep_diagnostic.sh worker no_ep \
-  >/highcode/shared_data/dsv4_ep_diag/logs/no_ep_worker.log 2>&1 </dev/null &
+  >/nas/disk6/ljl/dsv4_ep_diag/logs/no_ep_worker.log 2>&1 </dev/null &
 ```
 
 服务启动完成后，在 Head 节点保存基准 logits：
@@ -253,8 +527,30 @@ PYTHONPATH=/opt/twinkle/src \
 python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits.py \
   --mode no_ep \
   --server-url http://127.0.0.1:8000 \
-  --output-dir /highcode/shared_data/dsv4_ep_diag/results
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
 ```
+
+诊断配置的 `max_loras` 为 1。一次 probe 结束后，客户端只会停止 session
+心跳；服务端会在 `adapter_timeout: 60` 到期并经过下一轮清理检查后释放临时
+adapter，通常需要最多约 70 秒。probe 默认会等待空闲槽位 90 秒，因此连续执行
+不同模式时不需要重启服务。可按需调整：
+
+```bash
+--capacity-wait-seconds 120 --capacity-poll-seconds 5
+```
+
+只有等待超时且容量仍为 `used_loras=1` 时，才需要检查 ModelManagement 的
+adapter 清理日志或重启诊断服务。
+
+如果旧版 probe 持续输出 `used=0/0`，表示 ModelManagement 尚未通过首个模型请求
+惰性注册容量，并不表示 LoRA 已占满。使用修复后的 probe：它会先调用模型
+`/create`，再查询容量，正常应看到 `used=0/1` 或在上一个 adapter 未清理时看到
+`used=1/1`。
+
+四层诊断配置使用 `rps_limit: 100` 和 `tps_limit: 100000`。probe 会连续调用
+`/create`、`add_adapter`、`set_processor` 和 `forward_only`；若仍使用旧配置中的
+`rps_limit: 1`，这些串行初始化请求也会触发每用户滑动窗口限流。修改 YAML 后必须
+重启诊断服务，运行中的 ModelManagement 不会动态重载 `queue_config`。
 
 生成：
 
@@ -277,14 +573,14 @@ Head：
 
 ```bash
 nohup bash cookbook/client/server/transformer/run_dsv4_4layer_ep_diagnostic.sh head ep_loop \
-  >/highcode/shared_data/dsv4_ep_diag/logs/ep_loop_head.log 2>&1 </dev/null &
+  >/nas/disk6/ljl/dsv4_ep_diag/logs/ep_loop_head.log 2>&1 </dev/null &
 ```
 
 Worker：
 
 ```bash
 nohup bash cookbook/client/server/transformer/run_dsv4_4layer_ep_diagnostic.sh worker ep_loop \
-  >/highcode/shared_data/dsv4_ep_diag/logs/ep_loop_worker.log 2>&1 </dev/null &
+  >/nas/disk6/ljl/dsv4_ep_diag/logs/ep_loop_worker.log 2>&1 </dev/null &
 ```
 
 服务启动后，在 Head 保存 logits：
@@ -296,7 +592,7 @@ PYTHONPATH=/opt/twinkle/src \
 python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits.py \
   --mode ep_loop \
   --server-url http://127.0.0.1:8000 \
-  --output-dir /highcode/shared_data/dsv4_ep_diag/results
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
 ```
 
 日志中必须出现：
@@ -318,14 +614,14 @@ Head：
 
 ```bash
 nohup bash cookbook/client/server/transformer/run_dsv4_4layer_ep_diagnostic.sh head ep_gmm \
-  >/highcode/shared_data/dsv4_ep_diag/logs/ep_gmm_head.log 2>&1 </dev/null &
+  >/nas/disk6/ljl/dsv4_ep_diag/logs/ep_gmm_head.log 2>&1 </dev/null &
 ```
 
 Worker：
 
 ```bash
 nohup bash cookbook/client/server/transformer/run_dsv4_4layer_ep_diagnostic.sh worker ep_gmm \
-  >/highcode/shared_data/dsv4_ep_diag/logs/ep_gmm_worker.log 2>&1 </dev/null &
+  >/nas/disk6/ljl/dsv4_ep_diag/logs/ep_gmm_worker.log 2>&1 </dev/null &
 ```
 
 服务启动后保存 logits：
@@ -337,7 +633,7 @@ PYTHONPATH=/opt/twinkle/src \
 python3 cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits.py \
   --mode ep_gmm \
   --server-url http://127.0.0.1:8000 \
-  --output-dir /highcode/shared_data/dsv4_ep_diag/results
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results
 ```
 
 日志中必须出现：
@@ -356,18 +652,18 @@ EP experts compute: using NPU grouped matmul
 cd /opt/twinkle
 
 python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
-  /highcode/shared_data/dsv4_ep_diag/results/no_ep_last_logits.pt \
-  /highcode/shared_data/dsv4_ep_diag/results/ep_loop_last_logits.pt \
-  --output /highcode/shared_data/dsv4_ep_diag/results/compare_no_ep_vs_ep_loop.json
+  /nas/disk6/ljl/dsv4_ep_diag/results/no_ep_last_logits.pt \
+  /nas/disk6/ljl/dsv4_ep_diag/results/ep_loop_last_logits.pt \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_no_ep_vs_ep_loop.json
 ```
 
 然后比较 loop 与 GMM：
 
 ```bash
 python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
-  /highcode/shared_data/dsv4_ep_diag/results/ep_loop_last_logits.pt \
-  /highcode/shared_data/dsv4_ep_diag/results/ep_gmm_last_logits.pt \
-  --output /highcode/shared_data/dsv4_ep_diag/results/compare_ep_loop_vs_ep_gmm.json
+  /nas/disk6/ljl/dsv4_ep_diag/results/ep_loop_last_logits.pt \
+  /nas/disk6/ljl/dsv4_ep_diag/results/ep_gmm_last_logits.pt \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_ep_loop_vs_ep_gmm.json
 ```
 
 默认判定阈值：
@@ -402,8 +698,8 @@ TWINKLE_EP_DIAGNOSTICS=1
 查看日志：
 
 ```bash
-grep -h '\[EP_DIAG\]' /highcode/shared_data/dsv4_ep_diag/logs/ep_*_head.log \
-  >/highcode/shared_data/dsv4_ep_diag/results/ep_diagnostics.txt
+grep -h '\[EP_DIAG\]' /nas/disk6/ljl/dsv4_ep_diag/logs/ep_*_head.log \
+  >/nas/disk6/ljl/dsv4_ep_diag/results/ep_diagnostics.txt
 ```
 
 重点检查以下日志。
@@ -492,6 +788,8 @@ python3 -m pytest -q tests/kernel/ops/test_moe.py
 
 python3 -m py_compile \
   cookbook/client/server/transformer/diagnostics/test_dsv4_npu_gmm_layout.py \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_ray.py \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
   cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits.py \
   cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py
 
@@ -539,8 +837,65 @@ ray stop --force
 结果位于共享卷：
 
 ```text
-/highcode/shared_data/dsv4_ep_diag/results
-/highcode/shared_data/dsv4_ep_diag/logs
+/nas/disk6/ljl/dsv4_ep_diag/results
+/nas/disk6/ljl/dsv4_ep_diag/logs
 ```
 
 确认不再需要后可手动清理共享卷中的诊断日志和结果。`/dev/shm/rh` 仅用于当前 Pod 的 Ray 临时文件，Pod 删除后不会保留。
+
+## 15. 路由 Management 类型 NameError
+
+如果应用注册路由时出现以下任意错误：
+
+```text
+NameError: name 'GatewayServer' is not defined
+NameError: name 'ModelManagement' is not defined
+NameError: name 'SamplerManagement' is not defined
+NameError: name 'ProcessorManagement' is not defined
+```
+
+说明运行版本中的 handler 只在 `TYPE_CHECKING` 分支导入了对应的 Management
+类型，但 FastAPI 在运行时解析了路由参数的类型注解。这发生在服务配置加载阶段，
+与模型权重、FSDP 和 EP 无关。
+
+当前源码已在 Gateway、Model、Sampler 和 Processor 的 handler 中提供无循环导入
+的运行时类型别名，包括：
+
+```text
+src/twinkle/server/gateway/openai_handlers.py
+src/twinkle/server/gateway/tinker_handlers.py
+src/twinkle/server/gateway/twinkle_handlers.py
+src/twinkle/server/model/tinker_handlers.py
+src/twinkle/server/model/twinkle_handlers.py
+src/twinkle/server/sampler/tinker_handlers.py
+src/twinkle/server/sampler/twinkle_handlers.py
+src/twinkle/server/processor/twinkle_handlers.py
+```
+
+将修复后的源码同步到 head 和 worker 使用的相同 Twinkle 目录，然后重新启动服务。
+可先做静态检查：
+
+```bash
+cd /opt/twinkle
+python3 -m compileall -q \
+  src/twinkle/server/gateway \
+  src/twinkle/server/model \
+  src/twinkle/server/sampler \
+  src/twinkle/server/processor
+```
+
+如果错误仍然存在，先确认容器实际导入的源码位置：
+
+```bash
+cd /opt/twinkle
+PYTHONPATH=/opt/twinkle/src python3 - <<'PY'
+import inspect
+import twinkle.server.gateway.openai_handlers as module
+
+print(inspect.getfile(module))
+print('GatewayServer runtime alias:', module.GatewayServer)
+PY
+```
+
+输出文件应来自 `/opt/twinkle/src/twinkle/server/gateway/`，且不应再次出现
+`NameError`。

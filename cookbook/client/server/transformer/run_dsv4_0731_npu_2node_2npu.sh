@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Head node (172.61.10.111):
+# Head node (172.61.10.254):
 #   bash cookbook/client/server/transformer/run_dsv4_0731_npu_2node_2npu.sh head
 #
-# Worker node (172.61.12.165):
+# Worker node (172.61.12.251):
 #   bash cookbook/client/server/transformer/run_dsv4_0731_npu_2node_2npu.sh worker
 #
 # Override NETWORK_IFACE when the Ray/HCCL interface is not eth0. Set
@@ -16,8 +16,8 @@ if [[ "$ROLE" != "head" && "$ROLE" != "worker" ]]; then
     exit 2
 fi
 
-DEFAULT_HEAD_IP="172.61.10.111"
-DEFAULT_WORKER_IP="172.61.12.165"
+DEFAULT_HEAD_IP="172.61.10.254"
+DEFAULT_WORKER_IP="172.61.12.251"
 HEAD_IP="${HEAD_IP:-$DEFAULT_HEAD_IP}"
 WORKER_IP="${WORKER_IP:-$DEFAULT_WORKER_IP}"
 
