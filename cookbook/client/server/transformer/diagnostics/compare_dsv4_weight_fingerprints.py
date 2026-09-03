@@ -17,7 +17,12 @@ METADATA_FIELDS = (
     'dtype',
     'local_numel',
     'local_is_contiguous',
+    'local_is_meta',
     'sample_count',
+    'is_dtensor',
+    'placements',
+    'device_mesh_shape',
+    'device_mesh_dim_names',
 )
 
 
@@ -46,8 +51,12 @@ def load_rank_reports(directory: Path, mode: str) -> dict[int, dict[str, Any]]:
     return reports
 
 
-def parameter_map(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {record['name']: record for record in report['parameters']}
+def tensor_map(report: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    # Reports written before buffers were added contain only ``parameters``.
+    records = report.get('tensors')
+    if records is None:
+        records = [dict(record, kind='parameter') for record in report['parameters']]
+    return {(record.get('kind', 'parameter'), record['name']): record for record in records}
 
 
 def unravel_index(index: int, shape: list[int]) -> list[int]:
@@ -116,8 +125,9 @@ def main() -> None:
     value_mismatches = []
     missing_parameters = []
     unexpected_parameters = []
-    compared_parameters = 0
-    exact_parameters = 0
+    compared_tensors = 0
+    exact_tensors = 0
+    full_hash_comparisons = 0
 
     for rank in sorted(reference_ranks):
         reference_report = reference_reports[rank]
@@ -125,39 +135,66 @@ def main() -> None:
         if reference_report['sample_algorithm'] != candidate_report['sample_algorithm']:
             raise RuntimeError(f'Rank {rank}: sample algorithms differ')
 
-        reference_parameters = parameter_map(reference_report)
-        candidate_parameters = parameter_map(candidate_report)
-        reference_names = set(reference_parameters)
-        candidate_names = set(candidate_parameters)
-        for name in sorted(reference_names - candidate_names):
-            missing_parameters.append({'rank': rank, 'name': name})
-        for name in sorted(candidate_names - reference_names):
-            unexpected_parameters.append({'rank': rank, 'name': name})
+        reference_tensors = tensor_map(reference_report)
+        candidate_tensors = tensor_map(candidate_report)
+        reference_names = set(reference_tensors)
+        candidate_names = set(candidate_tensors)
+        for kind, name in sorted(reference_names - candidate_names):
+            missing_parameters.append({'rank': rank, 'kind': kind, 'name': name})
+        for kind, name in sorted(candidate_names - reference_names):
+            unexpected_parameters.append({'rank': rank, 'kind': kind, 'name': name})
 
-        for name in sorted(reference_names & candidate_names):
-            compared_parameters += 1
-            reference = reference_parameters[name]
-            candidate = candidate_parameters[name]
+        for kind, name in sorted(reference_names & candidate_names):
+            compared_tensors += 1
+            reference = reference_tensors[(kind, name)]
+            candidate = candidate_tensors[(kind, name)]
             changed_metadata = {
-                field: {'reference': reference[field], 'candidate': candidate[field]}
+                field: {'reference': reference.get(field), 'candidate': candidate.get(field)}
                 for field in METADATA_FIELDS
-                if reference[field] != candidate[field]
+                if reference.get(field) != candidate.get(field)
             }
             if changed_metadata:
                 metadata_mismatches.append({
                     'rank': rank,
+                    'kind': kind,
                     'name': name,
                     'fields': changed_metadata,
                 })
                 continue
-            if reference['sample_sha256'] == candidate['sample_sha256']:
-                exact_parameters += 1
+            reference_full_sha = reference.get('full_sha256')
+            candidate_full_sha = candidate.get('full_sha256')
+            if bool(reference_full_sha) != bool(candidate_full_sha):
+                metadata_mismatches.append({
+                    'rank': rank,
+                    'kind': kind,
+                    'name': name,
+                    'fields': {
+                        'full_sha256_available': {
+                            'reference': bool(reference_full_sha),
+                            'candidate': bool(candidate_full_sha),
+                        }
+                    },
+                })
+                continue
+            if reference_full_sha:
+                full_hash_comparisons += 1
+                values_match = reference_full_sha == candidate_full_sha
+                comparison_basis = 'full_sha256'
+            else:
+                values_match = reference['sample_sha256'] == candidate['sample_sha256']
+                comparison_basis = 'sample_sha256'
+            if values_match:
+                exact_tensors += 1
                 continue
             mismatch = {
                 'rank': rank,
+                'kind': kind,
                 'name': name,
+                'comparison_basis': comparison_basis,
                 'reference_sha256': reference['sample_sha256'],
                 'candidate_sha256': candidate['sample_sha256'],
+                'reference_full_sha256': reference_full_sha,
+                'candidate_full_sha256': candidate_full_sha,
             }
             mismatch.update(describe_value_mismatch(reference, candidate))
             value_mismatches.append(mismatch)
@@ -175,9 +212,10 @@ def main() -> None:
         'reference_memory_efficient_init': reference_reports[min(reference_ranks)]['memory_efficient_init'],
         'candidate_memory_efficient_init': candidate_reports[min(candidate_ranks)]['memory_efficient_init'],
         'ranks': sorted(reference_ranks),
-        'compared_parameters': compared_parameters,
-        'exact_sampled_parameters': exact_parameters,
-        'exact_sampled_fraction': exact_parameters / compared_parameters if compared_parameters else 0.0,
+        'compared_tensors': compared_tensors,
+        'full_hash_comparisons': full_hash_comparisons,
+        'exact_tensors': exact_tensors,
+        'exact_tensor_fraction': exact_tensors / compared_tensors if compared_tensors else 0.0,
         'metadata_mismatch_count': len(metadata_mismatches),
         'value_mismatch_count': len(value_mismatches),
         'missing_parameter_count': len(missing_parameters),

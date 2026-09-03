@@ -49,13 +49,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--dump-weight-fingerprints',
         action='store_true',
-        help='Save sampled local base-parameter fingerprints for every rank after FSDP/EP wrapping.',
+        help='Save local parameter and buffer fingerprints for every rank after FSDP/EP wrapping.',
     )
     parser.add_argument(
         '--weight-fingerprint-samples',
         type=int,
         default=4096,
-        help='Maximum number of evenly spaced values sampled from each local parameter.',
+        help='Maximum number of evenly spaced values sampled from each local tensor.',
+    )
+    parser.add_argument(
+        '--weight-fingerprint-full-hash',
+        action='store_true',
+        help='Also calculate an exact SHA256 over every local parameter and buffer in bounded CPU chunks.',
+    )
+    parser.add_argument(
+        '--weight-fingerprint-chunk-mib',
+        type=int,
+        default=64,
+        help='Maximum target CPU chunk size used by --weight-fingerprint-full-hash.',
     )
     return parser.parse_args()
 
@@ -130,6 +141,28 @@ def _parameter_local_tensor(parameter):
     return value
 
 
+def _tensor_distribution_metadata(tensor) -> dict[str, Any]:
+    from torch.distributed.tensor import DTensor
+
+    value = tensor.detach()
+    if not isinstance(value, DTensor):
+        return {
+            'is_dtensor': False,
+            'placements': None,
+            'device_mesh_shape': None,
+            'device_mesh_dim_names': None,
+        }
+    mesh = value.device_mesh
+    mesh_tensor = getattr(mesh, 'mesh', None)
+    mesh_dim_names = getattr(mesh, 'mesh_dim_names', None)
+    return {
+        'is_dtensor': True,
+        'placements': [repr(placement) for placement in value.placements],
+        'device_mesh_shape': list(mesh_tensor.shape) if mesh_tensor is not None else None,
+        'device_mesh_dim_names': list(mesh_dim_names) if mesh_dim_names is not None else None,
+    }
+
+
 def _sample_tensor_at_flat_positions(tensor, positions: list[int]):
     """Sample logical flat positions without flattening/copying the full tensor."""
     import torch
@@ -151,12 +184,45 @@ def _sample_tensor_at_flat_positions(tensor, positions: list[int]):
     return tensor[coordinates]
 
 
-def _sample_parameter(parameter, sample_limit: int) -> dict[str, Any]:
+def _full_tensor_sha256(tensor, chunk_mib: int) -> str:
+    """Hash a logical tensor in bounded chunks without copying it all to CPU."""
     import torch
 
-    local = _parameter_local_tensor(parameter)
-    positions = _sample_positions(local.numel(), sample_limit)
-    if positions:
+    digest = hashlib.sha256()
+    if tensor.numel() == 0:
+        return digest.hexdigest()
+    if tensor.ndim == 0:
+        cpu_chunk = tensor.detach().cpu().contiguous().reshape(1)
+        digest.update(cpu_chunk.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    row_numel = 1
+    for size in tensor.shape[1:]:
+        row_numel *= int(size)
+    row_bytes = max(1, row_numel * tensor.element_size())
+    rows_per_chunk = max(1, (chunk_mib * 1024 * 1024) // row_bytes)
+    for start in range(0, int(tensor.shape[0]), rows_per_chunk):
+        length = min(rows_per_chunk, int(tensor.shape[0]) - start)
+        cpu_chunk = tensor.narrow(0, start, length).detach().cpu().contiguous()
+        digest.update(cpu_chunk.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _fingerprint_tensor(tensor, sample_limit: int, *, full_hash: bool, chunk_mib: int) -> dict[str, Any]:
+    import torch
+
+    local = _parameter_local_tensor(tensor)
+    local_is_meta = bool(getattr(local, 'is_meta', False))
+    positions = [] if local_is_meta else _sample_positions(local.numel(), sample_limit)
+    if local_is_meta:
+        sample_sha256 = None
+        sample_values = []
+        sample_finite = None
+        sample_min = None
+        sample_max = None
+        sample_sum = None
+        sample_abs_sum = None
+    elif positions:
         sampled = _sample_tensor_at_flat_positions(local, positions).detach().cpu().contiguous()
         # Hash the original dtype bytes. Converting BF16 directly to NumPy is
         # not supported by every NumPy version, whereas a byte view is.
@@ -177,14 +243,15 @@ def _sample_parameter(parameter, sample_limit: int) -> dict[str, Any]:
         sample_sum = 0.0
         sample_abs_sum = 0.0
 
-    return {
-        'global_shape': list(parameter.shape),
-        'global_stride': list(parameter.stride()),
+    result = {
+        'global_shape': list(tensor.shape),
+        'global_stride': list(tensor.stride()),
         'local_shape': list(local.shape),
         'local_stride': list(local.stride()),
         'dtype': str(local.dtype),
         'local_numel': local.numel(),
         'local_is_contiguous': local.is_contiguous(),
+        'local_is_meta': local_is_meta,
         'sample_count': len(positions),
         'sample_sha256': sample_sha256,
         'sample_finite': sample_finite,
@@ -193,7 +260,10 @@ def _sample_parameter(parameter, sample_limit: int) -> dict[str, Any]:
         'sample_min': sample_min,
         'sample_max': sample_max,
         'sample_values': sample_values,
+        'full_sha256': _full_tensor_sha256(local, chunk_mib) if full_hash and not local_is_meta else None,
     }
+    result.update(_tensor_distribution_metadata(tensor))
+    return result
 
 
 def _write_weight_fingerprints(model, args: argparse.Namespace, *, rank: int, world_size: int) -> Path:
@@ -201,16 +271,28 @@ def _write_weight_fingerprints(model, args: argparse.Namespace, *, rank: int, wo
     import torch
 
     inner_model = getattr(model, 'model', model)
-    parameters = []
+    tensors = []
     with torch.no_grad():
         for name, parameter in inner_model.named_parameters():
-            # The probe disables LoRA during forward. Adapter slots are seeded
-            # separately and are not part of the base-weight loading question.
-            if 'lora_' in name:
-                continue
-            record = {'name': name}
-            record.update(_sample_parameter(parameter, args.weight_fingerprint_samples))
-            parameters.append(record)
+            record = {'kind': 'parameter', 'name': name}
+            record.update(
+                _fingerprint_tensor(
+                    parameter,
+                    args.weight_fingerprint_samples,
+                    full_hash=args.weight_fingerprint_full_hash,
+                    chunk_mib=args.weight_fingerprint_chunk_mib,
+                ))
+            tensors.append(record)
+        for name, buffer in inner_model.named_buffers():
+            record = {'kind': 'buffer', 'name': name}
+            record.update(
+                _fingerprint_tensor(
+                    buffer,
+                    args.weight_fingerprint_samples,
+                    full_hash=args.weight_fingerprint_full_hash,
+                    chunk_mib=args.weight_fingerprint_chunk_mib,
+                ))
+            tensors.append(record)
 
     payload = {
         'execution': 'cli',
@@ -221,8 +303,12 @@ def _write_weight_fingerprints(model, args: argparse.Namespace, *, rank: int, wo
         'memory_efficient_init': not args.disable_memory_efficient_init,
         'sample_algorithm': 'flat_evenly_spaced_integer_v1',
         'sample_limit_per_parameter': args.weight_fingerprint_samples,
-        'parameter_count': len(parameters),
-        'parameters': parameters,
+        'full_hash': args.weight_fingerprint_full_hash,
+        'full_hash_chunk_mib': args.weight_fingerprint_chunk_mib,
+        'parameter_count': sum(record['kind'] == 'parameter' for record in tensors),
+        'buffer_count': sum(record['kind'] == 'buffer' for record in tensors),
+        'tensor_count': len(tensors),
+        'tensors': tensors,
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / f'cli_{args.mode}_weight_fingerprints_rank{rank}.json'
@@ -240,6 +326,8 @@ def main() -> None:
         raise SystemExit('--input-ids must contain at least one token ID')
     if args.weight_fingerprint_samples <= 0:
         raise SystemExit('--weight-fingerprint-samples must be positive')
+    if args.weight_fingerprint_chunk_mib <= 0:
+        raise SystemExit('--weight-fingerprint-chunk-mib must be positive')
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('RANK', '0'))

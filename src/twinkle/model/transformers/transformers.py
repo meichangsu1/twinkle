@@ -447,11 +447,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._ensure_optimizer_dp_groups()
         model = self.strategy.unwrap_model(self.model)
         ep_fsdp_mesh = getattr(self.strategy, 'ep_fsdp_device_mesh', None)
+        can_reuse_storage = getattr(self.strategy, 'can_reuse_pre_ep_tensor_storage', None)
+        reuse_pre_ep_storage = bool(can_reuse_storage()) if callable(can_reuse_storage) else False
         apply_expert_parallel(
             model,
             self.device_mesh,
             config=self._expert_parallel_config,
             ep_fsdp_device_mesh=ep_fsdp_mesh,
+            clone_tensor_expert_weights=not reuse_pre_ep_storage,
         )
         self._expert_parallel_applied = True
 

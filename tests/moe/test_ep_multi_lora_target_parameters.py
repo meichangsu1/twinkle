@@ -153,6 +153,38 @@ def test_ep_shards_target_parameter_lora_slots_on_meta():
         assert all(param.shape[0] == 2 and param.is_meta for param in wrapper.lora_B.values())
 
 
+def test_ep_can_reuse_retained_full_tensor_storage_during_memory_efficient_init():
+    _ensure_dummy_zmq()
+    from twinkle.model.transformers.moe.expert_parallel import _shard_tensor_experts
+
+    experts = _FakeTensorExperts()
+    full_gate_up = experts.gate_up_proj
+    full_down = experts.down_proj
+    expected_gate_up = full_gate_up[2:4].detach().clone()
+    expected_down = full_down[2:4].detach().clone()
+
+    _shard_tensor_experts(experts, 2, 4, clone=False)
+
+    assert experts.gate_up_proj.untyped_storage().data_ptr() == full_gate_up.untyped_storage().data_ptr()
+    assert experts.down_proj.untyped_storage().data_ptr() == full_down.untyped_storage().data_ptr()
+    assert torch.equal(experts.gate_up_proj, expected_gate_up)
+    assert torch.equal(experts.down_proj, expected_down)
+
+
+def test_ep_clones_expert_storage_by_default():
+    _ensure_dummy_zmq()
+    from twinkle.model.transformers.moe.expert_parallel import _shard_tensor_experts
+
+    experts = _FakeTensorExperts()
+    full_gate_up = experts.gate_up_proj
+    full_down = experts.down_proj
+
+    _shard_tensor_experts(experts, 2, 4)
+
+    assert experts.gate_up_proj.untyped_storage().data_ptr() != full_gate_up.untyped_storage().data_ptr()
+    assert experts.down_proj.untyped_storage().data_ptr() != full_down.untyped_storage().data_ptr()
+
+
 def test_target_parameter_slot_reset_uses_materialized_ep_local_snapshot():
     _ensure_dummy_zmq()
     from peft import LoraConfig
