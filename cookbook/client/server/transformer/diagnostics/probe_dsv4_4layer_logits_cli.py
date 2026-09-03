@@ -46,6 +46,17 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Load the complete checkpoint in every process before FSDP wrapping.',
     )
+    parser.add_argument(
+        '--dump-weight-fingerprints',
+        action='store_true',
+        help='Save sampled local base-parameter fingerprints for every rank after FSDP/EP wrapping.',
+    )
+    parser.add_argument(
+        '--weight-fingerprint-samples',
+        type=int,
+        default=4096,
+        help='Maximum number of evenly spaced values sampled from each local parameter.',
+    )
     return parser.parse_args()
 
 
@@ -99,6 +110,126 @@ def _check_rank_consistency(last_logits):
     return float(max_diff.item())
 
 
+def _sample_positions(numel: int, count: int) -> list[int]:
+    """Return deterministic, evenly spaced flat indices without float rounding."""
+    if numel <= 0 or count <= 0:
+        return []
+    count = min(numel, count)
+    if count == 1:
+        return [0]
+    return [index * (numel - 1) // (count - 1) for index in range(count)]
+
+
+def _parameter_local_tensor(parameter):
+    """Return the rank-local tensor for both regular Parameters and FSDP2 DTensors."""
+    from torch.distributed.tensor import DTensor
+
+    value = parameter.detach()
+    if isinstance(value, DTensor):
+        value = value.to_local()
+    return value
+
+
+def _sample_tensor_at_flat_positions(tensor, positions: list[int]):
+    """Sample logical flat positions without flattening/copying the full tensor."""
+    import torch
+
+    if not positions:
+        return torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+    if tensor.ndim == 0:
+        return tensor.reshape(1)
+
+    remaining = positions
+    coordinate_columns = []
+    for size in reversed(tensor.shape):
+        coordinate_columns.append([position % size for position in remaining])
+        remaining = [position // size for position in remaining]
+    coordinates = tuple(
+        torch.tensor(column, dtype=torch.long, device=tensor.device)
+        for column in reversed(coordinate_columns)
+    )
+    return tensor[coordinates]
+
+
+def _sample_parameter(parameter, sample_limit: int) -> dict[str, Any]:
+    import torch
+
+    local = _parameter_local_tensor(parameter)
+    positions = _sample_positions(local.numel(), sample_limit)
+    if positions:
+        sampled = _sample_tensor_at_flat_positions(local, positions).detach().cpu().contiguous()
+        # Hash the original dtype bytes. Converting BF16 directly to NumPy is
+        # not supported by every NumPy version, whereas a byte view is.
+        sample_sha256 = hashlib.sha256(sampled.view(torch.uint8).numpy().tobytes()).hexdigest()
+        sampled_float = sampled.float()
+        sample_values = sampled_float.tolist()
+        sample_finite = bool(torch.isfinite(sampled_float).all().item())
+        sample_min = float(sampled_float.min().item())
+        sample_max = float(sampled_float.max().item())
+        sample_sum = float(sampled_float.sum().item())
+        sample_abs_sum = float(sampled_float.abs().sum().item())
+    else:
+        sample_sha256 = hashlib.sha256(b'').hexdigest()
+        sample_values = []
+        sample_finite = True
+        sample_min = None
+        sample_max = None
+        sample_sum = 0.0
+        sample_abs_sum = 0.0
+
+    return {
+        'global_shape': list(parameter.shape),
+        'global_stride': list(parameter.stride()),
+        'local_shape': list(local.shape),
+        'local_stride': list(local.stride()),
+        'dtype': str(local.dtype),
+        'local_numel': local.numel(),
+        'local_is_contiguous': local.is_contiguous(),
+        'sample_count': len(positions),
+        'sample_sha256': sample_sha256,
+        'sample_finite': sample_finite,
+        'sample_sum': sample_sum,
+        'sample_abs_sum': sample_abs_sum,
+        'sample_min': sample_min,
+        'sample_max': sample_max,
+        'sample_values': sample_values,
+    }
+
+
+def _write_weight_fingerprints(model, args: argparse.Namespace, *, rank: int, world_size: int) -> Path:
+    """Write rank-local post-wrap base-weight fingerprints to a JSON file."""
+    import torch
+
+    inner_model = getattr(model, 'model', model)
+    parameters = []
+    with torch.no_grad():
+        for name, parameter in inner_model.named_parameters():
+            # The probe disables LoRA during forward. Adapter slots are seeded
+            # separately and are not part of the base-weight loading question.
+            if 'lora_' in name:
+                continue
+            record = {'name': name}
+            record.update(_sample_parameter(parameter, args.weight_fingerprint_samples))
+            parameters.append(record)
+
+    payload = {
+        'execution': 'cli',
+        'mode': args.mode,
+        'model_id': str(Path(args.model_id).expanduser()),
+        'rank': rank,
+        'world_size': world_size,
+        'memory_efficient_init': not args.disable_memory_efficient_init,
+        'sample_algorithm': 'flat_evenly_spaced_integer_v1',
+        'sample_limit_per_parameter': args.weight_fingerprint_samples,
+        'parameter_count': len(parameters),
+        'parameters': parameters,
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output = args.output_dir / f'cli_{args.mode}_weight_fingerprints_rank{rank}.json'
+    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return output
+
+
 def main() -> None:
     args = parse_args()
     if not args.model_id:
@@ -107,6 +238,8 @@ def main() -> None:
     input_ids = [int(item.strip()) for item in args.input_ids.split(',') if item.strip()]
     if not input_ids:
         raise SystemExit('--input-ids must contain at least one token ID')
+    if args.weight_fingerprint_samples <= 0:
+        raise SystemExit('--weight-fingerprint-samples must be positive')
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('RANK', '0'))
@@ -202,6 +335,14 @@ def main() -> None:
         return_logits=True,
     )
     last_logits = _extract_logits(response)
+    fingerprint_path = None
+    if args.dump_weight_fingerprints:
+        fingerprint_path = _write_weight_fingerprints(
+            model,
+            args,
+            rank=rank,
+            world_size=world_size,
+        )
     max_rank_diff = _check_rank_consistency(last_logits)
     last_logits_cpu = last_logits.cpu()
 
@@ -247,6 +388,9 @@ def main() -> None:
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
         print(f'Logits saved to: {tensor_path.resolve()}', flush=True)
         print(f'Report saved to: {json_path.resolve()}', flush=True)
+
+    if fingerprint_path is not None:
+        print(f'Rank {rank} weight fingerprints saved to: {fingerprint_path.resolve()}', flush=True)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

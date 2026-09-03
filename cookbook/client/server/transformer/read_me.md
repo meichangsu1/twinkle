@@ -432,6 +432,69 @@ python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logit
   --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_cli_ep_loop_vs_ep_gmm.json
 ```
 
+### 比较 memory_efficient_init 开关后的实际权重
+
+最终 logits 不同只能证明初始化路径影响了结果。要定位具体参数，使用相同的
+`ep_loop` 计算路径分别开启和关闭 `memory_efficient_init`，并增加
+`--dump-weight-fingerprints`。诊断只读取每个 rank 的本地参数，并从每个参数均匀
+采样最多 4096 个值，不会将完整权重保存到磁盘，也不会为了展平非连续参数而复制
+完整权重。
+
+开启：
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode ep_loop \
+  --dump-weight-fingerprints \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results/memory_efficient_on
+```
+
+关闭：
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
+  --mode ep_loop \
+  --disable-memory-efficient-init \
+  --dump-weight-fingerprints \
+  --output-dir /nas/disk6/ljl/dsv4_ep_diag/results/memory_efficient_off
+```
+
+每次运行会按 rank 生成：
+
+```text
+cli_ep_loop_weight_fingerprints_rank0.json
+cli_ep_loop_weight_fingerprints_rank1.json
+cli_ep_loop_weight_fingerprints_rank2.json
+cli_ep_loop_weight_fingerprints_rank3.json
+```
+
+以关闭状态作为 reference 进行比较：
+
+```bash
+python3 cookbook/client/server/transformer/diagnostics/compare_dsv4_weight_fingerprints.py \
+  /nas/disk6/ljl/dsv4_ep_diag/results/memory_efficient_off \
+  /nas/disk6/ljl/dsv4_ep_diag/results/memory_efficient_on \
+  --mode ep_loop \
+  --output /nas/disk6/ljl/dsv4_ep_diag/results/compare_memory_init_weights.json \
+  || true
+```
+
+重点查看比较报告中的以下字段：
+
+```text
+metadata_mismatches    shape、stride、dtype 或连续性不同
+value_mismatches       参数采样值不同
+first_difference       第一个不同采样值的本地 flat index 和多维坐标
+rank                   不同权重所在的 EP/FSDP rank
+name                   不同权重的完整参数名
+```
+
+如果第一个不一致参数是 `embed_tokens`、attention、norm 或 `lm_head`，优先检查
+普通 FSDP DTensor 重建。如果只有 `mlp.experts.gate_up_proj/down_proj` 不一致，优先
+检查 pre-EP state capture 和 `_scatter_ep_expert_tensor()` 的专家切分。
+
 还可以将 `cli_<mode>_last_logits.pt` 与 C/S 产生的
 `<mode>_last_logits.pt` 比较。CLI 一致而 C/S 不一致时，重点排查 Ray/服务端权重
 分发；CLI 本身已经不一致时，重点排查 FSDP/EP/GMM。
@@ -809,7 +872,8 @@ python3 -m py_compile \
   cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_ray.py \
   cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits_cli.py \
   cookbook/client/server/transformer/diagnostics/probe_dsv4_4layer_logits.py \
-  cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py
+  cookbook/client/server/transformer/diagnostics/compare_dsv4_4layer_logits.py \
+  cookbook/client/server/transformer/diagnostics/compare_dsv4_weight_fingerprints.py
 
 bash -n \
   cookbook/client/server/transformer/run_dsv4_0731_npu_2node_2npu.sh \
