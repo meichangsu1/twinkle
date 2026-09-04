@@ -207,10 +207,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         # Generation invokes many forwards inside one context. Do not retain a
         # parametrized expert weight across FSDP reshard boundaries; recompute
         # the routed-expert LoRA delta when each decoder forward accesses it.
-        with self.multi_adapter.adapter(
-                adapter_name,
-                disable_lora=disable_lora,
-                cache_target_parameters=False):
+        with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora, cache_target_parameters=False):
             return super().generate(
                 inputs=inputs,
                 adapter_name=adapter_name,

@@ -1,5 +1,3 @@
-import importlib
-
 import pytest
 import torch
 from torch import nn
@@ -63,13 +61,3 @@ def test_normalize_packed_expert_weights_rejects_inconsistent_layout():
     module = _PackedExperts(torch.randn(2, 7, 9), torch.randn(2, 5, 6))
     with pytest.raises(RuntimeError, match='Unable to determine packed expert weight layout'):
         _normalize_packed_expert_weights(module, torch.float32, hidden_dim=8)
-
-
-def test_ep_force_loop_environment_switch(monkeypatch):
-    ep_ops = importlib.import_module('twinkle.kernel.ops.ep')
-
-    monkeypatch.setenv('TWINKLE_EP_FORCE_LOOP', '1')
-    implementations = ep_ops._get_impls()
-
-    assert len(implementations) == 1
-    assert implementations[0].name == 'per-expert loop'

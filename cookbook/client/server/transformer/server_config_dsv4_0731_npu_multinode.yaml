@@ -30,7 +30,7 @@ applications:
       server_config:
         per_token_model_limit: 1
       supported_models:
-        - deepseek-v4-0731-local
+        - DeepSeek-V4-Flash-0731
     deployments:
       - name: TinkerCompatServer
         max_ongoing_requests: 50
@@ -44,8 +44,8 @@ applications:
             env_vars:
               TWINKLE_FAIL_FAST: "1"
 
-  - name: models-deepseek-v4-0731-local
-    route_prefix: /api/v1/model/deepseek-v4-0731-local
+  - name: models-DeepSeek-V4-Flash-0731
+    route_prefix: /api/v1/model/DeepSeek-V4-Flash-0731
     import_path: model
     args:
       backend: transformers
@@ -54,8 +54,8 @@ applications:
       # Resolved from the launch environment on the head node.
       model_id: ${oc.env:DSV4_MODEL_ID,hf://deepseek-ai/DeepSeek-V4-Flash-0731}
       nproc_per_node: 16
-      max_loras: 1
-      max_r: 8
+      max_loras: 3
+      max_r: 32
       max_length: 8192
       mixed_precision: bf16
       strategy: native_fsdp

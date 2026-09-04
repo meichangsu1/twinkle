@@ -26,7 +26,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
 CONFIG_PATH="$SCRIPT_DIR/server_config_dsv4_0731_npu_multinode.yaml"
 export DSV4_MODEL_ID="${DSV4_MODEL_ID:-hf://deepseek-ai/DeepSeek-V4-Flash-0731}"
-DATASET_PATH="${DATASET_ID:-/model/ljl/dataset/self-cognition.jsonl}"
 
 NPU_PER_NODE=16
 NNODES=2
@@ -67,7 +66,6 @@ if [[ "${#VISIBLE_NPUS[@]}" -ne "$NPU_PER_NODE" ]]; then
 fi
 
 test -f "$CONFIG_PATH"
-test -f "$DATASET_PATH"
 
 if [[ "$DSV4_MODEL_ID" == hf://* || "$DSV4_MODEL_ID" == ms://* ]]; then
     echo "Model will be downloaded through the configured Hub backend: $DSV4_MODEL_ID"

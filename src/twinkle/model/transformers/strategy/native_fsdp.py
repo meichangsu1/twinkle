@@ -8,14 +8,12 @@ from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import fully_shard
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
-from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
+from twinkle.utils import DeviceMesh, Platform, torch_util
 from twinkle.utils.torch_utils import snapshot_state_dict_to_cpu
 from .load_context import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
-
-logger = get_logger()
 
 LORA_STATE_KEY_MARKERS = ('lora_A', 'lora_B', 'lora_embedding')
 PEFT_BASE_PREFIX = 'base_model.model.'
@@ -84,8 +82,7 @@ class NativeFSDPStrategy:
         # second full-model-sized allocation on every node-local source rank.
         # The retained tensors are immutable until wrap_model() finishes
         # broadcasting the rank-local shards.
-        self.set_rank0_pre_ep_full_state_dict(
-            snapshot_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
+        self.set_rank0_pre_ep_full_state_dict(snapshot_state_dict_to_cpu(model.state_dict()) if is_source_rank else {})
         self._pre_ep_state_captured = True
 
     def can_reuse_pre_ep_tensor_storage(self) -> bool:
@@ -1028,9 +1025,6 @@ def _broadcast_sharded_state_dict(
     rank_to_ep_rank = rank_to_ep_rank or {}
     adapter_source_sd = adapter_source_sd or {}
     adapter_full_sd = adapter_full_sd or {}
-    diagnostics_enabled = os.environ.get('TWINKLE_EP_DIAGNOSTICS', '').strip().lower() in {
-        '1', 'true', 'yes', 'on'
-    }
     source_metadata = None
     source_keys = None
     adapter_metadata = None
@@ -1144,42 +1138,13 @@ def _broadcast_sharded_state_dict(
                 raise RuntimeError(f"EP expert parameter '{param_name}' expects {num_experts} experts, "
                                    f'but source state has shape {tuple(full_tensor.shape)}. '
                                    'Rank0 must capture the full pre-EP state_dict before apply_expert_parallel().')
-            if diagnostics_enabled:
-                logger.warning(
-                    '[EP_DIAG] rank=%s local_source=%s param=%s full_shape=%s source_preview=%s',
-                    rank,
-                    local_source_rank,
-                    param_name,
-                    tuple(full_tensor.shape),
-                    _diagnostic_tensor_preview(full_tensor),
-                )
         local_tensor = _scatter_ep_tensor_from_source(
             full_tensor,
             local_tensor,
             shard_dim=0,
             shard_size=experts_per_rank,
         )
-        if diagnostics_enabled:
-            ep_rank = rank_to_ep_rank[rank]
-            start = ep_rank * experts_per_rank
-            logger.warning(
-                '[EP_DIAG] rank=%s ep_rank=%s param=%s expert_range=[%s,%s) local_shape=%s local_preview=%s',
-                rank,
-                ep_rank,
-                param_name,
-                start,
-                start + experts_per_rank,
-                tuple(local_tensor.shape),
-                _diagnostic_tensor_preview(local_tensor),
-            )
         return local_tensor
-
-    def _diagnostic_tensor_preview(tensor: torch.Tensor) -> List[float]:
-        flat = tensor.detach().reshape(-1)
-        if flat.numel() == 0:
-            return []
-        indices = sorted({0, flat.numel() // 3, (2 * flat.numel()) // 3, flat.numel() - 1})
-        return flat[indices].float().cpu().tolist()
 
     def _scatter_ep_tensor_from_source(full_tensor, local_tensor, *, shard_dim: int, shard_size: int):
         if is_source_rank:

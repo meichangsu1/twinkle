@@ -63,9 +63,8 @@ def _normalize_packed_expert_weights(module, input_dtype, hidden_dim):
     gate_up_proj = module.gate_up_proj.to(input_dtype)
     down_proj = module.down_proj.to(input_dtype)
     if gate_up_proj.ndim != 3 or down_proj.ndim != 3:
-        raise RuntimeError(
-            'Packed expert weights must be 3D: '
-            f'gate_up_proj={tuple(gate_up_proj.shape)}, down_proj={tuple(down_proj.shape)}.')
+        raise RuntimeError('Packed expert weights must be 3D: '
+                           f'gate_up_proj={tuple(gate_up_proj.shape)}, down_proj={tuple(down_proj.shape)}.')
 
     # torch.nn.functional.linear stores weights as [out_features, in_features],
     # while torch_npu.npu_grouped_matmul consumes [in_features, out_features].
@@ -76,11 +75,10 @@ def _normalize_packed_expert_weights(module, input_dtype, hidden_dim):
     linear_layout = gate_up_proj.shape[2] == hidden_dim and down_proj.shape[1] == hidden_dim
     grouped_mm_layout = gate_up_proj.shape[1] == hidden_dim and down_proj.shape[2] == hidden_dim
     if linear_layout == grouped_mm_layout:
-        raise RuntimeError(
-            'Unable to determine packed expert weight layout: '
-            f'gate_up_proj={tuple(gate_up_proj.shape)}, down_proj={tuple(down_proj.shape)}, '
-            f'hidden_dim={hidden_dim}. Expected either Transformers/F.linear '
-            '[E, out, in] tensors or grouped-matmul [E, in, out] tensors.')
+        raise RuntimeError('Unable to determine packed expert weight layout: '
+                           f'gate_up_proj={tuple(gate_up_proj.shape)}, down_proj={tuple(down_proj.shape)}, '
+                           f'hidden_dim={hidden_dim}. Expected either Transformers/F.linear '
+                           '[E, out, in] tensors or grouped-matmul [E, in, out] tensors.')
 
     if linear_layout:
         gate_up_weight = gate_up_proj.transpose(1, 2)

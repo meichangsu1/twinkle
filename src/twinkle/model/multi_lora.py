@@ -173,15 +173,10 @@ class MultiLora:
         self.target_parameter_manager.patch(module, target_parameters)
 
     @contextmanager
-    def adapter(self,
-                tenant_adapter_name: str,
-                disable_lora: bool = False,
-                cache_target_parameters: bool = True):
+    def adapter(self, tenant_adapter_name: str, disable_lora: bool = False, cache_target_parameters: bool = True):
         self.activate_adapter(tenant_adapter_name)
         with self.target_parameter_manager.adapter(
-                tenant_adapter_name,
-                disable_lora=disable_lora,
-                cache=cache_target_parameters):
+                tenant_adapter_name, disable_lora=disable_lora, cache=cache_target_parameters):
             if disable_lora:
                 # Temporarily disable all adapters while keeping optimizer_group active
                 with self._disable_lora_context(tenant_adapter_name):
