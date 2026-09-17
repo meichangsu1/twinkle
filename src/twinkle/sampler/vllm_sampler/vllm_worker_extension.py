@@ -126,6 +126,8 @@ class TwinkleWorkerExtension:
         base_sync_done: bool = False,
         use_shm: bool = False,
         zmq_handle: Optional[str] = None,
+        lora_only: bool = False,
+        weight_adapter: Optional[Dict] = None,
     ) -> None:
         """Receive and load weights via ZMQ + CUDA IPC/SHM.
 
@@ -155,6 +157,9 @@ class TwinkleWorkerExtension:
             device_str = Torch.get_device(local_rank)
             logger.info(f'vLLM worker bind device: local_rank={local_rank}, device={device_str}')
             self.device = torch.device(device_str)
+
+        if lora_only and (not peft_config or weight_adapter is None):
+            raise ValueError('Source-native LoRA requires peft_config and an explicit weight_adapter')
 
         # Detect TP rank — vLLM sets self.rank on each worker.
         tp_rank = getattr(self, 'rank', 0)
@@ -245,7 +250,7 @@ class TwinkleWorkerExtension:
         # ── Step 3: Receive and process weight buckets ──
         partial_tensors: dict = {}
         lora_bucket_accum: list[tuple[str, torch.Tensor]] = []
-        lora_mode = bool(peft_config and base_sync_done)
+        lora_mode = bool(peft_config and (base_sync_done or lora_only))
         while True:
             # Only the driver receives bucket metadata from VLLMEngine.
             if is_driver:
@@ -330,13 +335,13 @@ class TwinkleWorkerExtension:
 
             Torch.synchronize()
 
-            if is_driver:
-                socket.send(b'')
-
             # Ensure all ranks finish reading the buffer before the driver
             # proceeds to the next bucket (which overwrites the buffer).
             if tp_size > 1:
                 dist.barrier(group=cpu_group)
+
+            if is_driver:
+                socket.send(b'')
 
             if lora_mode:
                 lora_bucket_accum.extend(weights)
@@ -354,6 +359,8 @@ class TwinkleWorkerExtension:
                         lora_bucket_accum,
                         peft_config=peft_config,
                         base_sync_done=base_sync_done,
+                        lora_only=lora_only,
+                        weight_adapter=weight_adapter,
                     )
                 break
 
@@ -382,6 +389,42 @@ class TwinkleWorkerExtension:
         gc.collect()
         Torch.ipc_collect()
         Torch.empty_cache()
+
+    def _process_lora_weights(self, weights, peft_config, weight_adapter=None):
+        """Load-time hook: the default is identity; installation stays below."""
+        if weight_adapter is None:
+            return weights, peft_config
+        return self._get_weight_adapter(weight_adapter).process(weights, peft_config)
+
+    def _get_weight_adapter(self, config):
+        from .weight_sync import create_weight_adapter, normalize_weight_adapter
+        config = normalize_weight_adapter(config)
+        if config is None:
+            raise ValueError('Raw LoRA synchronization requires an explicit rollout weight_adapter')
+        cached = getattr(self, '_rollout_weight_adapter', None)
+        if cached is not None:
+            if config != self._rollout_weight_adapter_config:
+                raise ValueError('weight_adapter changed; restart rollout workers to change adapters')
+            return cached
+        if self.device is None:
+            self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
+        vconfig = self.vllm_config
+        hf = vconfig.model_config.hf_config
+        lora = vconfig.lora_config
+        target = dict(
+            device=str(self.device),
+            model_path=getattr(vconfig.model_config, 'model', None),
+            model_config=hf.to_dict() if hasattr(hf, 'to_dict') else vars(hf),
+            enable_lora=lora is not None,
+            max_lora_rank=lora.max_lora_rank if lora else 0,
+            lora_dtype=str(lora.lora_dtype) if lora else None,
+            pp_size=vconfig.parallel_config.pipeline_parallel_size,
+            ep_enabled=vconfig.parallel_config.enable_expert_parallel,
+            tp_size=vconfig.parallel_config.tensor_parallel_size)
+        adapter = create_weight_adapter(config, target)
+        self._rollout_weight_adapter_config = config
+        self._rollout_weight_adapter = adapter
+        return adapter
 
     def load_synced_weights(
         self,
@@ -442,23 +485,27 @@ class TwinkleWorkerExtension:
         weights: List[Tuple[str, torch.Tensor]],
         peft_config: Optional[Dict],
         base_sync_done: bool,
+        lora_only: bool = False,
+        weight_adapter: Optional[Dict] = None,
     ) -> None:
         """Load a batch of weights into vLLM.
 
         Two modes:
 
-        * **LoRA mode** (``peft_config`` set and ``base_sync_done=True``):
+        * **LoRA mode** (``peft_config`` set and base synced or ``lora_only``):
           loads weights as a tensor-based LoRA adapter via ``add_lora()``.
         * **Base model mode** (all other cases): delegates to
           ``model.load_weights()`` which handles stacked-parameter merging
           (q/k/v → qkv, gate/up → gate_up) and prefix mapping internally.
 
-        Weight names are expected to arrive **already normalised** by the
-        sender (``TransformersModel.send_weights`` /
-        ``MegatronModel.send_weights``), so no name transformation is done
-        here.
+        By default, weights arrive already normalized by the sender. An
+        explicitly configured LoRA processor can adapt names, layouts and
+        numeric representation before the existing loader is invoked.
         """
-        if peft_config and base_sync_done:
+        if lora_only and not peft_config:
+            raise ValueError('LoRA-only loading requires peft_config')
+        if peft_config and (base_sync_done or lora_only):
+            weights, peft_config = self._process_lora_weights(weights, peft_config, weight_adapter)
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
 
             converted = {self._convert_peft_to_vllm_lora_name(n): t for n, t in weights}

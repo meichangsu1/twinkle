@@ -18,7 +18,7 @@ api_key = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 served_model_name = os.environ.get('TWINKLE_MODEL_ID', 'DeepSeek-V4-Flash-0731')
 model_path = os.environ.get('MODEL_LOCAL_PATH') or os.environ.get('DSV4_MODEL_ID', '')
 dataset_id = os.environ.get('DATASET_PATH') or os.environ.get('DATASET_ID', '')
-epochs = int(os.environ.get('EPOCHS') or os.environ.get('NUM_EPOCHS', '3'))
+epochs = int(os.environ.get('EPOCHS') or os.environ.get('NUM_EPOCHS', '1'))
 max_length = int(os.environ.get('MAX_LENGTH', '8192'))
 truncation_strategy = os.environ.get('TRUNCATION_STRATEGY', 'delete')
 batch_size = int(os.environ.get('BATCH_SIZE', '32'))
@@ -75,7 +75,11 @@ def build_local_dataloader() -> DataLoader:
     if not os.path.exists(model_path):
         raise FileNotFoundError(f'Client cannot access tokenizer/model directory: {model_path}')
 
-    dataset = Dataset(dataset_meta=DatasetMeta(dataset_id=dataset_id))
+    # data_slice wraps out-of-range indices to repeat the dataset for 100 optimizer steps.
+    dataset = Dataset(dataset_meta=DatasetMeta(
+        dataset_id=dataset_id,
+        data_slice=range(100 * batch_size * grad_accumulation_steps),
+    ))
     dataset.set_template(
         template,
         model_id=model_path,

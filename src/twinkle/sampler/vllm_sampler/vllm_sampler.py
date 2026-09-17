@@ -442,6 +442,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self,
         base_sync_done: bool = False,
         peft_config: dict = None,
+        lora_only: bool = False,
     ):
         """Receive weights via NCCL broadcast and stream into vLLM.
 
@@ -455,15 +456,15 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
            a time, copying each into a GPU IPC bucket and flushing to the
            vLLM worker subprocess when the bucket is full.
 
-        Peak GPU overhead is only ~1 IPC bucket (~2 GB) instead of a full
-        model copy.
+        Complete LoRA tensors are retained until loading. Conversion and the
+        vLLM loader may allocate additional copies beyond the IPC bucket.
 
         Args:
             base_sync_done: If True, this is a LoRA-only sync.
             peft_config: PEFT config dict for LoRA adapter loading.
 
         Returns:
-            Number of weights loaded (approximate, from engine log).
+            None. Exceptions propagate to the caller.
         """
         engine = self._get_or_create_checkpoint_engine()
 
@@ -471,15 +472,17 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             # Stream NCCL-received tensors directly into vLLM via IPC.
             # VLLMEngine.update_weights accepts an async generator and
             # handles bucket packing + ZMQ transfer internally.
+            extra = dict(lora_only=True) if lora_only else {}
             await self.engine.update_weights(
                 engine.receive_weights(),  # async generator — not materialised
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
+                **extra,
             )
 
             # After a LoRA sync, refresh the cached LoRARequest in engine
             # so that sample() can use it without per-request list_loras RPC.
-            if base_sync_done and peft_config:
+            if (base_sync_done or lora_only) and peft_config:
                 await self.engine.refresh_synced_lora()
             elif not base_sync_done:
                 # Base-model sync invalidates any previously synced LoRA.

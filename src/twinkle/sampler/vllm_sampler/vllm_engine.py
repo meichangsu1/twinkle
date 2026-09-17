@@ -229,6 +229,7 @@ class VLLMEngine(BaseSamplerEngine):
         load_format: str = 'auto',
         logprobs_mode: Optional[str] = None,
         enable_sampling_replay: bool = False,
+        weight_adapter: Optional[dict] = None,
         **kwargs,
     ):
         from twinkle.hub import HubOperation
@@ -239,6 +240,8 @@ class VLLMEngine(BaseSamplerEngine):
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.enable_lora = enable_lora
+        from .weight_sync import normalize_weight_adapter
+        self.weight_adapter = normalize_weight_adapter(weight_adapter)
         self.max_loras = max_loras
         self.max_lora_rank = max_lora_rank
         self.enable_sleep_mode = enable_sleep_mode
@@ -745,6 +748,7 @@ class VLLMEngine(BaseSamplerEngine):
         peft_config: Optional[dict] = None,
         base_sync_done: bool = False,
         bucket_size_mb: int = 2048,
+        lora_only: bool = False,
         **kwargs,
     ) -> None:
         """Update model weights via ZMQ + CUDA IPC to worker extension.
@@ -772,6 +776,9 @@ class VLLMEngine(BaseSamplerEngine):
 
         start_time = time.time()
 
+        if lora_only and (self.weight_adapter is None or not peft_config):
+            raise ValueError('Source-native LoRA requires peft_config and an explicit weight_adapter')
+
         # Normalise *weights* into an async iterator regardless of input type.
         if isinstance(weights, dict):
 
@@ -794,6 +801,8 @@ class VLLMEngine(BaseSamplerEngine):
         try:
             first_name, first_tensor = await weight_aiter.__anext__()
         except StopAsyncIteration:
+            if lora_only:
+                raise ValueError('Empty LoRA synchronization stream')
             logger.warning('update_weights called with empty weights')
             return
 
@@ -813,7 +822,7 @@ class VLLMEngine(BaseSamplerEngine):
             raise ValueError(f'bucket_size_mb must be > 0, got {bucket_size_mb}')
 
         bucket_size = bucket_size_mb << 20
-        lora_mode = bool(base_sync_done and peft_config)
+        lora_mode = bool((base_sync_done or lora_only) and peft_config)
 
         # Create transfer buffer
         buffer = None
@@ -879,6 +888,8 @@ class VLLMEngine(BaseSamplerEngine):
                         'base_sync_done': base_sync_done,
                         'use_shm': use_shm,
                         'zmq_handle': zmq_handle,
+                        **({'lora_only': True} if lora_only else {}),
+                        **({'weight_adapter': self.weight_adapter} if self.weight_adapter is not None else {}),
                     },
                 ))
 
@@ -988,7 +999,7 @@ class VLLMEngine(BaseSamplerEngine):
             gc.collect()
 
         elapsed = time.time() - start_time
-        mode = 'LoRA' if base_sync_done and peft_config else 'base'
+        mode = 'LoRA' if lora_mode else 'base'
         logger.info(f'Updated {n_weights} {mode} weights via '
                     f"{'IPC' if use_gpu_ipc else 'SHM'} in {elapsed:.2f}s")
 

@@ -28,6 +28,14 @@ class CheckpointEngineMixin:
 
     @remote_function(collect='first', lazy_collect=False)
     def prepare_checkpoint_engine(self, is_master):
+        # Slice dispatch retains a singleton list, whose truth value would be
+        # True even for [False]. Only rank 0 may create a metadata publisher.
+        if isinstance(is_master, list):
+            if len(is_master) != 1:
+                raise ValueError('Expected one checkpoint master flag per worker')
+            is_master = is_master[0]
+        if not isinstance(is_master, bool):
+            raise ValueError('Checkpoint master flag must be boolean')
         engine = self._get_or_create_checkpoint_engine()
         engine.is_master = is_master
         return engine.prepare()

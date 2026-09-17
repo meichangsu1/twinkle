@@ -108,6 +108,28 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         assert adapter_name and adapter_name in self.optimizer_group, (f'Use a valid adapter_name first, '
                                                                        f'current is: {adapter_name}')
 
+    def _export_lora_weights(self, adapter_name, source_native=False):
+        if not source_native:
+            return super()._export_lora_weights(adapter_name)
+        self._check_adapter_valid(adapter_name)
+        self._lazy_wrap_model()
+        import torch
+
+        from twinkle.utils import Platform
+        from twinkle.utils.framework import Torch
+        from .weight_sync import iter_lora_source_groups
+        engine = self._get_or_create_checkpoint_engine()
+
+        @torch.no_grad()
+        def weights():
+            Torch.set_device(Platform.get_local_device())
+            for group in iter_lora_source_groups(self, adapter_name):
+                if engine.rank == 0:
+                    for name, tensor in group.items():
+                        yield name, tensor.to(Platform.get_local_device()).contiguous()
+
+        return weights()
+
     def register_global_mm_forward_hook(self):
 
         def forward_hook(model, args, kwargs):

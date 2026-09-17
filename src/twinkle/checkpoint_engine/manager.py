@@ -76,7 +76,7 @@ class CheckpointEngineManager:
         else:
             raise NotImplementedError
 
-    def sync_weights(self, merge_and_sync=True):
+    def sync_weights(self, merge_and_sync=True, *, lora_only=False, adapter_name=None):
         """
         Synchronize the weights between the model and the sampler.
 
@@ -93,9 +93,24 @@ class CheckpointEngineManager:
                 synced incrementally.
                 Defaults to True.
 
+        For DeepSeek-V4 RL, call with merge_and_sync=False, lora_only=True
+        and adapter_name. Both bases are already loaded; even the first call
+        sends only the tenant's source-native LoRA. This does not mark the base as
+        synchronized. Run sequentially: finish rollout/training before calling,
+        and start the next rollout only after this call succeeds. Do not mix
+        base reloads into that deployment. On communication failure, stop the
+        loop and rebuild the workers rather than retrying a broken collective.
+
+        Each call updates one fixed rollout LoRA slot, not a tenant slot registry.
+
         Returns:
-            None
+            None.
         """
+        peft_config = None
+        if lora_only:
+            if merge_and_sync or not adapter_name:
+                raise ValueError('lora_only requires merge_and_sync=False and an explicit adapter_name')
+            peft_config = self.model.get_peft_config_dict(adapter_name)
         model_metadata = self.model.prepare_checkpoint_engine([True]
                                                               + [False] * (self.model.device_mesh.world_size - 1))
         self.sampler.prepare_checkpoint_engine(False)
@@ -109,16 +124,18 @@ class CheckpointEngineManager:
         # be serialised.  lazy_collect=True makes them return futures.
         model_init = self.model.init_checkpoint_process_group(**model_kwargs)
         sampler_init = self.sampler.init_checkpoint_process_group(**sampler_kwargs)
-        model_init()  # wait for model init to complete
-        sampler_init()  # wait for sampler init to complete
+        model_init()
+        sampler_init()
 
-        peft_config = None
-        if self.base_sync_done and not merge_and_sync:
-            if self._peft_config is None:
-                self._peft_config = self.model.get_peft_config_dict()
-            peft_config = self._peft_config
+        if not lora_only and self.base_sync_done and not merge_and_sync:
+            if adapter_name is not None:
+                peft_config = self.model.get_peft_config_dict(adapter_name)
+            else:
+                if self._peft_config is None:
+                    self._peft_config = self.model.get_peft_config_dict()
+                peft_config = self._peft_config
 
-        if self._model_keys is None:
+        if not lora_only and self._model_keys is None:
             if hasattr(self.sampler, 'get_state_keys'):
                 self._model_keys = self.sampler.get_state_keys()
 
@@ -149,16 +166,23 @@ class CheckpointEngineManager:
             expanded = _expand_keys(expanded)
             self._model_keys = list(expanded)
 
-        model_result = self.model.send_weights(
+        send_kwargs = dict(
             base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
-        sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
+        receive_kwargs = dict(base_sync_done=self.base_sync_done, peft_config=peft_config)
+        if adapter_name is not None:
+            send_kwargs['adapter_name'] = adapter_name
+        if lora_only:
+            send_kwargs['lora_only'] = True
+            receive_kwargs['lora_only'] = True
+        model_result = self.model.send_weights(**send_kwargs)
+        sampler_result = self.sampler.receive_weights(**receive_kwargs)
         model_result()
         sampler_result()
 
         self.model.finalize_checkpoint_engine()
         self.sampler.finalize_checkpoint_engine()
 
-        if not self.base_sync_done:
+        if not lora_only and not self.base_sync_done:
             self.base_sync_done = True
             if not merge_and_sync:
                 logger.info('Base model sync completed, subsequent syncs will be LoRA-only')

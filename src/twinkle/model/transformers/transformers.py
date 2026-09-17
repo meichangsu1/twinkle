@@ -1850,6 +1850,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     # Only send_weights_via_checkpoint_engine is model-specific.
 
+    def _export_lora_weights(self, adapter_name, source_native=False):
+        """Export hook for LoRA only; base/merged export and transport stay unchanged."""
+        if source_native:
+            raise NotImplementedError('This model has no source-native LoRA exporter')
+        from peft.utils import get_peft_model_state_dict
+        model = self.strategy.unwrap_model(self.model)
+        return get_peft_model_state_dict(model, adapter_name=adapter_name).items()
+
     @remote_function(dispatch='all', lazy_collect=True)
     def send_weights(
         self,
@@ -1862,8 +1870,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if adapter_name is None:
             adapter_name = self._get_default_group()
         engine = self._get_or_create_checkpoint_engine()
+        lora_only = kwargs.get('lora_only', False)
         # Get state dict from unwrapped model
-        model = self.strategy.unwrap_model(self.model)
+        model = self.strategy.unwrap_model(self.model) if not lora_only else None
 
         def _normalize(name: str, keep_base_layer: bool) -> str:
             name = name.replace('base_model.model.', '')
@@ -1882,7 +1891,13 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         def _is_lora_key(name: str) -> bool:
             return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
 
-        if base_sync_done and adapter_name:
+        if lora_only:
+            exported = self._export_lora_weights(adapter_name, source_native=True)
+
+            def weight_generator():
+                yield from exported
+
+        elif base_sync_done and adapter_name:
             if merge_and_sync:
                 # LoRA Training and sync full model(merge_adapter)
                 # merge and skip lora weigts(already merged)
@@ -1904,12 +1919,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 # LoRA-only mode: send only adapter weights.
                 # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
-                from peft.utils import get_peft_model_state_dict
-                lora_state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
+                lora_weights = self._export_lora_weights(adapter_name)
 
                 def weight_generator():
                     names = []
-                    for name, tensor in lora_state_dict.items():
+                    for name, tensor in lora_weights:
                         tensor = Torch.to_local_tensor(tensor)
                         name = _normalize(name, keep_base_layer=True)
                         names.append(name)
