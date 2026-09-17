@@ -9,7 +9,7 @@
 - 不需要启动 Twinkle HTTP 服务或单独执行 `vllm serve`，脚本会通过 Ray 创建实例。
 - 已有专用 Ray 集群时只连接，不重复启动；不要停止或占用其他训练/推理任务。
 
-以下命令使用 Bash，远程代码目录假定为 `/opt/twinkle`。
+以下命令使用 Bash，远程代码目录为 `/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle`。
 `/实际路径/`、IP 和网卡按真实环境替换。同一硬件章节按顺序、在同一会话执行。
 
 ## 1. 运行前准备
@@ -26,13 +26,13 @@ W8A8_DYNAMIC 专家 LoRA 和原位更新的 vllm-ascend 环境。不在测试时
 - `cookbook/rl/grpo/dsv4_lora_sync_audit_npu.py`
 
 同时需要本次修改的 `src/twinkle` 代码，不能只复制这几个入口。
-文件对照另需已有的 `output/convert_twinkle_dsv4_lora_for_vllm.py`；
-NPU 对照还需同目录的 `output/diagnose_dsv4_quarot.py`。
+文件对照另需 `cookbook/rl/grpo/convert_twinkle_dsv4_lora_for_vllm.py`；
+NPU 对照还需同目录的 `cookbook/rl/grpo/diagnose_dsv4_quarot.py`。
 
 在参与节点的终端准备公共环境：
 
 ```bash
-cd /opt/twinkle
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
 export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export TWINKLE_TRUST_REMOTE_CODE=1
 export HF_HUB_OFFLINE=1
@@ -96,7 +96,7 @@ export GPU_MEMORY_UTILIZATION=0.85
 
 # 小 IPC 桶测试分片、缓冲区复用以及 TP ACK。
 export TWINKLE_VLLM_BUCKET_SIZE_MB=1
-export OFFLINE_LORA_CONVERTER=/opt/twinkle/output/convert_twinkle_dsv4_lora_for_vllm.py
+export OFFLINE_LORA_CONVERTER=/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle/cookbook/rl/grpo/convert_twinkle_dsv4_lora_for_vllm.py
 export SYNC_REPEATS=20
 
 export TEST_ROOT="$(mktemp -d /nas/disk6/ljl/dsv4_h800_e2e_XXXXXXXX)"
@@ -229,9 +229,9 @@ export GPU_MEMORY_UTILIZATION=0.85
 export TWINKLE_VLLM_BUCKET_SIZE_MB=1
 export TWINKLE_VLLM_IPC_TIMEOUT_S=1800
 export TWINKLE_CKPT_HCCL_META_TIMEOUT_S=1800
-export OFFLINE_LORA_CONVERTER=/opt/twinkle/output/convert_twinkle_dsv4_lora_for_vllm.py
+export OFFLINE_LORA_CONVERTER=/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle/cookbook/rl/grpo/convert_twinkle_dsv4_lora_for_vllm.py
 test -f "$OFFLINE_LORA_CONVERTER"
-test -f /opt/twinkle/output/diagnose_dsv4_quarot.py
+test -f /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle/cookbook/rl/grpo/diagnose_dsv4_quarot.py
 export SYNC_REPEATS=20
 
 export TEST_ROOT="$(mktemp -d /nas/disk6/ljl/dsv4_npu_e2e_XXXXXXXX)"
