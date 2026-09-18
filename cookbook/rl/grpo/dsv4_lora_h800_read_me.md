@@ -1,13 +1,15 @@
 # DeepSeek-V4 LoRA RL 操作手册
 
-当前资源：H800 一台；Ascend A3 两台，每台 16 张 NPU。
+手册覆盖 H800 单机、NPU 单机 8 卡，以及 NPU 双机每机 4 卡三种四层测试布局。
 先用同源四层模型验证权重同步，再跑三轮 GRPO。四层模型不用于评估回答质量。
 
 - H800：单机取 4 张卡，actor 2 卡、rollout TP=2。
-- NPU：四层双机测试，actor 4 卡、rollout TP=4，分别放在不同节点。
-  当前资源管理按每节点 16 卡预留资源，测试时两台机器均需有足够空闲资源。
+- NPU 单机：8 张卡，actor 使用 0–3，rollout TP=4 使用 4–7。
+- NPU 双机：每机 4 张卡，actor 使用 head 节点，rollout TP=4 使用 worker 节点。
 - 不需要启动 Twinkle HTTP 服务或单独执行 `vllm serve`，脚本会通过 Ray 创建实例。
 - 已有专用 Ray 集群时只连接，不重复启动；不要停止或占用其他训练/推理任务。
+- NPU 单机 8 卡直接使用 Twinkle 的 Ray 自动启动路径，不执行 `ray start`，也不设置
+  `RAY_ADDRESS`。NPU 双机无法由一个进程自动创建两个 Ray 节点，仍需显式建立集群。
 
 以下命令使用 Bash，远程代码目录为 `/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle`。
 `/实际路径/`、IP 和网卡按真实环境替换。同一硬件章节按顺序、在同一会话执行。
@@ -77,6 +79,19 @@ Ray 运行目录不放 NFS。`/dev/shm` 会消耗 RAM，运行时同时监控其
 ### 2.2 四层同步对照
 
 ```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO
+export RAY_ROTATION_MAX_BYTES=20971520
+export RAY_ROTATION_BACKUP_COUNT=1
+export RAY_ADDRESS=127.0.0.1:6379
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+set -o pipefail
+ray status --address="$RAY_ADDRESS"
+
 # 父目录暂按 /nas/disk1；如实际位置不同，请修改 MODEL_ROOT。
 export MODEL_ROOT=/nas/disk1
 export ACTOR_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-bf16"
@@ -110,11 +125,49 @@ python -u -m cookbook.rl.grpo.dsv4_lora_sync_audit \
 
 ### 2.3 四层三轮 GRPO
 
-同步对照成功退出后，沿用上面的模型及设备配置：
+同步对照成功退出后可直接执行下面的完整命令。该命令不依赖上一段命令遗留的
+环境变量，但要求第 2.1 节的四卡 Ray 集群仍在运行：
 
 ```bash
-export GSM8K_PATH=/nas/disk6/ljl/gsm8k
-export REPORT_DIR="$TEST_ROOT/grpo"
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO
+export RAY_ROTATION_MAX_BYTES=20971520
+export RAY_ROTATION_BACKUP_COUNT=1
+export RAY_ADDRESS=127.0.0.1:6379
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+set -o pipefail
+
+ray status --address="$RAY_ADDRESS"
+
+export MODEL_ROOT=/nas/disk1
+export ACTOR_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-bf16"
+export ROLLOUT_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-original"
+test -f "$ACTOR_MODEL/config.json"
+test -f "$ROLLOUT_MODEL/config.json"
+
+export GPUS_PER_NODE=4
+export ACTOR_GPUS=2
+export ACTOR_EP=2
+export ROLLOUT_START_RANK=2
+export ROLLOUT_TP=2
+
+export ACTOR_PRECISION=bf16
+export LORA_R=8
+export LORA_ALPHA=32
+export MAX_MODEL_LEN=1024
+export MAX_NUM_SEQS=2
+export GPU_MEMORY_UTILIZATION=0.85
+export TWINKLE_VLLM_BUCKET_SIZE_MB=1
+
+export GSM8K_PATH=/model/ljl/project/data/gsm8k
+test -d "$GSM8K_PATH"
+
+export TEST_ROOT="$(mktemp -d /nas/disk6/ljl/dsv4_h800_grpo_XXXXXXXX)"
+export REPORT_DIR="$TEST_ROOT/report"
 export STEPS=3
 export BATCH_SIZE=2
 export NUM_GENERATIONS=2
@@ -133,9 +186,165 @@ python -u -m cookbook.rl.grpo.dsv4_lora_h800 \
 当前测试入口不做 actor/rollout 复用卡或卸载切换；现有资源先完成四层验收，
 完整模型需另外确认两份基座与训练/推理开销能同时容纳。
 
-## 3. NPU 双机操作
+## 3. NPU 单机 8 卡操作
 
-### 3.1 两台机器准备环境
+单机模式在同一台机器上使用 8 张 NPU：0–3 给 actor，4–7 给 rollout。
+Twinkle 会根据可见 NPU 数量自动执行 `ray.init(resources={'NPU': 8})`。
+
+### 3.1 确认使用自动启动路径
+
+不要提前执行 `ray start`。在干净的专用运行环境中执行：
+
+```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export NETWORK_IFACE=eth0
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+unset RAY_ADDRESS
+
+python3 -c 'import torch, torch_npu; assert torch.npu.is_available(); assert torch.npu.device_count() == 8; print("NPU count:", torch.npu.device_count())'
+```
+
+如果该容器中已经有别的 Ray 集群或任务，不要复用这套单机自动启动命令；先确认任务归属，
+改用独立容器。不要为了测试停止其他用户的 Ray 集群。
+
+### 3.2 四层同步对照完整命令
+
+```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO
+export RAY_ROTATION_MAX_BYTES=20971520
+export RAY_ROTATION_BACKUP_COUNT=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export NETWORK_IFACE=eth0
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+unset RAY_ADDRESS
+set -o pipefail
+
+export MODEL_ROOT=/nas/disk1
+export ACTOR_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-bf16"
+export ROLLOUT_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-w8a8"
+test -f "$ACTOR_MODEL/config.json"
+test -f "$ROLLOUT_MODEL/config.json"
+
+export NPUS_PER_NODE=8
+export ACTOR_NPUS=4
+export ACTOR_EP=4
+export ROLLOUT_START_RANK=4
+export ROLLOUT_TP=4
+export ACTOR_PRECISION=bf16
+export LORA_R=8
+export LORA_ALPHA=32
+export MAX_MODEL_LEN=1024
+export MAX_NUM_SEQS=2
+export MAX_NUM_BATCHED_TOKENS=4096
+export GPU_MEMORY_UTILIZATION=0.85
+export TWINKLE_VLLM_BUCKET_SIZE_MB=1
+export TWINKLE_VLLM_IPC_TIMEOUT_S=1800
+export TWINKLE_CKPT_HCCL_META_TIMEOUT_S=1800
+export OFFLINE_LORA_CONVERTER="$PWD/cookbook/rl/grpo/convert_twinkle_dsv4_lora_for_vllm.py"
+test -f "$OFFLINE_LORA_CONVERTER"
+test -f "$PWD/cookbook/rl/grpo/diagnose_dsv4_quarot.py"
+export SYNC_REPEATS=20
+
+export TEST_ROOT="$(mktemp -d /nas/disk6/ljl/dsv4_npu_single_e2e_XXXXXXXX)"
+export AUDIT_DIR="$TEST_ROOT/sync_audit"
+python -u -m cookbook.rl.grpo.dsv4_lora_sync_audit_npu \
+  2>&1 | tee "$TEST_ROOT/sync_audit.log"
+```
+
+### 3.3 四层三轮 GRPO 完整命令
+
+该命令会为 GRPO 进程重新使用 Twinkle 的单机 Ray 自动启动路径：
+
+```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO
+export RAY_ROTATION_MAX_BYTES=20971520
+export RAY_ROTATION_BACKUP_COUNT=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export NETWORK_IFACE=eth0
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+unset RAY_ADDRESS
+set -o pipefail
+
+export MODEL_ROOT=/nas/disk1
+export ACTOR_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-bf16"
+export ROLLOUT_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-w8a8"
+export NPUS_PER_NODE=8
+export ACTOR_NPUS=4
+export ACTOR_EP=4
+export ROLLOUT_START_RANK=4
+export ROLLOUT_TP=4
+export ACTOR_PRECISION=bf16
+export LORA_R=8
+export LORA_ALPHA=32
+export MAX_MODEL_LEN=1024
+export MAX_NUM_SEQS=2
+export MAX_NUM_BATCHED_TOKENS=4096
+export GPU_MEMORY_UTILIZATION=0.85
+export TWINKLE_VLLM_BUCKET_SIZE_MB=1
+export TWINKLE_VLLM_IPC_TIMEOUT_S=1800
+export TWINKLE_CKPT_HCCL_META_TIMEOUT_S=1800
+
+export GSM8K_PATH=/model/ljl/project/data/gsm8k
+test -d "$GSM8K_PATH"
+export TEST_ROOT="$(mktemp -d /nas/disk6/ljl/dsv4_npu_single_grpo_XXXXXXXX)"
+export REPORT_DIR="$TEST_ROOT/report"
+export STEPS=3
+export BATCH_SIZE=2
+export NUM_GENERATIONS=2
+export MAX_NEW_TOKENS=128
+export LR=1e-5
+
+python -u -m cookbook.rl.grpo.dsv4_lora_npu \
+  2>&1 | tee "$TEST_ROOT/grpo.log"
+```
+
+## 4. NPU 双机、每机 4 卡操作
+
+双机模式同样必须先显式启动 Ray：head、worker 各自通过 `ray start` 注册
+`NPU:4`，Python 测试入口只从 head 连接已有集群，不再次声明资源。
+Twinkle 的自动启动路径只能创建当前节点，不能自动登录另一台机器并启动第二个
+Ray 节点，所以双机不能照搬第 3 节的 `unset RAY_ADDRESS` 后直接运行 Python 的方式。
+
+修改 `src/twinkle`（尤其是 Checkpoint Engine、HCCL 或
+`utils/torch_utils.py`）后，必须将同一份代码同步到两台机器，并重启这个测试专用
+Ray 集群；已经启动的 Ray worker 不会自动重新加载修改后的源码。
+
+### 4.1 两台机器准备环境
 
 两台机器均先执行第 1 节公共环境，再执行：
 
@@ -144,12 +353,12 @@ if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
 fi
 
-export HEAD_IP=172.61.10.149
-export WORKER_IP=172.61.8.184
-export NETWORK_IFACE=bond0
+export HEAD_IP=172.61.8.191
+export WORKER_IP=172.61.10.150
+export NETWORK_IFACE=eth0
 test -d "/sys/class/net/$NETWORK_IFACE"
 
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
 export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
@@ -160,20 +369,35 @@ export RAY_TMPDIR=/dev/shm
 python -c 'import torch, torch_npu; print("NPU available:", torch.npu.is_available(), "count:", torch.npu.device_count())'
 ```
 
-每台应显示 NPU 可用且能看到 16 张卡；两机网卡名称不同时各自设置。
+每台应显示 NPU 可用且只能看到 4 张卡；两机网卡名称不同时各自设置。
 确保 Ray、HCCL 和同步控制端口互通。不要直接使用会额外启动 HTTP 服务的
 `run_dsv4_0731_npu_multinode.sh`，这里只需要 Ray。
 
-### 3.2 启动 head 和 worker
+### 4.2 启动 head 和 worker
 
 仅在对应节点尚未运行 Ray 时执行。
 
 head 节点：
 
 ```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export HEAD_IP=172.61.8.191
+export NETWORK_IFACE=eth0
+test -d "/sys/class/net/$NETWORK_IFACE"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+unset RAY_ADDRESS
 ray start --head \
   --node-ip-address="$HEAD_IP" --port=6379 \
-  --resources='{"NPU":16}' \
+  --resources='{"NPU":4}' \
   --temp-dir=/dev/shm/ray-dsv4-e2e \
   --disable-usage-stats --include-dashboard=false
 ```
@@ -181,9 +405,25 @@ ray start --head \
 worker 节点：
 
 ```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export HEAD_IP=172.61.8.191
+export WORKER_IP=172.61.10.150
+export NETWORK_IFACE=eth0
+test -d "/sys/class/net/$NETWORK_IFACE"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+unset RAY_ADDRESS
 ray start --address="$HEAD_IP:6379" \
   --node-ip-address="$WORKER_IP" \
-  --resources='{"NPU":16}' --disable-usage-stats
+  --resources='{"NPU":4}' --disable-usage-stats
 ```
 
 两台加入后，在 head 检查：
@@ -193,10 +433,10 @@ export RAY_ADDRESS="$HEAD_IP:6379"
 ray status --address="$RAY_ADDRESS"
 ```
 
-应有两个节点、合计 32 个 NPU 资源。已有集群必须已注册 `NPU` 自定义资源；
+应有两个节点、合计 8 个 NPU 资源。已有集群必须已注册 `NPU` 自定义资源；
 只注册 GPU 资源不适用。后面的 Python 命令只在 head 执行一次，不要两机各启动一份。
 
-### 3.3 四层跨节点同步对照
+### 4.3 四层跨节点同步对照
 
 actor 使用一个节点上的 4 张卡，rollout 使用另一个节点上的 4 张卡。
 这是四层模型的跨机测试配置，不沿用完整模型的 rollout TP=8 配置。
@@ -206,15 +446,40 @@ actor 使用一个节点上的 4 张卡，rollout 使用另一个节点上的 4 
 两个节点应能访问以下路径，rollout 适配器还需读取 BF16 基座的 norm 权重。
 
 ```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO
+export RAY_ROTATION_MAX_BYTES=20971520
+export RAY_ROTATION_BACKUP_COUNT=1
+export HEAD_IP=172.61.8.191
+export WORKER_IP=172.61.10.150
+export NETWORK_IFACE=eth0
+export RAY_ADDRESS="$HEAD_IP:6379"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+set -o pipefail
+ray status --address="$RAY_ADDRESS"
+
 export MODEL_ROOT=/nas/disk1
 export ACTOR_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-bf16"
 export ROLLOUT_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-w8a8"
 test -f "$ACTOR_MODEL/config.json"
 test -f "$ROLLOUT_MODEL/config.json"
-export NPUS_PER_NODE=16
+export NPUS_PER_NODE=4
 export ACTOR_NPUS=4
 export ACTOR_EP=4
-export ROLLOUT_START_RANK=16
+export ROLLOUT_START_RANK=4
 export ROLLOUT_TP=4
 
 export ACTOR_PRECISION=bf16
@@ -248,13 +513,61 @@ python -u -m cookbook.rl.grpo.dsv4_lora_sync_audit_npu \
 成功时检查 `$AUDIT_DIR/summary.json` 中 `passed=true`、`backend=ascend`。
 首次初始化和旋转可能耗时较长；显存记录使用 NPU 接口，不调用 CUDA 统计。
 
-### 3.4 四层三轮 GRPO
+### 4.4 四层三轮 GRPO
 
-同步对照成功退出后，沿用 NPU 环境：
+下面是可在 head 节点新终端直接执行的完整命令；要求双机 Ray 集群仍在运行：
 
 ```bash
-export GSM8K_PATH=/nas/disk6/ljl/gsm8k
-export REPORT_DIR="$TEST_ROOT/grpo"
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+if [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO
+export RAY_ROTATION_MAX_BYTES=20971520
+export RAY_ROTATION_BACKUP_COUNT=1
+export HEAD_IP=172.61.8.191
+export WORKER_IP=172.61.10.150
+export NETWORK_IFACE=eth0
+export RAY_ADDRESS="$HEAD_IP:6379"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=0
+export RAY_TMPDIR=/dev/shm
+set -o pipefail
+ray status --address="$RAY_ADDRESS"
+
+export MODEL_ROOT=/nas/disk1
+export ACTOR_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-bf16"
+export ROLLOUT_MODEL="$MODEL_ROOT/DeepSeek-V4-Flash-0731-4layers-w8a8"
+test -f "$ACTOR_MODEL/config.json"
+test -f "$ROLLOUT_MODEL/config.json"
+export NPUS_PER_NODE=4
+export ACTOR_NPUS=4
+export ACTOR_EP=4
+export ROLLOUT_START_RANK=4
+export ROLLOUT_TP=4
+export ACTOR_PRECISION=bf16
+export LORA_R=8
+export LORA_ALPHA=32
+export MAX_MODEL_LEN=1024
+export MAX_NUM_SEQS=2
+export MAX_NUM_BATCHED_TOKENS=4096
+export GPU_MEMORY_UTILIZATION=0.85
+export TWINKLE_VLLM_BUCKET_SIZE_MB=1
+export TWINKLE_VLLM_IPC_TIMEOUT_S=1800
+export TWINKLE_CKPT_HCCL_META_TIMEOUT_S=1800
+
+export GSM8K_PATH=/model/ljl/project/data/gsm8k
+test -d "$GSM8K_PATH"
+export TEST_ROOT="$(mktemp -d /nas/disk6/ljl/dsv4_npu_multinode_grpo_XXXXXXXX)"
+export REPORT_DIR="$TEST_ROOT/report"
 export STEPS=3
 export BATCH_SIZE=2
 export NUM_GENERATIONS=2
@@ -269,13 +582,12 @@ python -u -m cookbook.rl.grpo.dsv4_lora_npu \
 `BATCH_SIZE * NUM_GENERATIONS` 必须能被 actor 的数据并行规模整除；
 `ACTOR_EP` 还需整除 actor 数量和模型专家数。
 
-**完整模型暂不照搬上述划卡。** 你之前完整 BF16 actor 已需要两台 A3；
-若仍占满 32 张卡，就没有独立 rollout 可用的卡。仅启用
-`memory_efficient_init` 不能保证运行期空出显存。先验收四层链路；
-完整模型需实测 actor 能否缩到留有 rollout 空间的规模，或另行增加资源/支持卸载调度，
-不能在同一批卡上直接再启动 rollout。
+**完整模型不能照搬上述划卡。** 当前总共只能使用 8 张 NPU，并且四层测试已将
+head 的 4 张卡全部给 actor、worker 的 4 张卡全部给 rollout。此前完整 BF16 actor
+需要更多资源；仅启用 `memory_efficient_init` 不能保证它能在当前配额内运行。
+本手册的 NPU 命令因此只用于四层链路验收，不宣称支持完整模型 GRPO。
 
-## 4. 看结果与重跑
+## 5. 看结果与重跑
 
 ### 同步对照
 

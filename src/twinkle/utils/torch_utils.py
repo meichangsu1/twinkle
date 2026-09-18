@@ -337,8 +337,6 @@ def stateless_init_process_group(
     world_size: int,
     device: Union[int, 'torch.device'] = None,
     backend: str = 'nccl',
-    listen_socket: socket.socket = None,
-    listen_fd: int = None,
 ):
     """Create a stateless process group using vLLM's StatelessProcessGroup.
 
@@ -355,10 +353,6 @@ def stateless_init_process_group(
         world_size: Total number of processes.
         device: The CUDA device to use. If None, uses current device.
         backend: The communication backend ("nccl" or "hccl").
-        listen_socket: Optional pre-created listening socket for master (rank 0).
-            If provided, this socket will be reused instead of creating a new one.
-        listen_fd: Optional file descriptor of the listening socket.
-
     Returns:
         PyNcclCommunicator or PyHcclCommunicator instance.
     """
@@ -377,21 +371,13 @@ def stateless_init_process_group(
     if device is None:
         device = torch.cuda.current_device() if backend == 'nccl' else torch.npu.current_device()
 
-    # Create the stateless process group
+    # Create the stateless process group. Let TCPStore create and own its
+    # listening socket. Passing a Python-owned socket through
+    # ``master_listen_fd`` gives two owners to the same file descriptor. On
+    # the non-libuv TCPStore used by torch-npu, one owner can close the fd
+    # while TCPStoreMasterDaemon is still polling it, which terminates the
+    # process with ``Unexpected poll revent ...: 32`` (POLLNVAL).
     launch_server = rank == 0
-
-    if launch_server and listen_socket is None:
-        # For master, create a listening socket if not provided
-        if is_valid_ipv6_address(master_address):
-            listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        else:
-            listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_socket.bind((master_address, master_port))
-        listen_socket.listen()
-        listen_fd = listen_socket.fileno()
-    elif launch_server and listen_fd is None:
-        listen_fd = listen_socket.fileno()
 
     store = TCPStore(
         host_name=master_address,
@@ -400,14 +386,12 @@ def stateless_init_process_group(
         is_master=launch_server,
         timeout=timedelta(seconds=300),
         use_libuv=False,  # for compatibility
-        master_listen_fd=listen_fd,
     )
 
     pg = StatelessProcessGroup(
         rank=rank,
         world_size=world_size,
         store=store,
-        socket=listen_socket,
         data_expiration_seconds=3600,
     )
 
