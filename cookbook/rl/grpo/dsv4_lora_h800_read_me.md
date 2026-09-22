@@ -2,9 +2,10 @@
 
 ## 当前 NPU DAPO 快速入口（四层先行、再三机全层）
 
-本节使用 `cookbook/rl/grpo/run_dsv4_npu_dapo.sh`，但**四层与全层是两套独立环境**，
-不能共用代码目录、IP、网卡或 Ray 集群。先把当前代码（包括 `dsv4_dapo.py` 和
-脚本）分别同步到对应环境的代码目录。四层使用开发测试环境的
+本节使用两份独立脚本：四层开发环境使用 `run_dsv4_mini_npu_dapo.sh`，
+全层三机环境使用 `run_dsv4_full_npu_dapo.sh`。两套环境不能共用代码目录、IP、
+网卡或 Ray 集群。先把当前代码（包括 `dsv4_dapo.py` 和对应脚本）分别同步到
+各自代码目录。四层使用开发测试环境的
 `/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle`、`eth0`、
 `172.61.8.191` 和 `172.61.10.150`（每机 4 卡）；全层使用新环境的
 `/opt/twinkle`、`bond0`、`22.6.7.15/.13/.14`（每机 16 卡）。四层测试读取
@@ -20,14 +21,14 @@
 
 ```bash
 cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
-bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini-head
+bash cookbook/rl/grpo/run_dsv4_mini_npu_dapo.sh head
 ```
 
 在 `172.61.10.150` 执行：
 
 ```bash
 cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
-bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini-worker
+bash cookbook/rl/grpo/run_dsv4_mini_npu_dapo.sh worker
 ```
 
 两节点加入后，仅在 `172.61.8.191` 执行四层 DAPO 链路测试：
@@ -35,7 +36,7 @@ bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini-worker
 ```bash
 cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
 DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=8 NUM_GENERATIONS=2 \
-  bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini
+  bash cookbook/rl/grpo/run_dsv4_mini_npu_dapo.sh run
 ```
 
 四层只验证初始化、同步、采样和训练链路；回答质量及 reward 可能很低。
@@ -54,21 +55,21 @@ rollout。不要在已有非测试 Ray 集群上直接执行 `ray start`。
 
 ```bash
 cd /opt/twinkle
-bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh head
+bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh head
 ```
 
 在 `22.6.7.13` 执行：
 
 ```bash
 cd /opt/twinkle
-NODE_IP=22.6.7.13 bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh worker
+NODE_IP=22.6.7.13 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
 ```
 
 在 `22.6.7.14` 执行：
 
 ```bash
 cd /opt/twinkle
-NODE_IP=22.6.7.14 bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh worker
+NODE_IP=22.6.7.14 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
 ```
 
 三节点加入后，仅在 `22.6.7.15` 启动一次训练。先用三轮验证完整模型链路：
@@ -76,7 +77,7 @@ NODE_IP=22.6.7.14 bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh worker
 ```bash
 cd /opt/twinkle
 DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=64 NUM_GENERATIONS=2 \
-  bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh full
+  bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh run
 ```
 
 此配置每轮 64 道题、128 条生成样本，满足 actor 的 `data_world_size=32`。
