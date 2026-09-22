@@ -2,26 +2,45 @@
 
 ## 当前 NPU DAPO 快速入口（四层先行、再三机全层）
 
-本节使用 `/opt/twinkle/cookbook/rl/grpo/run_dsv4_npu_dapo.sh`。先将当前代码
-（包括 `dsv4_dapo.py` 和脚本）同步到参与节点的 `/opt/twinkle`。模型、数据必须在
-各自参与节点上可读。脚本使用 `bond0`；四层测试读取
+本节使用 `cookbook/rl/grpo/run_dsv4_npu_dapo.sh`，但**四层与全层是两套独立环境**，
+不能共用代码目录、IP、网卡或 Ray 集群。先把当前代码（包括 `dsv4_dapo.py` 和
+脚本）分别同步到对应环境的代码目录。四层使用开发测试环境的
+`/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle`、`eth0`、
+`172.61.8.191` 和 `172.61.10.150`（每机 4 卡）；全层使用新环境的
+`/opt/twinkle`、`bond0`、`22.6.7.15/.13/.14`（每机 16 卡）。四层测试读取
 `/model/ljl/project/data/DAPO-Math-17k/dapo-math-17k.parquet`，三机全层读取
 `/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。默认仅选前 2000 条。
 
-四层链路测试在一台可用 8 张 NPU、没有已启动 Ray 集群的机器上执行；路径沿用本手册
-第 3 节的 `/nas/disk1/DeepSeek-V4-Flash-0731-4layers-bf16` 和
+四层链路测试采用本手册第 4 节的两机各 4 卡布局；模型路径沿用
+`/nas/disk1/DeepSeek-V4-Flash-0731-4layers-bf16` 和
 `/nas/disk1/DeepSeek-V4-Flash-0731-4layers-w8a8`。若两目录实际不在 `/nas/disk1`，
 在同一命令前设置 `ACTOR_MODEL`、`ROLLOUT_MODEL` 为实际绝对路径。
 
+仅当开发测试环境尚未运行本任务专用 Ray 集群时，在 `172.61.8.191` 执行：
+
 ```bash
-cd /opt/twinkle
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini-head
+```
+
+在 `172.61.10.150` 执行：
+
+```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini-worker
+```
+
+两节点加入后，仅在 `172.61.8.191` 执行四层 DAPO 链路测试：
+
+```bash
+cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
 DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=8 NUM_GENERATIONS=2 \
   bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini
 ```
 
-四层只验证初始化、同步、采样和训练链路；回答质量及 reward 可能很低。脚本不会
-替你停止 Ray。切换三机全层前，应在参与节点确认并停止**本次测试专用**的旧 Ray
-实例，不能对共用集群执行 `ray stop --force`。
+四层只验证初始化、同步、采样和训练链路；回答质量及 reward 可能很低。
+四层开发环境的 Ray 与全层新环境互不关联，不需要为了启动新环境而停止旧集群。
+脚本不会停止任何 Ray 实例；不要对共用集群执行 `ray stop --force`。
 
 全层使用 actor BF16
 `/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16_20260806_01`
