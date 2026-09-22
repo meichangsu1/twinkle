@@ -152,6 +152,20 @@ def local_gsm8k():
     return load_dataset('parquet', data_files=[str(p) for p in files], split='train')
 
 
+def local_dapo():
+    from datasets import load_dataset
+    path = Path(required_path('DAPO_PATH'))
+    if path.is_dir():
+        path = path / 'dapo-math-17k.parquet'
+    if not path.is_file() or path.suffix != '.parquet':
+        raise ValueError('DAPO_PATH must be dapo-math-17k.parquet or its containing directory')
+    dataset = load_dataset('parquet', data_files=str(path), split='train')
+    required = {'prompt', 'reward_model'}
+    if not required.issubset(dataset.column_names):
+        raise ValueError(f'DAPO dataset is missing columns: {sorted(required - set(dataset.column_names))}')
+    return dataset
+
+
 def actual_logprobs(sequence):
     if sequence.logprobs is None or len(sequence.logprobs) != len(sequence.tokens):
         raise RuntimeError('Missing actual rollout token logprobs')
@@ -159,15 +173,29 @@ def actual_logprobs(sequence):
 
 
 def main(worker_builder=None):
-    dataset = local_gsm8k()
+    dataset_kind = os.environ.get('DATASET_KIND', 'gsm8k').lower()
+    if dataset_kind == 'dapo':
+        from .dsv4_dapo import DAPOMathAccuracyReward, DAPOMathProcessor
+        dataset = local_dapo()
+        processor, reward_fn = DAPOMathProcessor(), DAPOMathAccuracyReward()
+    elif dataset_kind == 'gsm8k':
+        dataset = local_gsm8k()
+        processor, reward_fn = GSM8KProcessor(), GSM8KAccuracyReward()
+    else:
+        raise ValueError('DATASET_KIND must be gsm8k or dapo')
+    max_rows = int(os.environ.get('DATASET_MAX_ROWS', '0'))
+    if max_rows < 0:
+        raise ValueError('DATASET_MAX_ROWS must be nonnegative')
+    if max_rows:
+        dataset = dataset.select(range(min(max_rows, len(dataset))))
     steps, batch, generations = (int(os.environ.get(k, default))
                                  for k, default in [('STEPS', '3'), ('BATCH_SIZE', '4'), ('NUM_GENERATIONS', '4')])
     if min(steps, batch) <= 0 or generations < 2 or len(dataset) < steps * batch:
-        raise ValueError('Require positive steps/batch, >=2 generations and enough unrepeated GSM8K rows')
+        raise ValueError('Require positive steps/batch, >=2 generations and enough unrepeated dataset rows')
     output = Path(os.environ.get('REPORT_DIR', './dsv4_grpo_reports')).resolve()
     output.mkdir(parents=True, exist_ok=False)
     model, sampler, manager = (worker_builder or build_workers)()
-    processor, reward_fn, advantage_fn = GSM8KProcessor(), GSM8KAccuracyReward(), GRPOAdvantage()
+    advantage_fn = GRPOAdvantage()
     if (batch * generations) % model.device_mesh.data_world_size:
         raise ValueError('BATCH_SIZE * NUM_GENERATIONS must be divisible by actor data_world_size')
     params = SamplingParams(

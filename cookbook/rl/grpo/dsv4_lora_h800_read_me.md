@@ -1,5 +1,79 @@
 # DeepSeek-V4 LoRA RL 操作手册
 
+## 当前 NPU DAPO 快速入口（四层先行、再三机全层）
+
+本节使用 `/opt/twinkle/cookbook/rl/grpo/run_dsv4_npu_dapo.sh`。先将当前代码
+（包括 `dsv4_dapo.py` 和脚本）同步到参与节点的 `/opt/twinkle`。模型、数据必须在
+各自参与节点上可读。脚本使用 `bond0`；四层测试读取
+`/model/ljl/project/data/DAPO-Math-17k/dapo-math-17k.parquet`，三机全层读取
+`/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。默认仅选前 2000 条。
+
+四层链路测试在一台可用 8 张 NPU、没有已启动 Ray 集群的机器上执行；路径沿用本手册
+第 3 节的 `/nas/disk1/DeepSeek-V4-Flash-0731-4layers-bf16` 和
+`/nas/disk1/DeepSeek-V4-Flash-0731-4layers-w8a8`。若两目录实际不在 `/nas/disk1`，
+在同一命令前设置 `ACTOR_MODEL`、`ROLLOUT_MODEL` 为实际绝对路径。
+
+```bash
+cd /opt/twinkle
+DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=8 NUM_GENERATIONS=2 \
+  bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh mini
+```
+
+四层只验证初始化、同步、采样和训练链路；回答质量及 reward 可能很低。脚本不会
+替你停止 Ray。切换三机全层前，应在参与节点确认并停止**本次测试专用**的旧 Ray
+实例，不能对共用集群执行 `ray stop --force`。
+
+全层使用 actor BF16
+`/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16_20260806_01`
+与 rollout W8A8
+`/highcode/shared_data/DeepSeek-V4-Flash-0731-W8A8-HW/DeepSeek-V4-Flash-0731-W8A8-HW_20260803_01`。
+以下以三台机器各可见 16 张 NPU 为前提。Ray 按每机 16 卡创建 placement group，
+actor 占两个组（32 卡），rollout TP=16 占剩余一个组；不依赖哪台物理机器担任
+rollout。不要在已有非测试 Ray 集群上直接执行 `ray start`。
+
+在 `22.6.7.15` 执行：
+
+```bash
+cd /opt/twinkle
+bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh head
+```
+
+在 `22.6.7.13` 执行：
+
+```bash
+cd /opt/twinkle
+NODE_IP=22.6.7.13 bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh worker
+```
+
+在 `22.6.7.14` 执行：
+
+```bash
+cd /opt/twinkle
+NODE_IP=22.6.7.14 bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh worker
+```
+
+三节点加入后，仅在 `22.6.7.15` 启动一次训练。先用三轮验证完整模型链路：
+
+```bash
+cd /opt/twinkle
+DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=64 NUM_GENERATIONS=2 \
+  bash cookbook/rl/grpo/run_dsv4_npu_dapo.sh full
+```
+
+此配置每轮 64 道题、128 条生成样本，满足 actor 的 `data_world_size=32`。
+链路成功后，要顺序使用前 1984 条，可改为 `STEPS=31 BATCH_SIZE=64`；
+若坚持固定 batch 且用完 2000 条，可用 `STEPS=25 BATCH_SIZE=80`，但单轮
+生成 160 条，需重新确认 rollout 吞吐和内存。默认报告与日志在
+`/tmp/dsv4_dapo_reports/`；可用 `REPORT_ROOT` 指向其他本地目录。Ray session
+放在 `/dev/shm`，需同时观察其空间和容器内存。全层首次运行属于硬件验收，
+不应将四层通过当作全层训练已验证。
+`TWINKLE_VLLM_BUCKET_SIZE_MB` 只控制 vLLM 接收侧的共享内存桶；
+Checkpoint Engine 的 HCCL 桶是另一项配置。全层启动前应确认远端代码中已采用
+你调整过的 HCCL 桶大小，不能把这里的 64 MiB 当作 HCCL 桶设置。
+
+以下第 2–4 节是此前 H800/四层环境的详细操作记录，其旧 IP、旧代码路径和
+GSM8K 命令不适用于上述 DAPO 三机任务。
+
 手册覆盖 H800 单机、NPU 单机 8 卡，以及 NPU 双机每机 4 卡三种四层测试布局。
 先用同源四层模型验证权重同步，再跑三轮 GRPO。四层模型不用于评估回答质量。
 
