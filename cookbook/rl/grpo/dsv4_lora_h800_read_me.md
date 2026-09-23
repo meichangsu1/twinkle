@@ -6,8 +6,8 @@
 全层三机环境使用 `run_dsv4_full_npu_dapo.sh`。两套环境不能共用代码目录、IP、
 网卡或 Ray 集群。先把当前代码（包括 `dsv4_dapo.py` 和对应脚本）分别同步到
 各自代码目录。四层使用开发测试环境的
-`/nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle`、`eth0`、
-`172.61.8.191` 和 `172.61.10.150`（每机 4 卡）；全层使用新环境的
+`/opt/twinkle`、`eth0`、
+`172.61.10.46` 和 `172.61.10.144`（每机 4 卡）；全层使用新环境的
 `/opt/twinkle`、`bond0`、`22.6.7.15/.13/.14`（每机 16 卡）。四层测试读取
 `/model/ljl/project/data/DAPO-Math-17k/dapo-math-17k.parquet`，三机全层读取
 `/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。默认仅选前 2000 条。
@@ -17,24 +17,24 @@
 `/nas/disk1/DeepSeek-V4-Flash-0731-4layers-w8a8`。若两目录实际不在 `/nas/disk1`，
 在同一命令前设置 `ACTOR_MODEL`、`ROLLOUT_MODEL` 为实际绝对路径。
 
-仅当开发测试环境尚未运行本任务专用 Ray 集群时，在 `172.61.8.191` 执行：
+仅当开发测试环境尚未运行本任务专用 Ray 集群时，在 `172.61.10.46` 执行：
 
 ```bash
-cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+cd /opt/twinkle
 bash cookbook/rl/grpo/run_dsv4_mini_npu_dapo.sh head
 ```
 
-在 `172.61.10.150` 执行：
+在 `172.61.10.144` 执行：
 
 ```bash
-cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+cd /opt/twinkle
 bash cookbook/rl/grpo/run_dsv4_mini_npu_dapo.sh worker
 ```
 
-两节点加入后，仅在 `172.61.8.191` 执行四层 DAPO 链路测试：
+两节点加入后，仅在 `172.61.10.46` 执行四层 DAPO 链路测试：
 
 ```bash
-cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+cd /opt/twinkle
 DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=8 NUM_GENERATIONS=2 \
   bash cookbook/rl/grpo/run_dsv4_mini_npu_dapo.sh run
 ```

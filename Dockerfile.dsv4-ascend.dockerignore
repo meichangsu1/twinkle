@@ -19,3 +19,11 @@ outputs
 tmp
 run-*
 *.log
+kernel_meta
+kernel_meta/**
+**/kernel_meta
+**/kernel_meta/**
+kernel_meta_*
+kernel_meta_*/**
+**/kernel_meta_*
+**/kernel_meta_*/**

@@ -8,7 +8,7 @@ if [[ ! "$role" =~ ^(head|worker|run)$ ]]; then
   exit 2
 fi
 
-cd /nas/disk6/ljl/project/dsv4-lora-weight-sync/twinkle
+cd /opt/twinkle
 if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
   # shellcheck disable=SC1091
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -19,10 +19,12 @@ export LOG_LEVEL=INFO RAY_ROTATION_MAX_BYTES=20971520 RAY_ROTATION_BACKUP_COUNT=
 export NETWORK_IFACE=eth0 GLOO_SOCKET_IFNAME=eth0 HCCL_SOCKET_IFNAME=eth0
 export HCCL_CONNECT_TIMEOUT=7200 HCCL_EXEC_TIMEOUT=0
 export RAY_TMPDIR=/dev/shm RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-export HEAD_IP=172.61.8.191 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export HEAD_IP=172.61.8.192
+
 test -d /sys/class/net/eth0
 
 if [[ "$role" == head ]]; then
+  export ASCEND_RT_VISIBLE_DEVICES=10,11,12,13
   unset RAY_ADDRESS
   ray start --head --node-ip-address="$HEAD_IP" --port=6379 \
     --resources='{"NPU":4}' --temp-dir=/dev/shm/ray-dsv4-mini \
@@ -30,12 +32,14 @@ if [[ "$role" == head ]]; then
   exit 0
 fi
 if [[ "$role" == worker ]]; then
+  export ASCEND_RT_VISIBLE_DEVICES=10,11,14,15
   unset RAY_ADDRESS
-  ray start --address="$HEAD_IP:6379" --node-ip-address=172.61.10.150 \
+  ray start --address="$HEAD_IP:6379" --node-ip-address=172.61.10.27 \
     --resources='{"NPU":4}' --disable-usage-stats
   exit 0
 fi
 
+export ASCEND_RT_VISIBLE_DEVICES=10,11,12,13
 export RAY_ADDRESS="$HEAD_IP:6379"
 export DATASET_KIND=dapo DAPO_PATH=${DAPO_PATH:-/model/ljl/project/data/DAPO-Math-17k}
 export DATASET_MAX_ROWS=${DATASET_MAX_ROWS:-2000}
@@ -55,7 +59,7 @@ import ray
 
 ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 alive = [node for node in ray.nodes() if node['Alive']]
-available = ray.cluster_resources().get('NPU', 0)
+available = ray.cluster_resources().get("NPU", 0)
 print(f'Mini Ray preflight: alive_nodes={len(alive)}, NPU_resources={available}')
 if len(alive) != 2 or available < 8:
     raise RuntimeError('Mini run requires two alive Ray nodes and at least eight NPU resources')
@@ -77,7 +81,7 @@ if (( DATASET_MAX_ROWS > 0 && STEPS * BATCH_SIZE > DATASET_MAX_ROWS )); then
   echo 'STEPS * BATCH_SIZE exceeds DATASET_MAX_ROWS' >&2
   exit 2
 fi
-REPORT_ROOT=${REPORT_ROOT:-/tmp/dsv4_dapo_reports}
+REPORT_ROOT=${REPORT_ROOT:-$HOME/dsv4_dapo_reports}
 mkdir -p "$REPORT_ROOT"
 TEST_ROOT=$(mktemp -d "$REPORT_ROOT/mini_XXXXXXXX")
 export REPORT_DIR="$TEST_ROOT/report"
