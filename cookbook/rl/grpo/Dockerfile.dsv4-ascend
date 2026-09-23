@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.7
+# The base image already contains the required vLLM and vllm-ascend sources,
+# compiled extensions and Python dependencies. This layer only adds the
+# non-root Kubernetes runtime identity.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG USER_NAME=ai-user
+ARG USER_ID=1001
+ARG GROUP_NAME=ai-group
+ARG GROUP_ID=1001
+ARG VLLM_SOURCE_DIR=/vllm-workspace/vllm-0351e9aa
+ARG VLLM_ASCEND_SOURCE_DIR=/vllm-workspace/vllm-ascend-dsv4-multilora
+
+USER root
+
+ENV USER_NAME=${USER_NAME} \
+    USER_ID=${USER_ID} \
+    GROUP_NAME=${GROUP_NAME} \
+    GROUP_ID=${GROUP_ID} \
+    VLLM_SOURCE_DIR=${VLLM_SOURCE_DIR} \
+    VLLM_ASCEND_SOURCE_DIR=${VLLM_ASCEND_SOURCE_DIR} \
+    HOME=/home/${USER_NAME} \
+    XDG_CACHE_HOME=/home/${USER_NAME}/.cache \
+    HF_HOME=/home/${USER_NAME}/.cache/huggingface \
+    MODELSCOPE_CACHE=/home/${USER_NAME}/.cache/modelscope \
+    TORCH_HOME=/home/${USER_NAME}/.cache/torch \
+    TRITON_CACHE_DIR=/home/${USER_NAME}/.cache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/home/${USER_NAME}/.cache/torchinductor \
+    TMPDIR=/tmp/twinkle \
+    RAY_TMPDIR=/dev/shm \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN set -eux; \
+    if getent group "${GROUP_NAME}" >/dev/null 2>&1; then \
+        test "$(getent group "${GROUP_NAME}" | cut -d: -f3)" = "${GROUP_ID}"; \
+    elif getent group "${GROUP_ID}" >/dev/null 2>&1; then \
+        echo "GID ${GROUP_ID} is already occupied by $(getent group "${GROUP_ID}" | cut -d: -f1)" >&2; \
+        exit 1; \
+    else \
+        groupadd --gid "${GROUP_ID}" "${GROUP_NAME}"; \
+    fi; \
+    if id "${USER_NAME}" >/dev/null 2>&1; then \
+        test "$(id -u "${USER_NAME}")" = "${USER_ID}"; \
+        test "$(id -g "${USER_NAME}")" = "${GROUP_ID}"; \
+    elif getent passwd "${USER_ID}" >/dev/null 2>&1; then \
+        echo "UID ${USER_ID} is already occupied by $(getent passwd "${USER_ID}" | cut -d: -f1)" >&2; \
+        exit 1; \
+    else \
+        useradd --create-home --uid "${USER_ID}" --gid "${GROUP_ID}" \
+            --shell /bin/bash "${USER_NAME}"; \
+    fi; \
+    mkdir -p \
+        "${HOME}/.cache/huggingface" \
+        "${HOME}/.cache/modelscope" \
+        "${HOME}/.cache/torch" \
+        "${HOME}/.cache/triton" \
+        "${HOME}/.cache/torchinductor" \
+        /tmp/twinkle \
+        /opt/twinkle; \
+    chown -R "${USER_ID}:${GROUP_ID}" \
+        "${HOME}" \
+        /tmp/twinkle \
+        /opt/twinkle; \
+    for source_dir in "${VLLM_SOURCE_DIR}" "${VLLM_ASCEND_SOURCE_DIR}"; do \
+        if [ -d "${source_dir}" ]; then \
+            chown -R "${USER_ID}:${GROUP_ID}" "${source_dir}"; \
+            chmod -R u+rwX "${source_dir}"; \
+        else \
+            echo "WARNING: source directory does not exist: ${source_dir}" >&2; \
+        fi; \
+    done; \
+    chmod 1777 /tmp /dev/shm
+
+USER ${USER_ID}:${GROUP_ID}
+WORKDIR /opt/twinkle
+
+RUN test "$(id -u)" = "${USER_ID}" && \
+    test "$(id -g)" = "${GROUP_ID}" && \
+    touch "${HOME}/.runtime-write-test" && \
+    rm "${HOME}/.runtime-write-test" && \
+    for source_dir in "${VLLM_SOURCE_DIR}" "${VLLM_ASCEND_SOURCE_DIR}"; do \
+        if [ -d "${source_dir}" ]; then \
+            test -w "${source_dir}"; \
+        fi; \
+    done
+
+CMD ["/bin/bash"]
