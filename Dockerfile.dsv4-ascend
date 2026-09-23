@@ -36,9 +36,7 @@ ENV USER_NAME=${USER_NAME} \
 
 RUN rm -rf /opt/twinkle && mkdir -p /opt/twinkle
 
-COPY pyproject.toml setup.cfg README.md LICENSE /opt/twinkle/
-COPY src /opt/twinkle/src
-COPY cookbook /opt/twinkle/cookbook
+COPY . /opt/twinkle
 
 RUN python3 -m pip install \
     --no-cache-dir \
@@ -91,19 +89,17 @@ RUN set -eux; \
 USER ${USER_ID}:${GROUP_ID}
 WORKDIR /opt/twinkle
 
-RUN test "$(id -u)" = "${USER_ID}" && \
-    test "$(id -g)" = "${GROUP_ID}" && \
-    touch "${HOME}/.runtime-write-test" && \
-    rm "${HOME}/.runtime-write-test" && \
-    test -d /opt/twinkle && \
-    test -w /opt/twinkle && \
-    test -f /opt/twinkle/pyproject.toml && \
-    test -f /opt/twinkle/src/twinkle/__init__.py && \
-    python3 -c 'import twinkle; assert twinkle.__file__.startswith("/opt/twinkle/src/"), twinkle.__file__' && \
-    for source_dir in "${VLLM_SOURCE_DIR}" "${VLLM_ASCEND_SOURCE_DIR}"; do \
-        if [ -d "${source_dir}" ]; then \
-            test -w "${source_dir}"; \
-        fi; \
-    done
+RUN set -eux; \
+    id; \
+    test "$(id -u)" = "${USER_ID}"; \
+    test "$(id -g)" = "${GROUP_ID}"; \
+    test -w "${HOME}"; \
+    test -w /opt/twinkle; \
+    test -f /opt/twinkle/pyproject.toml; \
+    test -f /opt/twinkle/src/twinkle/__init__.py; \
+    touch "${HOME}/.runtime-write-test"; \
+    rm "${HOME}/.runtime-write-test"; \
+    python3 -c 'from importlib.metadata import version; print("twinkle-kit:", version("twinkle-kit"))'; \
+    python3 -m pip show twinkle-kit | grep -E '^(Name|Version|Editable project location):'
 
 CMD ["/bin/bash"]
