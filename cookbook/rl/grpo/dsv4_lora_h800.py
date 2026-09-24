@@ -5,6 +5,7 @@ See dsv4_lora_h800_read_me.md for resource placement and acceptance tests.
 """
 import json
 import os
+import re
 import time
 import torch
 from pathlib import Path
@@ -205,7 +206,9 @@ def main(worker_builder=None):
         temperature=1.0,
         top_p=1.0,
         top_k=-1)
+    answer_line = re.compile(r'^\s*Answer:\s*\S+', re.IGNORECASE | re.MULTILINE)
     for step in range(steps):
+        step_start = time.monotonic()
         sync_start = time.monotonic()
         manager.sync_weights(
             merge_and_sync=False,
@@ -213,7 +216,9 @@ def main(worker_builder=None):
             adapter_name=TENANT)
         report = dict(training_step=step, sync_seconds=time.monotonic() - sync_start)
         prompts = [processor.preprocess(dataset[i]) for i in range(step * batch, (step + 1) * batch)]
+        sample_start = time.monotonic()
         responses = sampler.sample(prompts, params)
+        report['sample_seconds'] = time.monotonic() - sample_start
         if len(responses) != batch:
             raise RuntimeError('Missing rollout responses')
         features, old_logps, reward_inputs, samples = [], [], [], []
@@ -237,15 +242,33 @@ def main(worker_builder=None):
                         prompt_tokens=response.prompt_token_ids))
         rewards = reward_fn(reward_inputs)
         advantages = advantage_fn(rewards, num_generations=generations, scale='group').tolist()
+        train_start = time.monotonic()
         result = model.forward_backward(
             inputs=features, old_logps=old_logps, advantages=advantages, micro_batch_size=1, adapter_name=TENANT)
         model.clip_grad_and_step(adapter_name=TENANT)
+        report['train_seconds'] = time.monotonic() - train_start
         report.update(rewards=rewards, advantages=advantages, samples=samples)
         (output / f'round_{step}.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-        print(
-            f'round={step} mean_reward={sum(rewards)/len(rewards):.4f} '
-            f'nonzero_advantages={sum(a != 0 for a in advantages)} result={result}',
-            flush=True)
+        lengths = [len(sample['tokens']) for sample in samples]
+        loss = result.get('loss') if isinstance(result, dict) else None
+        if isinstance(loss, torch.Tensor):
+            loss = loss.detach().float().item() if loss.numel() == 1 else None
+        metrics = dict(
+            training_step=step,
+            mean_reward=sum(rewards) / len(rewards),
+            nonzero_advantages=sum(a != 0 for a in advantages),
+            answer_format_rate=sum(bool(answer_line.search(sample['text'])) for sample in samples) / len(samples),
+            mean_completion_tokens=sum(lengths) / len(lengths),
+            length_cap_rate=sum(length >= params.max_tokens for length in lengths) / len(lengths),
+            loss=loss,
+            sync_seconds=report['sync_seconds'],
+            sample_seconds=report['sample_seconds'],
+            train_seconds=report['train_seconds'],
+            step_seconds=time.monotonic() - step_start,
+        )
+        with (output / 'metrics.jsonl').open('a', encoding='utf-8') as metrics_file:
+            metrics_file.write(json.dumps(metrics, ensure_ascii=False) + '\n')
+        print(f'round={step} metrics={json.dumps(metrics, ensure_ascii=False)}', flush=True)
     # Synchronize the last optimizer update too, without adding a fourth training round.
     sync_start = time.monotonic()
     manager.sync_weights(

@@ -75,8 +75,8 @@ else
 fi
 test -f "$ACTOR_MODEL/config.json"
 test -f "$ROLLOUT_MODEL/config.json"
-if (( BATCH_SIZE <= ACTOR_NPUS )); then
-  echo 'BATCH_SIZE must exceed 32 actor ranks' >&2
+if (( BATCH_SIZE < ACTOR_NPUS )); then
+  echo 'BATCH_SIZE must be at least 32 actor ranks' >&2
   exit 2
 fi
 if (( BATCH_SIZE * NUM_GENERATIONS % ACTOR_NPUS != 0 )); then

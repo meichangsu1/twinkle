@@ -43,16 +43,16 @@ if [[ "$role" == worker ]]; then
 fi
 
 export RAY_ADDRESS="$HEAD_IP:6379"
-export DATASET_KIND=dapo DAPO_PATH=${DAPO_PATH:-/highcode/shared_data/DAPO-Math-17}
-export DATASET_MAX_ROWS=${DATASET_MAX_ROWS:-2000}
+export DATASET_KIND=dapo DAPO_PATH=${DAPO_PATH:-/highcode/shared_data/DAPO-Math-17k}
+export DATASET_MAX_ROWS=${DATASET_MAX_ROWS:-0}
 export ACTOR_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16_20260806_01
 export ROLLOUT_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-W8A8-HW/DeepSeek-V4-Flash-0731-W8A8-HW_20260803_01
 export NPUS_PER_NODE=16 ACTOR_NPUS=32 ACTOR_EP=32 ROLLOUT_START_RANK=32 ROLLOUT_TP=8
 export ACTOR_PRECISION=bf16 LORA_R=8 LORA_ALPHA=32
-export MAX_MODEL_LEN=4096 MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=4096
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192} MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=4096
 export GPU_MEMORY_UTILIZATION=0.85 TWINKLE_VLLM_BUCKET_SIZE_MB=64
-export STEPS=${STEPS:-3} BATCH_SIZE=${BATCH_SIZE:-64} NUM_GENERATIONS=${NUM_GENERATIONS:-2}
-export MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024} LR=${LR:-1e-5}
+export STEPS=${STEPS:-100} BATCH_SIZE=${BATCH_SIZE:-32} NUM_GENERATIONS=${NUM_GENERATIONS:-2}
+export MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096} LR=${LR:-5e-6}
 
 ray status --address="$RAY_ADDRESS"
 python - <<'PY'
@@ -75,21 +75,27 @@ else
 fi
 test -f "$ACTOR_MODEL/config.json"
 test -f "$ROLLOUT_MODEL/config.json"
-if (( BATCH_SIZE <= ACTOR_NPUS )); then
-  echo 'Full-model BATCH_SIZE must exceed 32 actor ranks' >&2
+if (( BATCH_SIZE < ACTOR_NPUS )); then
+  echo 'Full-model BATCH_SIZE must be at least 32 actor ranks' >&2
   exit 2
 fi
 if (( BATCH_SIZE * NUM_GENERATIONS % ACTOR_NPUS != 0 )); then
   echo 'BATCH_SIZE * NUM_GENERATIONS must be divisible by ACTOR_NPUS' >&2
   exit 2
 fi
+if (( MAX_NEW_TOKENS >= MAX_MODEL_LEN )); then
+  echo 'MAX_NEW_TOKENS must be smaller than MAX_MODEL_LEN to leave room for the prompt' >&2
+  exit 2
+fi
 if (( DATASET_MAX_ROWS > 0 && STEPS * BATCH_SIZE > DATASET_MAX_ROWS )); then
   echo 'STEPS * BATCH_SIZE exceeds DATASET_MAX_ROWS' >&2
   exit 2
 fi
-export REPORT_DIR=${REPORT_DIR:-/highcode/shared_data/dsv4_logs}
-mkdir -p "$REPORT_DIR"
+REPORT_ROOT=${REPORT_ROOT:-/highcode/shared_data/dsv4_logs}
+mkdir -p "$REPORT_ROOT"
+RUN_DIR=$(mktemp -d "$REPORT_ROOT/full_XXXXXXXX")
+export REPORT_DIR="$RUN_DIR/report"
 echo "Report: $REPORT_DIR"
 nohup python -u -m cookbook.rl.grpo.dsv4_lora_npu \
-  >>"$REPORT_DIR/grpo.log" 2>&1 </dev/null &
-echo "GRPO PID=$! Log=$REPORT_DIR/grpo.log"
+  >"$RUN_DIR/grpo.log" 2>&1 </dev/null &
+echo "GRPO PID=$! Log=$RUN_DIR/grpo.log"

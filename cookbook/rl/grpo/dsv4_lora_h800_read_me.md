@@ -8,9 +8,10 @@
 各自代码目录。四层使用开发测试环境的
 `/opt/twinkle`、`eth0`、
 `172.61.10.46` 和 `172.61.10.144`（每机 4 卡）；全层使用新环境的
-`/opt/twinkle`、`bond0`、`22.6.7.15/.13/.14`（每机 16 卡）。四层测试读取
+`/opt/twinkle`、`bond0`、`11.173.4.131/.140/.144`（每机 16 卡）。四层测试读取
 `/model/ljl/project/data/DAPO-Math-17k/dapo-math-17k.parquet`，三机全层读取
-`/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。默认仅选前 2000 条。
+`/highcode/shared_data/DAPO-Math-17k/dapo-math-17k.parquet`。四层默认选前 2000 条，
+全层默认不截断数据集。
 
 四层链路测试采用本手册第 4 节的两机各 4 卡布局；模型路径沿用
 `/nas/disk1/DeepSeek-V4-Flash-0731-4layers-bf16` 和
@@ -48,43 +49,57 @@ DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=8 NUM_GENERATIONS=2 \
 与 rollout W8A8
 `/highcode/shared_data/DeepSeek-V4-Flash-0731-W8A8-HW/DeepSeek-V4-Flash-0731-W8A8-HW_20260803_01`。
 以下以三台机器各可见 16 张 NPU 为前提。Ray 按每机 16 卡创建 placement group，
-actor 占两个组（32 卡），rollout TP=16 占剩余一个组；不依赖哪台物理机器担任
+actor 占两个组（32 卡），rollout TP=8 占剩余一个组中的 8 卡；不依赖哪台物理机器担任
 rollout。不要在已有非测试 Ray 集群上直接执行 `ray start`。
 
-在 `22.6.7.15` 执行：
+在 `11.173.4.131` 执行：
 
 ```bash
 cd /opt/twinkle
 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh head
 ```
 
-在 `22.6.7.13` 执行：
+在 `11.173.4.140` 执行：
 
 ```bash
 cd /opt/twinkle
-NODE_IP=22.6.7.13 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
+NODE_IP=11.173.4.140 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
 ```
 
-在 `22.6.7.14` 执行：
+在 `11.173.4.144` 执行：
 
 ```bash
 cd /opt/twinkle
-NODE_IP=22.6.7.14 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
+NODE_IP=11.173.4.144 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
 ```
 
-三节点加入后，仅在 `22.6.7.15` 启动一次训练。先用三轮验证完整模型链路：
+三节点加入后，仅在 `11.173.4.131` 启动一次训练。先用三轮验证完整模型链路：
 
 ```bash
 cd /opt/twinkle
-DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=64 NUM_GENERATIONS=2 \
+DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=32 NUM_GENERATIONS=2 \
+  MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
   bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh run
 ```
 
-此配置每轮 64 道题、128 条生成样本，满足 actor 的 `data_world_size=32`。
-链路成功后，要顺序使用前 1984 条，可改为 `STEPS=31 BATCH_SIZE=64`；
-若坚持固定 batch 且用完 2000 条，可用 `STEPS=25 BATCH_SIZE=80`，但单轮
-生成 160 条，需重新确认 rollout 吞吐和内存。默认报告与日志在
-`/tmp/dsv4_dapo_reports/`；可用 `REPORT_ROOT` 指向其他本地目录。Ray session
+此配置每轮 32 道题、64 条生成样本，满足 actor 的 `data_world_size=32`。
+链路成功后，运行正式训练：
+
+```bash
+cd /opt/twinkle
+STEPS=100 BATCH_SIZE=32 NUM_GENERATIONS=2 \
+  MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
+  bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh run
+```
+
+`MAX_MODEL_LEN` 是 prompt 与回答合计的上限；4096 是回答上限，不代表每条
+回答都能生成满 4096 token。长上下文会增加 KV cache 占用，若 rollout OOM，
+先减小并发（`MAX_NUM_SEQS`）或回答上限，不要直接把 reward 低归咎于学习率。
+每次运行创建独立目录，默认位于 `/highcode/shared_data/dsv4_logs/full_*/`；
+`grpo.log` 和 `report/metrics.jsonl` 分别记录日志与逐轮指标。
+其中 `mean_reward` 是训练样本 reward，`answer_format_rate` 与
+`length_cap_rate` 用来区分答案格式问题和长度截断；训练 reward 不保证逐轮
+单调上升，也不能单独代替固定验证集评估。Ray session
 放在 `/dev/shm`，需同时观察其空间和容器内存。全层首次运行属于硬件验收，
 不应将四层通过当作全层训练已验证。
 `TWINKLE_VLLM_BUCKET_SIZE_MB` 只控制 vLLM 接收侧的共享内存桶；
