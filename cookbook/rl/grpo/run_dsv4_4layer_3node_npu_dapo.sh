@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full-model DAPO GRPO in the three-node A3 environment (16 NPUs per node).
+# Four-layer DAPO GRPO on three A3 nodes (16 NPUs per node).
 set -euo pipefail
 
 role=${1:-}
@@ -26,13 +26,13 @@ test -d /sys/class/net/bond0
 if [[ "$role" == head ]]; then
   unset RAY_ADDRESS
   ray start --head --node-ip-address="$HEAD_IP" --port=6379 \
-    --resources='{"NPU":16}' --temp-dir=/dev/shm/ray-dsv4-full \
+    --resources='{"NPU":16}' --temp-dir=/dev/shm/ray-dsv4-4layer \
     --disable-usage-stats --include-dashboard=false
   exit 0
 fi
 if [[ "$role" == worker ]]; then
   unset RAY_ADDRESS
-  : "${NODE_IP:?Set NODE_IP to 11.173.4.140 or 11.173.4.144 on this worker}"
+  : "${NODE_IP:?Set NODE_IP to 11.173.4.140 or 11.173.4.144}"
   if [[ "$NODE_IP" != 11.173.4.140 && "$NODE_IP" != 11.173.4.144 ]]; then
     echo 'NODE_IP must be 11.173.4.140 or 11.173.4.144' >&2
     exit 2
@@ -45,8 +45,8 @@ fi
 export RAY_ADDRESS="$HEAD_IP:6379"
 export DATASET_KIND=dapo DAPO_PATH=${DAPO_PATH:-/highcode/shared_data/DAPO-Math-17}
 export DATASET_MAX_ROWS=${DATASET_MAX_ROWS:-2000}
-export ACTOR_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16_20260806_01
-export ROLLOUT_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-W8A8-HW/DeepSeek-V4-Flash-0731-W8A8-HW_20260803_01
+export ACTOR_MODEL=${ACTOR_MODEL:-/highcode/shared_data/DeepSeek-V4-Flash-0731-4layers-bf16}
+export ROLLOUT_MODEL=${ROLLOUT_MODEL:-/highcode/shared_data/DeepSeek-V4-Flash-0731-4layers-w8a8-v2}
 export NPUS_PER_NODE=16 ACTOR_NPUS=32 ACTOR_EP=32 ROLLOUT_START_RANK=32 ROLLOUT_TP=8
 export ACTOR_PRECISION=bf16 LORA_R=8 LORA_ALPHA=32
 export MAX_MODEL_LEN=4096 MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=4096
@@ -62,9 +62,9 @@ import ray
 ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 alive = [node for node in ray.nodes() if node['Alive']]
 available = ray.cluster_resources().get('NPU', 0)
-print(f'Full Ray preflight: alive_nodes={len(alive)}, NPU_resources={available}')
+print(f'Four-layer Ray preflight: alive_nodes={len(alive)}, NPU_resources={available}')
 if len(alive) != 3 or available < 48:
-    raise RuntimeError('Full run requires three alive Ray nodes and at least 48 NPU resources')
+    raise RuntimeError('Four-layer run requires three alive Ray nodes and at least 48 NPU resources')
 ray.shutdown()
 PY
 
@@ -76,7 +76,7 @@ fi
 test -f "$ACTOR_MODEL/config.json"
 test -f "$ROLLOUT_MODEL/config.json"
 if (( BATCH_SIZE <= ACTOR_NPUS )); then
-  echo 'Full-model BATCH_SIZE must exceed 32 actor ranks' >&2
+  echo 'BATCH_SIZE must exceed 32 actor ranks' >&2
   exit 2
 fi
 if (( BATCH_SIZE * NUM_GENERATIONS % ACTOR_NPUS != 0 )); then
@@ -87,9 +87,11 @@ if (( DATASET_MAX_ROWS > 0 && STEPS * BATCH_SIZE > DATASET_MAX_ROWS )); then
   echo 'STEPS * BATCH_SIZE exceeds DATASET_MAX_ROWS' >&2
   exit 2
 fi
-export REPORT_DIR=${REPORT_DIR:-/highcode/shared_data/dsv4_logs}
-mkdir -p "$REPORT_DIR"
-echo "Report: $REPORT_DIR"
+
+REPORT_ROOT=${REPORT_ROOT:-/highcode/shared_data/dsv4_logs}
+mkdir -p "$REPORT_ROOT"
+RUN_DIR=$(mktemp -d "$REPORT_ROOT/4layer_XXXXXXXX")
+export REPORT_DIR="$RUN_DIR/report"
 nohup python -u -m cookbook.rl.grpo.dsv4_lora_npu \
-  >>"$REPORT_DIR/grpo.log" 2>&1 </dev/null &
-echo "GRPO PID=$! Log=$REPORT_DIR/grpo.log"
+  >"$RUN_DIR/grpo.log" 2>&1 </dev/null &
+echo "GRPO PID=$! Report=$REPORT_DIR Log=$RUN_DIR/grpo.log"
