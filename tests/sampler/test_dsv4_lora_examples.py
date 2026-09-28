@@ -1,12 +1,36 @@
 """CPU orchestration tests for the examples; not GPU/NPU hardware validation."""
 import json
 import types
+from pathlib import Path
 
 import pytest
 import torch
 
 from cookbook.rl.grpo import dsv4_lora_h800 as example
 from cookbook.rl.grpo import dsv4_lora_sync_audit as audit
+
+
+def test_periodic_lora_save_counts_global_batches_not_microbatches(tmp_path):
+    saved = []
+
+    class Actor:
+        def save(self, name, output_dir, **kwargs):
+            assert kwargs == {'adapter_name': 'tenant_a'}
+            path = Path(output_dir) / name
+            path.mkdir()
+            saved.append(path)
+
+    actor = Actor()
+    root = tmp_path / 'checkpoints'
+    for completed_gbs in (1, 49, 51, 99):
+        assert example.save_checkpoint_if_due(actor, completed_gbs, 50, root) is None
+    assert not root.exists()
+    assert example.save_checkpoint_if_due(actor, 50, 50, root) == str(root / 'dsv4-grpo-gbs-000050')
+    assert example.save_checkpoint_if_due(actor, 100, 50, root) == str(root / 'dsv4-grpo-gbs-000100')
+    assert saved == [root / 'dsv4-grpo-gbs-000050', root / 'dsv4-grpo-gbs-000100']
+    assert example.save_checkpoint_if_due(actor, 150, 0, root) is None
+    with pytest.raises(FileExistsError, match='Refusing to overwrite checkpoint'):
+        example.save_checkpoint_if_due(actor, 50, 50, root)
 
 
 @pytest.fixture

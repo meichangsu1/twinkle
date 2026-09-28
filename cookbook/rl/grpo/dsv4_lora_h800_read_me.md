@@ -87,10 +87,23 @@ DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=32 NUM_GENERATIONS=2 \
 
 ```bash
 cd /opt/twinkle
-STEPS=100 BATCH_SIZE=32 NUM_GENERATIONS=2 \
+STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 \
   MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
   bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh run
 ```
+
+正式训练每个 GBS 是 64 道题、每题 4 条回答，共 256 条生成样本；
+32 个 actor rank 且 `ACTOR_MICRO_BATCH_PER_RANK=1` 时，分 8 次微批反传，
+然后只做一次优化器更新。`SAVE_EVERY_GBS=50` 按优化器更新次数计数，
+第 50、100 个 GBS 完成后分别保存一次 LoRA，不按微批计数。
+默认保存在本次运行的 `full_*/checkpoints/dsv4-grpo-gbs-000050/` 等目录，
+可用 `CHECKPOINT_DIR` 改到三节点可见的共享目录；设置 `SAVE_EVERY_GBS=0`
+可关闭定期保存。保存的是 adapter 权重和配置，不包含优化器状态，
+也不参与在线权重同步。三个 NPU 启动脚本都默认把 `FINAL_CHECKPOINT_DIR`
+设为本次运行的 `CHECKPOINT_DIR`，因此结束时还会保存
+`checkpoints/dsv4-grpo-final/`。若 `STEPS<50`，只会保存最终 adapter；
+若总轮数恰好是 50 的倍数，则定期 checkpoint 和最终 checkpoint 都会保存，
+占用两份空间。可分别覆盖两个目录环境变量。
 
 `MAX_MODEL_LEN` 是 prompt 与回答合计的上限；4096 是回答上限，不代表每条
 回答都能生成满 4096 token。长上下文会增加 KV cache 占用，若 rollout OOM，
@@ -719,7 +732,9 @@ head 的 4 张卡全部给 actor、worker 的 4 张卡全部给 rollout。此前
 
 四层模型可能全部奖励相同、advantage 为零。此时只能说链路跑通，不能说明有效更新
 或训练质量改善。采样固定 temperature=1、top_p=1、top_k=-1，KL 系数为 0；
-只在设置 `FINAL_CHECKPOINT_DIR` 时保存最终 checkpoint，不参与在线同步。
+默认每完成 50 个 GBS 保存一次 LoRA；短于 50 轮的链路测试不会触发定期保存。
+NPU 启动脚本默认设置 `FINAL_CHECKPOINT_DIR`，所以仍会保存最终 adapter；
+这些文件不参与在线同步。直接运行 Python 入口时，最终保存仍需显式设置该变量。
 
 ### 失败与资源检查
 

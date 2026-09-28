@@ -85,5 +85,8 @@ REPORT_ROOT=${REPORT_ROOT:-$HOME/dsv4_dapo_reports}
 mkdir -p "$REPORT_ROOT"
 TEST_ROOT=$(mktemp -d "$REPORT_ROOT/mini_XXXXXXXX")
 export REPORT_DIR="$TEST_ROOT/report"
+export CHECKPOINT_DIR=${CHECKPOINT_DIR:-$TEST_ROOT/checkpoints}
+export FINAL_CHECKPOINT_DIR=${FINAL_CHECKPOINT_DIR:-$CHECKPOINT_DIR}
 echo "Report: $REPORT_DIR"
+echo "Final checkpoint: $FINAL_CHECKPOINT_DIR/dsv4-grpo-final"
 python -u -m cookbook.rl.grpo.dsv4_lora_npu 2>&1 | tee "$TEST_ROOT/grpo.log"

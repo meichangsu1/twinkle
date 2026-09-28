@@ -173,6 +173,32 @@ def actual_logprobs(sequence):
     return [dict(entries)[token] for token, entries in zip(sequence.tokens, sequence.logprobs)]
 
 
+def actor_micro_batch_size(total_sequences, data_world_size):
+    """Return a global batch size that bounds sequences per actor rank."""
+    per_rank = int(os.environ.get('ACTOR_MICRO_BATCH_PER_RANK', '0'))
+    if per_rank < 0:
+        raise ValueError('ACTOR_MICRO_BATCH_PER_RANK must be nonnegative')
+    if per_rank == 0:
+        return total_sequences  # Preserve the previous behavior unless enabled.
+    size = per_rank * data_world_size
+    if total_sequences % size:
+        raise ValueError('Total sequences must be divisible by ACTOR_MICRO_BATCH_PER_RANK * data_world_size')
+    return size
+
+
+def save_checkpoint_if_due(model, completed_gbs, save_every_gbs, checkpoint_root):
+    """Save the trained LoRA after a whole number of global-batch updates."""
+    if save_every_gbs == 0 or completed_gbs % save_every_gbs:
+        return None
+    name = f'dsv4-grpo-gbs-{completed_gbs:06d}'
+    checkpoint_path = checkpoint_root / name
+    if checkpoint_path.exists():
+        raise FileExistsError(f'Refusing to overwrite checkpoint: {checkpoint_path}')
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    model.save(name, output_dir=str(checkpoint_root), adapter_name=TENANT)
+    return str(checkpoint_path)
+
+
 def main(worker_builder=None):
     dataset_kind = os.environ.get('DATASET_KIND', 'gsm8k').lower()
     if dataset_kind == 'dapo':
@@ -193,8 +219,12 @@ def main(worker_builder=None):
                                  for k, default in [('STEPS', '3'), ('BATCH_SIZE', '4'), ('NUM_GENERATIONS', '4')])
     if min(steps, batch) <= 0 or generations < 2 or len(dataset) < steps * batch:
         raise ValueError('Require positive steps/batch, >=2 generations and enough unrepeated dataset rows')
+    save_every_gbs = int(os.environ.get('SAVE_EVERY_GBS', '50'))
+    if save_every_gbs < 0:
+        raise ValueError('SAVE_EVERY_GBS must be nonnegative (0 disables periodic saves)')
     output = Path(os.environ.get('REPORT_DIR', './dsv4_grpo_reports')).resolve()
     output.mkdir(parents=True, exist_ok=False)
+    checkpoint_root = Path(os.environ.get('CHECKPOINT_DIR', str(output / 'checkpoints'))).expanduser().resolve()
     model, sampler, manager = (worker_builder or build_workers)()
     advantage_fn = GRPOAdvantage()
     if (batch * generations) % model.device_mesh.data_world_size:
@@ -243,18 +273,35 @@ def main(worker_builder=None):
         rewards = reward_fn(reward_inputs)
         advantages = advantage_fn(rewards, num_generations=generations, scale='group').tolist()
         train_start = time.monotonic()
-        result = model.forward_backward(
-            inputs=features, old_logps=old_logps, advantages=advantages, micro_batch_size=1, adapter_name=TENANT)
+        micro_size = actor_micro_batch_size(len(features), model.device_mesh.data_world_size)
+        micro_losses = []
+        for start in range(0, len(features), micro_size):
+            end = start + micro_size
+            result = model.forward_backward(
+                inputs=features[start:end],
+                old_logps=old_logps[start:end],
+                advantages=advantages[start:end],
+                adapter_name=TENANT)
+            micro_loss = result.get('loss') if isinstance(result, dict) else None
+            if isinstance(micro_loss, torch.Tensor):
+                micro_loss = micro_loss.detach().float().item() if micro_loss.numel() == 1 else None
+            if isinstance(micro_loss, (int, float)):
+                micro_losses.append(float(micro_loss))
         model.clip_grad_and_step(adapter_name=TENANT)
         report['train_seconds'] = time.monotonic() - train_start
+        save_start = time.monotonic()
+        checkpoint_path = save_checkpoint_if_due(model, step + 1, save_every_gbs, checkpoint_root)
+        if checkpoint_path is not None:
+            report['checkpoint_dir'] = checkpoint_path
+            report['checkpoint_seconds'] = time.monotonic() - save_start
+            print(f'Saved LoRA after {step + 1} GBS: {checkpoint_path}', flush=True)
         report.update(rewards=rewards, advantages=advantages, samples=samples)
         (output / f'round_{step}.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
         lengths = [len(sample['tokens']) for sample in samples]
-        loss = result.get('loss') if isinstance(result, dict) else None
-        if isinstance(loss, torch.Tensor):
-            loss = loss.detach().float().item() if loss.numel() == 1 else None
+        loss = sum(micro_losses) / len(micro_losses) if len(micro_losses) == len(features) // micro_size else None
         metrics = dict(
             training_step=step,
+            actor_microbatches=len(features) // micro_size,
             mean_reward=sum(rewards) / len(rewards),
             nonzero_advantages=sum(a != 0 for a in advantages),
             answer_format_rate=sum(bool(answer_line.search(sample['text'])) for sample in samples) / len(samples),
@@ -264,6 +311,7 @@ def main(worker_builder=None):
             sync_seconds=report['sync_seconds'],
             sample_seconds=report['sample_seconds'],
             train_seconds=report['train_seconds'],
+            checkpoint_seconds=report.get('checkpoint_seconds', 0.0),
             step_seconds=time.monotonic() - step_start,
         )
         with (output / 'metrics.jsonl').open('a', encoding='utf-8') as metrics_file:
