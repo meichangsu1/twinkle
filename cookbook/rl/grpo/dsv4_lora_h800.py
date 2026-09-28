@@ -99,7 +99,7 @@ def build_workers(model_cls=MultiLoraTransformersModel,
         memory_efficient_init=True,
         max_loras=1,
         max_r=rank,
-        max_length=8192,
+        max_length=int(os.environ.get('ACTOR_MAX_LENGTH', '8192')),
         lora_config=placeholder,
         fsdp_config={'expert_parallel': {
             'enabled': ep > 1,
