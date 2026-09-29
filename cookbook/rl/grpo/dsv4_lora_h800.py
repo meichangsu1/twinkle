@@ -115,7 +115,7 @@ def build_workers(model_cls=MultiLoraTransformersModel,
     model.set_optimizer('AdamW', lr=float(os.environ.get('LR', '1e-5')), adapter_name=TENANT)
     model.set_loss('GRPOLoss', beta=0.0, epsilon=0.2, adapter_name=TENANT)
     model.set_processor(InputProcessor, adapter_name=TENANT)
-    model.set_template('DeepseekV4Template', model_id=actor_path, adapter_name=TENANT)
+    model.set_template('DeepseekV4Template', model_id=actor_path, adapter_name=TENANT, enable_thinking=False)
     weight_adapter = dict(
         class_path='twinkle.sampler.vllm_sampler.dsv4_lora.DeepSeekV4NvidiaLoraAdapter', options={})
     if is_npu:
@@ -140,7 +140,7 @@ def build_workers(model_cls=MultiLoraTransformersModel,
     engine_args.update(extra_engine_args or {})
     sampler = sampler_cls(
         model_id=rollout_path, remote_group='rollout', device_mesh=rollout_mesh, engine_args=engine_args)
-    sampler.set_template('DeepseekV4Template', model_id=actor_path)
+    sampler.set_template('DeepseekV4Template', model_id=actor_path, enable_thinking=False)
     return model, sampler, CheckpointEngineManager(model, sampler, platform=platform)
 
 
