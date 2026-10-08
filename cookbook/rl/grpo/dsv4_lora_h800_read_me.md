@@ -1,6 +1,51 @@
 # DeepSeek-V4 LoRA RL 操作手册
 
-## 当前 NPU DAPO 快速入口（四层先行、再三机全层）
+## 全层四节点 DAPO（四层四节点通过后的下一步）
+
+四台 A3 各 16 张 NPU：actor 使用两个节点的 32 张卡；rollout 在另外两个节点上
+运行四个独立 TP8 实例（`ROLLOUT_DP=4`）。沿用四层测试的 Ray 集群时，先确认
+没有正在运行的任务，直接执行下方 `run`，不要再次执行 `head`/`worker`。
+四台容器的 `/opt/twinkle` 都需有已测通的 Python 源码；把
+`run_dsv4_full_npu_dapo.sh` 和 `run_dsv4_full_4node_npu_dapo.sh` 放在
+四台机器共用的 `/highcode/shared_data/rl/`。脚本内部仍切换到 `/opt/twinkle`
+执行 Python 模块。
+
+若 Ray 集群尚未启动，在 `11.173.4.131` 执行：
+
+```bash
+bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh head
+```
+
+在其余三个节点分别执行：
+
+```bash
+NODE_IP=11.173.4.140 bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh worker
+NODE_IP=11.173.4.144 bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh worker
+NODE_IP=11.173.4.137 bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh worker
+```
+
+集群有四个存活节点及 64 个 NPU 资源后，仅在 head 执行一次全层链路验证：
+
+```bash
+DATASET_MAX_ROWS=2000 STEPS=1 BATCH_SIZE=32 NUM_GENERATIONS=2 \
+  bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh run
+```
+
+确认首轮完成、无 actor OOM、四个 rollout 实例均收到 LoRA 后，再启动正式训练：
+
+```bash
+STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 \
+  bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh run
+```
+
+默认 actor 为全层 BF16 模型，rollout 为同源 W8A8-HW 模型，数据集为
+`/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。四节点入口将
+`MAX_NEW_TOKENS` 默认设为 2048，以避开先前 4096 回答长度触发的 actor OOM；
+这仍可能截断数学答案，需结合 `length_cap_rate` 评估，不能把链路成功当作
+reward 已可稳定上升。每个 TP8 实例的 `MAX_NUM_SEQS` 默认 4，四实例合计最多
+16 条并发序列。输出默认写入 `/highcode/shared_data/dsv4_logs/full_*/`。
+
+## 其他 NPU DAPO 入口（开发环境四层与旧三节点全层）
 
 本节使用两份独立脚本：四层开发环境使用 `run_dsv4_mini_npu_dapo.sh`，
 全层三机环境使用 `run_dsv4_full_npu_dapo.sh`。两套环境不能共用代码目录、IP、
@@ -10,7 +55,7 @@
 `172.61.10.46` 和 `172.61.10.144`（每机 4 卡）；全层使用新环境的
 `/opt/twinkle`、`bond0`、`11.173.4.131/.140/.144`（每机 16 卡）。四层测试读取
 `/model/ljl/project/data/DAPO-Math-17k/dapo-math-17k.parquet`，三机全层读取
-`/highcode/shared_data/DAPO-Math-17k/dapo-math-17k.parquet`。四层默认选前 2000 条，
+`/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。四层默认选前 2000 条，
 全层默认不截断数据集。
 
 四层链路测试采用本手册第 4 节的两机各 4 卡布局；模型路径沿用
@@ -56,21 +101,21 @@ rollout。不要在已有非测试 Ray 集群上直接执行 `ray start`。
 
 ```bash
 cd /opt/twinkle
-bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh head
+bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh head
 ```
 
 在 `11.173.4.140` 执行：
 
 ```bash
 cd /opt/twinkle
-NODE_IP=11.173.4.140 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
+NODE_IP=11.173.4.140 bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh worker
 ```
 
 在 `11.173.4.144` 执行：
 
 ```bash
 cd /opt/twinkle
-NODE_IP=11.173.4.144 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
+NODE_IP=11.173.4.144 bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh worker
 ```
 
 三节点加入后，仅在 `11.173.4.131` 启动一次训练。先用三轮验证完整模型链路：
@@ -79,7 +124,7 @@ NODE_IP=11.173.4.144 bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh worker
 cd /opt/twinkle
 DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=32 NUM_GENERATIONS=2 \
   MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
-  bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh run
+  bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh run
 ```
 
 此配置每轮 32 道题、64 条生成样本，满足 actor 的 `data_world_size=32`。
@@ -89,7 +134,7 @@ DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=32 NUM_GENERATIONS=2 \
 cd /opt/twinkle
 STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 \
   MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
-  bash cookbook/rl/grpo/run_dsv4_full_npu_dapo.sh run
+  bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh run
 ```
 
 正式训练每个 GBS 是 64 道题、每题 4 条回答，共 256 条生成样本；

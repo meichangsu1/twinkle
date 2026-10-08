@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full-model DAPO GRPO in the three-node A3 environment (16 NPUs per node).
+# Full-model DAPO GRPO on three or four A3 nodes (16 NPUs per node).
 set -euo pipefail
 
 role=${1:-}
@@ -32,9 +32,9 @@ if [[ "$role" == head ]]; then
 fi
 if [[ "$role" == worker ]]; then
   unset RAY_ADDRESS
-  : "${NODE_IP:?Set NODE_IP to 11.173.4.140 or 11.173.4.144 on this worker}"
-  if [[ "$NODE_IP" != 11.173.4.140 && "$NODE_IP" != 11.173.4.144 ]]; then
-    echo 'NODE_IP must be 11.173.4.140 or 11.173.4.144' >&2
+  : "${NODE_IP:?Set NODE_IP to the worker IP}"
+  if [[ "$NODE_IP" != 11.173.4.140 && "$NODE_IP" != 11.173.4.144 && "$NODE_IP" != 11.173.4.137 ]]; then
+    echo 'NODE_IP must be a configured worker IP' >&2
     exit 2
   fi
   ray start --address="$HEAD_IP:6379" --node-ip-address="$NODE_IP" \
@@ -43,13 +43,14 @@ if [[ "$role" == worker ]]; then
 fi
 
 export RAY_ADDRESS="$HEAD_IP:6379"
-export DATASET_KIND=dapo DAPO_PATH=${DAPO_PATH:-/highcode/shared_data/DAPO-Math-17k}
+export DATASET_KIND=dapo DAPO_PATH=${DAPO_PATH:-/highcode/shared_data/DAPO-Math-17}
 export DATASET_MAX_ROWS=${DATASET_MAX_ROWS:-0}
 export ACTOR_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16/DeepSeek-V4-Flash-0731-BF16_20260806_01
 export ROLLOUT_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-W8A8-HW/DeepSeek-V4-Flash-0731-W8A8-HW_20260803_01
 export NPUS_PER_NODE=16 ACTOR_NPUS=32 ACTOR_EP=32 ROLLOUT_START_RANK=32 ROLLOUT_TP=8
+export ROLLOUT_DP=${ROLLOUT_DP:-1}
 export ACTOR_PRECISION=bf16 LORA_R=8 LORA_ALPHA=32
-export MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192} MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=4096
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192} MAX_NUM_SEQS=${MAX_NUM_SEQS:-4} MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-4096}
 export GPU_MEMORY_UTILIZATION=0.85 TWINKLE_VLLM_BUCKET_SIZE_MB=64
 export STEPS=${STEPS:-100} BATCH_SIZE=${BATCH_SIZE:-64} NUM_GENERATIONS=${NUM_GENERATIONS:-4}
 export MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-4096} LR=${LR:-5e-6}
@@ -65,9 +66,14 @@ import ray
 ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)
 alive = [node for node in ray.nodes() if node['Alive']]
 available = ray.cluster_resources().get('NPU', 0)
+expected_nodes = (int(os.environ['ROLLOUT_START_RANK'])
+                  + int(os.environ['ROLLOUT_TP']) * int(os.environ['ROLLOUT_DP'])
+                  + int(os.environ['NPUS_PER_NODE']) - 1) // int(os.environ['NPUS_PER_NODE'])
+expected_npus = expected_nodes * int(os.environ['NPUS_PER_NODE'])
 print(f'Full Ray preflight: alive_nodes={len(alive)}, NPU_resources={available}')
-if len(alive) != 3 or available < 48:
-    raise RuntimeError('Full run requires three alive Ray nodes and at least 48 NPU resources')
+if len(alive) != expected_nodes or available < expected_npus:
+    raise RuntimeError(f'Full run requires {expected_nodes} alive Ray nodes '
+                       f'and at least {expected_npus} NPU resources')
 ray.shutdown()
 PY
 
