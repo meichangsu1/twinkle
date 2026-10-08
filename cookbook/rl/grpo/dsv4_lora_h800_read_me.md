@@ -27,21 +27,22 @@ NODE_IP=11.173.4.137 bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.
 集群有四个存活节点及 64 个 NPU 资源后，仅在 head 执行一次全层链路验证：
 
 ```bash
-DATASET_MAX_ROWS=2000 STEPS=1 BATCH_SIZE=32 NUM_GENERATIONS=2 \
+DATASET_MAX_ROWS=2000 STEPS=1 BATCH_SIZE=32 NUM_GENERATIONS=2 MAX_NEW_TOKENS=3072 \
   bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh run
 ```
 
 确认首轮完成、无 actor OOM、四个 rollout 实例均收到 LoRA 后，再启动正式训练：
 
 ```bash
-STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 \
+STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 MAX_NEW_TOKENS=3072 \
   bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh run
 ```
 
 默认 actor 为全层 BF16 模型，rollout 为同源 W8A8-HW 模型，数据集为
 `/highcode/shared_data/DAPO-Math-17/dapo-math-17k.parquet`。四节点入口将
-`MAX_NEW_TOKENS` 默认设为 2048，以避开先前 4096 回答长度触发的 actor OOM；
-这仍可能截断数学答案，需结合 `length_cap_rate` 评估，不能把链路成功当作
+四节点脚本默认 `MAX_NEW_TOKENS=2048`；上述启动命令显式设置为 3072。
+先前 4096 曾触发 actor OOM，但 3072 仍需在全层首轮验证显存；同时结合
+`length_cap_rate` 评估答案截断，不能把链路成功当作
 reward 已可稳定上升。每个 TP8 实例的 `MAX_NUM_SEQS` 默认 4，四实例合计最多
 16 条并发序列。输出默认写入 `/highcode/shared_data/dsv4_logs/full_*/`。
 
@@ -123,7 +124,7 @@ NODE_IP=11.173.4.144 bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh wor
 ```bash
 cd /opt/twinkle
 DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=32 NUM_GENERATIONS=2 \
-  MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
+  MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=3072 LR=5e-6 \
   bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh run
 ```
 
@@ -133,7 +134,7 @@ DATASET_MAX_ROWS=2000 STEPS=3 BATCH_SIZE=32 NUM_GENERATIONS=2 \
 ```bash
 cd /opt/twinkle
 STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 \
-  MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=4096 LR=5e-6 \
+  MAX_MODEL_LEN=8192 MAX_NEW_TOKENS=3072 LR=5e-6 \
   bash /highcode/shared_data/rl/run_dsv4_full_npu_dapo.sh run
 ```
 
@@ -150,8 +151,8 @@ STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 \
 若总轮数恰好是 50 的倍数，则定期 checkpoint 和最终 checkpoint 都会保存，
 占用两份空间。可分别覆盖两个目录环境变量。
 
-`MAX_MODEL_LEN` 是 prompt 与回答合计的上限；4096 是回答上限，不代表每条
-回答都能生成满 4096 token。长上下文会增加 KV cache 占用，若 rollout OOM，
+`MAX_MODEL_LEN` 是 prompt 与回答合计的上限；3072 是回答上限，不代表每条
+回答都能生成满 3072 token。长上下文会增加 KV cache 占用，若 rollout OOM，
 先减小并发（`MAX_NUM_SEQS`）或回答上限，不要直接把 reward 低归咎于学习率。
 每次运行创建独立目录，默认位于 `/highcode/shared_data/dsv4_logs/full_*/`；
 `grpo.log` 和 `report/metrics.jsonl` 分别记录日志与逐轮指标。
