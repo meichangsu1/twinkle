@@ -14,10 +14,10 @@ class RolloutWeightAdapter(ABC):
 
     @abstractmethod
     def process(self, weights, peft_config):
-        """Return (weights, peft_config) for the existing loader.
+        """Adapt a complete, independently stored LoRA for the existing loader.
 
-        Input tensors already own their storage. Context/constants are supplied
-        once by initialize(); a processor must release per-update staging on error.
+        Return (weights, peft_config). Keep per-update data local to this call;
+        only target constants initialized by initialize() persist.
         """
 
 

@@ -26,6 +26,19 @@ from twinkle.utils.platforms import ensure_npu_backend
 TENANT = 'tenant_a'
 
 
+def lora_targets_from_env():
+    """Select the same ordinary modules for slot preallocation and training."""
+    raw_modules = os.environ.get('LORA_TARGET_MODULES', '').strip()
+    modules = 'all-linear' if raw_modules == 'all-linear' else [
+        value.strip() for value in raw_modules.split(',') if value.strip()]
+    raw_parameters = os.environ.get('LORA_TARGET_PARAMETERS')
+    parameters = (['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']
+                  if raw_parameters is None else [value.strip() for value in raw_parameters.split(',') if value.strip()])
+    if not modules and not parameters:
+        raise ValueError('Select at least one LoRA target module or parameter')
+    return modules, parameters
+
+
 def required_path(name):
     path = Path(os.environ[name]).expanduser().resolve()
     if not path.exists():
@@ -51,13 +64,16 @@ def build_workers(model_cls=MultiLoraTransformersModel,
     rollout_path = required_path('ROLLOUT_MODEL')
     actor_devices = int(os.environ.get('ACTOR_NPUS' if is_npu else 'ACTOR_GPUS', '4' if is_npu else '8'))
     rollout_tp = int(os.environ.get('ROLLOUT_TP', '4'))
+    rollout_dp = int(os.environ.get('ROLLOUT_DP', '1'))
     per_node = int(os.environ.get('NPUS_PER_NODE' if is_npu else 'GPUS_PER_NODE', '16' if is_npu else '8'))
-    if min(actor_devices, rollout_tp, per_node) <= 0:
-        raise ValueError('Actor, rollout and per-node device counts must be positive')
+    if min(actor_devices, rollout_tp, rollout_dp, per_node) <= 0:
+        raise ValueError('Actor, rollout TP/DP and per-node device counts must be positive')
     # Default: put rollout on the next node. A reduced-model single-node test
     # can start rollout immediately after the actor devices if TP fits that node.
     start = int(os.environ.get('ROLLOUT_START_RANK', str(((actor_devices + per_node - 1) // per_node) * per_node)))
-    if start < actor_devices or start // per_node != (start + rollout_tp - 1) // per_node:
+    if start < actor_devices or any(
+            (start + replica * rollout_tp) // per_node !=
+            (start + (replica + 1) * rollout_tp - 1) // per_node for replica in range(rollout_dp)):
         raise ValueError('Use disjoint actor/rollout devices and keep rollout TP on one node')
     ep = int(os.environ.get('ACTOR_EP', str(actor_devices)))
     if ep <= 0 or actor_devices % ep:
@@ -72,7 +88,8 @@ def build_workers(model_cls=MultiLoraTransformersModel,
     config.use_cache = False
     device_type, platform = ('npu', 'NPU') if is_npu else ('cuda', 'GPU')
     actor_mesh = DeviceMesh.from_sizes(fsdp_size=actor_devices, dp_size=1, ep_size=ep, device_type=device_type)
-    rollout_mesh = DeviceMesh.from_sizes(world_size=rollout_tp, dp_size=1, tp_size=rollout_tp, device_type=device_type)
+    rollout_mesh = DeviceMesh.from_sizes(
+        world_size=rollout_dp * rollout_tp, dp_size=rollout_dp, tp_size=rollout_tp, device_type=device_type)
     twinkle.initialize(
         mode='ray',
         nproc_per_node=per_node,
@@ -81,13 +98,16 @@ def build_workers(model_cls=MultiLoraTransformersModel,
             DeviceGroup(name='actor', ranks=list(range(actor_devices)), device_type=platform),
             DeviceGroup(
                 name='rollout',
-                ranks=list(range(start, start + rollout_tp)),
+                ranks=list(range(start, start + rollout_dp * rollout_tp)),
                 device_type=platform,
                 gpus_per_worker=rollout_tp),
         ])
-    # One small, inactive PEFT placeholder per layer establishes the container;
-    # tenant target_modules=[] excludes these slots from training/export.
-    placeholder = LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=0, target_modules=['q_a_proj'])
+    target_modules, target_parameters = lora_targets_from_env()
+    # Multi-LoRA preallocates ordinary module slots at model construction.
+    # Routed-only runs retain the old small, inactive q_a_proj placeholder.
+    placeholder = LoraConfig(
+        r=rank, lora_alpha=alpha, lora_dropout=0,
+        target_modules=target_modules or ['q_a_proj'])
     model = model_cls(
         model_id=actor_path,
         config=config,
@@ -109,8 +129,8 @@ def build_workers(model_cls=MultiLoraTransformersModel,
         r=rank,
         lora_alpha=alpha,
         lora_dropout=0,
-        target_modules=[],
-        target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'])
+        target_modules=target_modules,
+        target_parameters=target_parameters)
     model.add_adapter_to_model(TENANT, lora, gradient_accumulation_steps=1)
     model.set_optimizer('AdamW', lr=float(os.environ.get('LR', '1e-5')), adapter_name=TENANT)
     model.set_loss('GRPOLoss', beta=0.0, epsilon=0.2, adapter_name=TENANT)

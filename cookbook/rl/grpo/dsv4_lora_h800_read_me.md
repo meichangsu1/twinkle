@@ -177,6 +177,24 @@ set -o pipefail
 - 文件对照的输出目录必须在 driver、actor、rollout 上以同一路径可读写。
   这是测试对照要求；正式在线同步不从 adapter 文件加载。
 
+### 可训练 LoRA 模块与当前同步边界
+
+Actor 逐张量导出所选租户的普通 2D LoRA 和 routed-expert 3D LoRA；rollout
+将其转换为目标名称及布局。示例默认仍只训练 routed experts。训练普通线性层时，
+设置逗号分隔的 `LORA_TARGET_MODULES`（或 `all-linear`）；可用
+`LORA_TARGET_PARAMETERS=` 清空默认 routed target。例如：
+`LORA_TARGET_MODULES=self_attn.q_a_proj,mlp.shared_experts.gate_proj`。
+
+Checkpoint Engine 仍按桶传输；vLLM worker 收齐完整 LoRA 后才统一配对、转换并安装。
+因此不能把桶大小当作接收端峰值内存上限。转换失败不会提交半个 adapter。
+
+Ascend 对普通模块应用对应的 QuaRot 坐标变换，但目前只有 CPU 公式测试，**尚未验证
+真实 W8A8 前向增量**。启用这些模块训练前，须逐模块比较 BF16 与 W8A8 基座上的
+LoRA 增量，并比较文件加载与内存同步的同 token 输出。当前后端缺口：NVIDIA DSV4
+未声明 embedding LoRA 入口；Ascend `mix_placement` 可能不创建独立 shared-expert
+模块；其他 3D target parameter 也尚无目标加载布局。Twinkle 不会修改 vLLM 后端，
+发送成功不代表这些模块已在目标前向中生效。
+
 ## 2. H800 单机操作
 
 ### 2.1 启动或连接 Ray

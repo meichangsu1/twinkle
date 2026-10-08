@@ -11,7 +11,40 @@ from safetensors.torch import load_file, save_file
 
 from twinkle.sampler.vllm_sampler.dsv4_lora_ascend import (
     QUAROT_RECIPE, DeepSeekV4AscendQuaRotLoraAdapter, transform_quarot_pair)
+from twinkle.sampler.vllm_sampler.dsv4_lora import NORMAL_MODULE_RULES, PREFIX
 from twinkle.sampler.vllm_sampler.weight_sync import create_weight_adapter
+
+EXPECTED_NORMAL_QUAROT_RULES = {
+    'self_attn.compressor.indexer.weights_proj': 'attention_input',
+    'self_attn.compressor.indexer.scorer.weights_proj': 'attention_input',
+    'self_attn.compressor.indexer.q_b_proj': 'identity',
+    'self_attn.compressor.indexer.kv_proj': 'attention_input',
+    'self_attn.compressor.indexer.gate_proj': 'attention_input',
+    'self_attn.compressor.kv_proj': 'attention_input',
+    'self_attn.compressor.gate_proj': 'attention_input',
+    'self_attn.q_a_proj': 'attention_input',
+    'self_attn.q_b_proj': 'identity',
+    'self_attn.kv_proj': 'attention_input',
+    'self_attn.o_a_proj': 'identity',
+    'self_attn.o_b_proj': 'hidden_output',
+    'mlp.shared_experts.gate_proj': 'ffn_input',
+    'mlp.shared_experts.down_proj': 'hidden_output',
+    'mlp.shared_experts.up_proj': 'ffn_input',
+}
+
+
+def test_ascend_rules_preserve_independent_mapping_and_rotation_recipe():
+    from cookbook.rl.grpo.convert_twinkle_dsv4_lora_for_vllm import NORMAL_MODULE_MAPPING
+    assert {suffix: rule.quarot for suffix, rule in NORMAL_MODULE_RULES.items()} == EXPECTED_NORMAL_QUAROT_RULES
+    for suffix, rule in NORMAL_MODULE_RULES.items():
+        mapped = NORMAL_MODULE_MAPPING[suffix]
+        if mapped.startswith('attn.'):
+            expected = 'self_attn.' + mapped.removeprefix('attn.')
+        else:
+            expected = 'mlp.' + mapped.removeprefix('ffn.')
+            parent, projection = expected.rsplit('.', 1)
+            expected = parent + '.' + {'w1': 'gate_proj', 'w2': 'down_proj', 'w3': 'up_proj'}[projection]
+        assert rule.ascend == expected
 
 
 @pytest.fixture
@@ -26,10 +59,15 @@ def recipe(tmp_path):
     rng = torch.Generator().manual_seed(17)
     rotation = torch.linalg.qr(torch.randn(8, 8, generator=rng))[0].contiguous()
     gammas = {layer: torch.rand(8, generator=rng) + 0.5 for layer in range(2)}
+    attn_gammas = {layer: torch.rand(8, generator=rng) + 0.5 for layer in range(2)}
     save_file({'global_rotation': rotation}, str(quant / 'optional/quarot.safetensors'))
-    save_file({f'model.layers.{layer}.post_attention_layernorm.weight': gamma
-               for layer, gamma in gammas.items()}, str(source / 'model.safetensors'))
+    source_weights = {f'model.layers.{layer}.post_attention_layernorm.weight': gamma
+                      for layer, gamma in gammas.items()}
+    source_weights.update({f'model.layers.{layer}.input_layernorm.weight': gamma
+                           for layer, gamma in attn_gammas.items()})
+    save_file(source_weights, str(source / 'model.safetensors'))
     quant_weights = {f'layers.{layer}.ffn_norm.weight': torch.ones(8) for layer in range(2)}
+    quant_weights.update({f'layers.{layer}.attn_norm.weight': torch.ones(8) for layer in range(2)})
     description = dict(optional=dict(quarot=dict(rotation_map=dict(global_rotation='optional/quarot.safetensors'))))
     for layer in range(2):
         for expert in range(3):
@@ -45,7 +83,8 @@ def recipe(tmp_path):
     peft = dict(r=2, lora_alpha=8, use_rslora=False, target_modules=[],
                 target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'])
     return types.SimpleNamespace(source=source, quant=quant, target=target, options=options,
-                                 peft=peft, rotation=rotation, gammas=gammas, description=description)
+                                 peft=peft, rotation=rotation, gammas=gammas,
+                                 attn_gammas=attn_gammas, description=description)
 
 
 def adapter_config(recipe):
@@ -97,8 +136,50 @@ def test_ascend_matches_independent_formula_and_repeated_updates(recipe, dtype):
             assert torch.equal(value, expected[name] * (factor if '.lora_B.' in name else 1))
         assert config['r'] == 2 and config['lora_alpha'] == 8 and not config['use_rslora']
         assert config['target_parameters'] is None and config['target_modules'] == ['experts']
-        assert not adapter.pending and not adapter.converted
+        assert not hasattr(adapter, 'pending')
         assert all(torch.equal(value, original[name]) for name, value in source)
+
+
+@pytest.mark.parametrize('suffix,rule', NORMAL_MODULE_RULES.items())
+def test_ordinary_quarot_coordinate_rules(recipe, suffix, rule):
+    # Algebraic conversion check; real W8A8 forward parity remains untested.
+    recipe.peft['target_modules'] = [suffix]
+    recipe.peft['target_parameters'] = []
+    a_in = 8 if rule.quarot in ('attention_input', 'ffn_input') else 4
+    b_out = 8 if rule.quarot == 'hidden_output' else 4
+    a = torch.arange(2 * a_in, dtype=torch.float32).reshape(2, a_in).to(torch.bfloat16) / 10
+    b = torch.arange(b_out * 2, dtype=torch.float32).reshape(b_out, 2).to(torch.bfloat16) / 10
+    adapter = create_weight_adapter(adapter_config(recipe), recipe.target)
+    source_name = f'model.layers.0.{suffix}'
+    converted, config = adapter.process([
+        (f'{source_name}.lora_B.weight', b), (f'{source_name}.lora_A.weight', a)], recipe.peft)
+    converted = dict(converted)
+    target_suffix = rule.ascend
+    target_name = f'{PREFIX}.0.{target_suffix}'
+    if rule.quarot == 'attention_input':
+        expected_a = ((a.float() * recipe.attn_gammas[0]) @ recipe.rotation).to(a.dtype)
+    elif rule.quarot == 'ffn_input':
+        expected_a = ((a.float() * recipe.gammas[0]) @ recipe.rotation).to(a.dtype)
+    else:
+        expected_a = a
+    expected_b = (recipe.rotation.T @ b.float()).to(b.dtype) if rule.quarot == 'hidden_output' else b
+    assert torch.equal(converted[f'{target_name}.lora_A.weight'], expected_a)
+    assert torch.equal(converted[f'{target_name}.lora_B.weight'], expected_b)
+    runtime = target_suffix.rsplit('.', 1)[-1]
+    assert config['target_modules'] == [runtime]
+
+
+def test_attention_requires_norm_fusion(recipe):
+    recipe.peft['target_modules'] = ['q_a_proj']
+    recipe.peft['target_parameters'] = []
+    quant_weights = load_file(str(recipe.quant / 'model.safetensors'))
+    quant_weights['layers.0.attn_norm.weight'][0] = 2
+    save_file(quant_weights, str(recipe.quant / 'model.safetensors'))
+    adapter = create_weight_adapter(adapter_config(recipe), recipe.target)
+    name = 'model.layers.0.self_attn.q_a_proj'
+    with pytest.raises(ValueError, match='attention norm'):
+        adapter.process([(f'{name}.lora_A.weight', torch.ones(2, 8, dtype=torch.bfloat16)),
+                         (f'{name}.lora_B.weight', torch.ones(4, 2, dtype=torch.bfloat16))], recipe.peft)
 
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
@@ -162,7 +243,7 @@ def test_invalid_recipe_rejected_at_initialization(recipe, fault, tmp_path):
             save_file({'global_rotation': q}, str(recipe.quant / 'optional/quarot.safetensors'))
     elif fault.startswith('gamma_') or fault == 'missing_norm':
         values = load_file(str(recipe.source / 'model.safetensors'))
-        key = next(iter(values))
+        key = 'model.layers.0.post_attention_layernorm.weight'
         if fault == 'gamma_nonfinite':
             values[key][0] = float('inf')
         elif fault == 'gamma_shape':
@@ -227,7 +308,7 @@ def test_only_constants_read_from_index_and_cached_in_worker(recipe, monkeypatch
     assert all('.mlp.experts.' in key for key in installed[-1].lora_tensors)
 
 
-@pytest.mark.parametrize('fault', ['missing', 'duplicate', 'nonfinite', 'overflow', 'dtype', 'normal_linear'])
+@pytest.mark.parametrize('fault', ['missing', 'duplicate', 'nonfinite', 'overflow', 'dtype', 'unknown_module'])
 def test_update_failure_does_not_install_and_preserves_constants(recipe, monkeypatch, fault):
     from twinkle.sampler.vllm_sampler.vllm_worker_extension import TwinkleWorkerExtension
     adapter = create_weight_adapter(adapter_config(recipe), recipe.target)
@@ -246,12 +327,15 @@ def test_update_failure_does_not_install_and_preserves_constants(recipe, monkeyp
         source[0] = source[0][0], source[0][1].float()
     else:
         config['target_modules'] = ['q_a_proj']
+        name = 'model.layers.0.self_attn.unknown_proj'
+        source.extend([(f'{name}.lora_A.weight', torch.ones(2, 8, dtype=torch.bfloat16)),
+                       (f'{name}.lora_B.weight', torch.ones(4, 2, dtype=torch.bfloat16))])
     worker = object.__new__(TwinkleWorkerExtension)
     worker._get_weight_adapter = lambda _: adapter
     worker.add_lora = lambda _: pytest.fail('Conversion failure must not reach the loader')
     with pytest.raises(ValueError):
         worker._load_weights(source, config, False, lora_only=True, weight_adapter=adapter_config(recipe))
-    assert not adapter.pending and not adapter.converted
+    assert not hasattr(adapter, 'pending')
     assert adapter.rotation is rotation and adapter.gammas is gammas
 
 

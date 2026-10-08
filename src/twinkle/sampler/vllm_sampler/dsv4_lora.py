@@ -1,168 +1,181 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""DeepSeek-V4 routed LoRA layout handling, executed only on rollout workers."""
+"""DeepSeek-V4 LoRA adaptation after rollout has received the complete adapter."""
 import math
 import re
-import time
-import torch
 from copy import deepcopy
+from typing import NamedTuple
+
+import torch
 
 from .weight_sync import RolloutWeightAdapter
 
 TARGETS = {'mlp.experts.gate_up_proj', 'mlp.experts.down_proj'}
 PREFIX = 'base_model.model.model.layers'
-PARAMETER = re.compile(r'(?:.*\.)?layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$')
+SOURCE_NAME = re.compile(r'(?:.*\.)?layers\.(\d+)\.(.+)\.lora_([AB])\.weight')
 
 
-def target_peft_config(source):
-    config = deepcopy(source)
-    if config.get('target_modules') or set(config.get('target_parameters') or []) != TARGETS:
-        raise ValueError('DSV4 synchronization requires routed-only gate_up_proj/down_proj LoRA')
-    for key in ('use_dora', 'use_qalora', 'rank_pattern', 'alpha_pattern', 'modules_to_save', 'layer_replication',
-                'trainable_token_indices', 'lora_bias'):
-        if config.get(key):
-            raise ValueError(f'Unsupported LoRA option: {key}')
-    if config.get('bias', 'none') != 'none':
-        raise ValueError('Only LoRA bias=none is supported')
-    if type(config['r']) is not int or config['r'] <= 0 or not math.isfinite(float(config['lora_alpha'])):
-        raise ValueError('Invalid LoRA rank/alpha')
-    config.update(
-        target_modules=['experts'],
-        target_parameters=None,
-        exclude_modules=None,
-        inference_mode=True,
-        bias='none',
-        modules_to_save=None)
-    return config
+class NormalModuleRule(NamedTuple):
+    nvidia: str
+    ascend: str
+    quarot: str
+
+
+# Source module -> vLLM names and, when needed, the Ascend QuaRot coordinate rule.
+NORMAL_MODULE_RULES = {
+    'self_attn.compressor.indexer.weights_proj': NormalModuleRule(
+        'attn.indexer.weights_proj', 'self_attn.indexer.weights_proj', 'attention_input'),
+    'self_attn.compressor.indexer.scorer.weights_proj': NormalModuleRule(
+        'attn.indexer.weights_proj', 'self_attn.indexer.weights_proj', 'attention_input'),
+    'self_attn.compressor.indexer.q_b_proj': NormalModuleRule(
+        'attn.indexer.wq_b', 'self_attn.indexer.wq_b', 'identity'),
+    'self_attn.compressor.indexer.kv_proj': NormalModuleRule(
+        'attn.indexer.compressor.wkv', 'self_attn.indexer.compressor.wkv', 'attention_input'),
+    'self_attn.compressor.indexer.gate_proj': NormalModuleRule(
+        'attn.indexer.compressor.wgate', 'self_attn.indexer.compressor.wgate', 'attention_input'),
+    'self_attn.compressor.kv_proj': NormalModuleRule(
+        'attn.compressor.wkv', 'self_attn.compressor.wkv', 'attention_input'),
+    'self_attn.compressor.gate_proj': NormalModuleRule(
+        'attn.compressor.wgate', 'self_attn.compressor.wgate', 'attention_input'),
+    'self_attn.q_a_proj': NormalModuleRule('attn.wq_a', 'self_attn.wq_a', 'attention_input'),
+    'self_attn.q_b_proj': NormalModuleRule('attn.wq_b', 'self_attn.wq_b', 'identity'),
+    'self_attn.kv_proj': NormalModuleRule('attn.wkv', 'self_attn.wkv', 'attention_input'),
+    'self_attn.o_a_proj': NormalModuleRule('attn.wo_a', 'self_attn.wo_a', 'identity'),
+    'self_attn.o_b_proj': NormalModuleRule('attn.wo_b', 'self_attn.wo_b', 'hidden_output'),
+    'mlp.shared_experts.gate_proj': NormalModuleRule(
+        'ffn.shared_experts.w1', 'mlp.shared_experts.gate_proj', 'ffn_input'),
+    'mlp.shared_experts.down_proj': NormalModuleRule(
+        'ffn.shared_experts.w2', 'mlp.shared_experts.down_proj', 'hidden_output'),
+    'mlp.shared_experts.up_proj': NormalModuleRule(
+        'ffn.shared_experts.w3', 'mlp.shared_experts.up_proj', 'ffn_input'),
+}
 
 
 class DeepSeekV4LoraAdapter(RolloutWeightAdapter):
+    backend = 'nvidia'
 
     def _initialize(self, target_context):
         if not target_context['enable_lora']:
             raise ValueError('LoRA synchronization requires enable_lora')
         if target_context['pp_size'] != 1 or target_context['ep_enabled']:
             raise ValueError('Rollout synchronization supports node-local TP, not PP/EP')
-        self.target = target_context
-        self.abort_update()
-
-    def process(self, weights, peft_config):
-        """Adapt one complete LoRA without changing the worker's loading policy."""
-        try:
-            self.begin_update(peft_config)
-            self.consume_weights(weights)
-            tensors, config, _ = self.finish_update()
-            return list(tensors.items()), config
-        finally:
-            self.abort_update()
-
-    def begin_update(self, peft_config):
-        self.abort_update()
-        dims = self.target['model_config']
+        dims = target_context['model_config']
         if dims.get('model_type') != 'deepseek_v4':
             raise ValueError('Expected DeepSeek-V4 rollout')
         for key in ('num_hidden_layers', 'n_routed_experts', 'hidden_size', 'moe_intermediate_size'):
             if type(dims.get(key)) is not int or dims[key] <= 0:
                 raise ValueError(f'Invalid target dimension: {key}')
-        self.peft_config = target_peft_config(peft_config)
-        r = self.peft_config['r']
-        if r > self.target['max_lora_rank']:
+        self.target = target_context
+
+    def _update_config(self, peft_config):
+        targets = set(peft_config.get('target_parameters') or [])
+        modules = peft_config.get('target_modules')
+        if targets - TARGETS or not (targets or modules):
+            raise ValueError('Unsupported DSV4 LoRA targets')
+        if modules is not None and not isinstance(modules, (str, list, tuple, set)):
+            raise ValueError('Unsupported DSV4 LoRA targets')
+        unsupported = ('use_dora', 'use_qalora', 'rank_pattern', 'alpha_pattern', 'modules_to_save',
+                       'layer_replication', 'trainable_token_indices', 'lora_bias')
+        if any(peft_config.get(key) for key in unsupported) or peft_config.get('bias', 'none') != 'none':
+            raise ValueError('Unsupported LoRA configuration')
+        rank = peft_config['r']
+        if type(rank) is not int or rank <= 0 or not math.isfinite(float(peft_config['lora_alpha'])):
+            raise ValueError('Invalid LoRA rank/alpha')
+        if rank > self.target['max_lora_rank']:
             raise ValueError('Insufficient rollout LoRA rank capacity')
-        self.scale = float(self.peft_config['lora_alpha']) / (math.sqrt(r) if self.peft_config.get('use_rslora') else r)
-        self.dtype = str(self.target['lora_dtype'])
-        if self.dtype not in ('torch.bfloat16', 'torch.float16'):
+        dtype = str(self.target['lora_dtype'])
+        if dtype not in ('torch.bfloat16', 'torch.float16'):
             raise ValueError('LoRA dtype must be BF16/FP16')
-        self.expected_target_count = dims['num_hidden_layers'] * dims['n_routed_experts'] * 6
+        return targets, rank, dtype
 
-    def adapt_numeric_pair(self, layer, projection, a, b):
-        """Default identity; a backend may change coordinates before splitting."""
+    def transform_pair(self, layer, suffix, a, b):
+        """Change coordinates before splitting a routed projection; NVIDIA is identity."""
         return a, b
-
-    def convert_layout(self, projection, a, b):
-        """Yield independent 2-D tensors, retaining gate/up's shared source A."""
-        i = self.target['model_config']['moe_intermediate_size']
-        projections = [('w1', b[:, :i]), ('w3', b[:, i:])] if projection == 'gate_up_proj' else [('w2', b)]
-        for expert in range(a.shape[0]):
-            for target, bp in projections:
-                yield expert, target, 'A', a[expert].detach().clone().contiguous()
-                yield expert, target, 'B', bp[expert].detach().clone().contiguous()
 
     def map_name(self, layer, expert, projection, side):
         return f'{PREFIX}.{layer}.ffn.experts.{expert}.{projection}.lora_{side}.weight'
 
+    def normal_runtime_target(self, mapped_suffix):
+        if mapped_suffix == 'ffn.shared_experts.w2':
+            return 'down_proj'
+        return mapped_suffix.rsplit('.', 1)[-1]
+
+    def _outputs(self, layer, suffix, a, b):
+        if suffix not in TARGETS:
+            mapped = getattr(NORMAL_MODULE_RULES[suffix], self.backend)
+            runtime = self.normal_runtime_target(mapped)
+            yield f'{PREFIX}.{layer}.{mapped}.lora_A.weight', a, runtime
+            yield f'{PREFIX}.{layer}.{mapped}.lora_B.weight', b, runtime
+            return
+        intermediate = self.target['model_config']['moe_intermediate_size']
+        projection = suffix.rsplit('.', 1)[-1]
+        branches = (('w1', b[:, :intermediate]), ('w3', b[:, intermediate:])) \
+            if projection == 'gate_up_proj' else (('w2', b),)
+        for expert in range(a.shape[0]):
+            for target, b_part in branches:
+                yield self.map_name(layer, expert, target, 'A'), a[expert], 'experts'
+                yield self.map_name(layer, expert, target, 'B'), b_part[expert], 'experts'
+
     @torch.no_grad()
-    def consume_weights(self, weights):
-        for name, tensor in weights:
-            match = re.fullmatch(r'(.+)\.lora_([AB])\.weight', name)
-            parameter = PARAMETER.fullmatch(match[1]) if match else None
-            if parameter is None:
-                raise ValueError(f'Unsupported source name: {name}')
-            layer, projection, side = int(parameter[1]), parameter[2], match[2]
-            slot = (layer, projection, side)
-            dims = self.target['model_config']
-            if slot in self.seen or not 0 <= layer < dims['num_hidden_layers']:
-                raise ValueError(f'Unexpected or duplicate source tensor: {name}')
-            e, h, i = (dims[k] for k in ('n_routed_experts', 'hidden_size', 'moe_intermediate_size'))
-            ins, outs = (h, 2 * i) if projection == 'gate_up_proj' else (i, h)
-            r = self.peft_config['r']
-            expected = (e, r, ins) if side == 'A' else (e, outs, r)
-            if tuple(tensor.shape) != expected or str(tensor.dtype) != self.dtype:
-                raise ValueError(f'Invalid source tensor shape/dtype for {name}: expected {expected}, {self.dtype}')
-            self.seen.add(slot)
-            self.source_nbytes += tensor.numel() * tensor.element_size()
-            group = self.pending.setdefault((layer, projection), {})
-            group[side] = tensor
-            if set(group) != {'A', 'B'}:
-                continue
-            if tensor.is_cuda:
-                torch.cuda.synchronize(tensor.device)
-            start = time.monotonic()
-            a, b = self.adapt_numeric_pair(layer, projection, group['A'], group['B'])
-            if a.shape != group['A'].shape or b.shape != group['B'].shape:
-                raise ValueError('Numeric adaptation changed A/B dimensions')
-            for expert, target, ab, value in self.convert_layout(projection, a, b):
-                target_name = self.map_name(layer, expert, target, ab)
-                if target_name in self.converted or str(value.dtype) != self.dtype:
-                    raise ValueError(f'Duplicate target or changed dtype: {target_name}')
-                self.converted[target_name] = value
-                self.target_nbytes += value.numel() * value.element_size()
-            if tensor.is_cuda:
-                torch.cuda.synchronize(tensor.device)
-            self.convert_seconds += time.monotonic() - start
-            del self.pending[(layer, projection)]
-
-    def finish_update(self):
-        if self.pending or len(self.seen) != self.target['model_config']['num_hidden_layers'] * 4:
-            raise ValueError('Incomplete source LoRA stream')
-        if len(self.converted) != self.expected_target_count:
-            raise ValueError('Incomplete converted LoRA')
-        # Explicit output shape/key validation before calling the existing loader.
+    def process(self, weights, peft_config):
+        """Convert one complete adapter without keeping any per-update state."""
+        targets, rank, dtype = self._update_config(peft_config)
         dims = self.target['model_config']
-        r, h, i = self.peft_config['r'], dims['hidden_size'], dims['moe_intermediate_size']
-        for layer in range(dims['num_hidden_layers']):
-            for expert in range(dims['n_routed_experts']):
-                for proj in ('w1', 'w2', 'w3'):
-                    for side in ('A', 'B'):
-                        name = self.map_name(layer, expert, proj, side)
-                        expected = ((r, i if proj == 'w2' else h) if side == 'A' else (h if proj == 'w2' else i, r))
-                        value = self.converted.get(name)
-                        if value is None or tuple(value.shape) != expected or str(value.dtype) != self.dtype:
-                            raise ValueError(f'Invalid converted tensor: {name}')
-        report = dict(
-            source_tensor_count=len(self.seen),
-            tensor_count=len(self.converted),
-            source_nbytes=self.source_nbytes,
-            target_nbytes=self.target_nbytes,
-            convert_seconds=self.convert_seconds,
-            dtype=self.dtype,
-            scale=self.scale)
-        return self.converted, self.peft_config, report
+        pairs = {}
+        for name, tensor in weights:
+            match = SOURCE_NAME.fullmatch(name)
+            if match is None:
+                raise ValueError(f'Unsupported source name: {name}')
+            layer, suffix, side = int(match[1]), match[2], match[3]
+            if not 0 <= layer < dims['num_hidden_layers']:
+                raise ValueError(f'Unsupported DSV4 LoRA layer: {name}')
+            if suffix in TARGETS:
+                if suffix not in targets:
+                    raise ValueError(f'Unexpected routed LoRA target: {name}')
+                experts, hidden, intermediate = (dims[key] for key in
+                                                 ('n_routed_experts', 'hidden_size', 'moe_intermediate_size'))
+                ins, outs = ((hidden, 2 * intermediate) if suffix.endswith('gate_up_proj')
+                             else (intermediate, hidden))
+                expected = (experts, rank, ins) if side == 'A' else (experts, outs, rank)
+                if tuple(tensor.shape) != expected or str(tensor.dtype) != dtype:
+                    raise ValueError(f'Invalid source tensor shape/dtype for {name}: expected {expected}, {dtype}')
+            elif suffix in NORMAL_MODULE_RULES:
+                if (tensor.ndim != 2 or str(tensor.dtype) != dtype
+                        or (tensor.shape[0] if side == 'A' else tensor.shape[1]) != rank):
+                    raise ValueError(f'Invalid ordinary LoRA shape/dtype: {name}')
+            else:
+                raise ValueError(f'Unsupported DSV4 LoRA module: {name}')
+            pair = pairs.setdefault((layer, suffix), {})
+            if side in pair:
+                raise ValueError(f'Duplicate source LoRA tensor: {name}')
+            pair[side] = tensor
 
-    def abort_update(self):
-        self.pending = {}
-        self.converted = {}
-        self.seen = set()
-        self.source_nbytes = self.target_nbytes = 0
-        self.convert_seconds = 0.0
+        if not pairs:
+            raise ValueError('Empty source LoRA')
+        if any(set(pair) != {'A', 'B'} for pair in pairs.values()):
+            raise ValueError('Incomplete source LoRA pair')
+        routed_count = sum(suffix in TARGETS for _, suffix in pairs)
+        if routed_count != dims['num_hidden_layers'] * len(targets):
+            raise ValueError('Incomplete source routed LoRA')
+
+        converted = {}
+        runtime_targets = set()
+        for (layer, suffix), pair in pairs.items():
+            a, b = pair['A'], pair['B']
+            new_a, new_b = self.transform_pair(layer, suffix, a, b)
+            if (new_a.shape != a.shape or new_b.shape != b.shape
+                    or str(new_a.dtype) != dtype or str(new_b.dtype) != dtype):
+                raise ValueError(f'Numeric adaptation changed A/B shape or dtype: {layer}.{suffix}')
+            for name, value, runtime in self._outputs(layer, suffix, new_a, new_b):
+                if name in converted:
+                    raise ValueError(f'Conflicting LoRA target: {name}')
+                converted[name] = value.detach().clone().contiguous()
+                runtime_targets.add(runtime)
+
+        target_config = deepcopy(peft_config)
+        target_config.update(
+            target_modules=sorted(runtime_targets), target_parameters=None,
+            exclude_modules=None, inference_mode=True, bias='none', modules_to_save=None)
+        return list(converted.items()), target_config
 
 
 class DeepSeekV4NvidiaLoraAdapter(DeepSeekV4LoraAdapter):

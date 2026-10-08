@@ -10,7 +10,8 @@ import types
 from pathlib import Path
 
 from twinkle.checkpoint_engine.manager import CheckpointEngineManager
-from twinkle.sampler.vllm_sampler.dsv4_lora import PREFIX, TARGETS, DeepSeekV4NvidiaLoraAdapter, target_peft_config
+from twinkle.sampler.vllm_sampler.dsv4_lora import (
+    NORMAL_MODULE_RULES, PREFIX, TARGETS, DeepSeekV4NvidiaLoraAdapter)
 
 ADAPTER_CONFIG = dict(class_path='twinkle.sampler.vllm_sampler.dsv4_lora.DeepSeekV4NvidiaLoraAdapter', options={})
 
@@ -34,15 +35,12 @@ def new_adapter(metadata, cls=DeepSeekV4NvidiaLoraAdapter):
             model_config=metadata['model_config'],
             max_lora_rank=128,
             lora_dtype=metadata['dtype']), {})
-    adapter.begin_update(metadata["peft_config"])
     return adapter
 
 
 def convert_groups(source, metadata):
     adapter = new_adapter(metadata)
-    for group in source:
-        adapter.consume_weights(group.items())
-    return adapter.finish_update()[0].items()
+    return adapter.process((item for group in source for item in group.items()), metadata['peft_config'])[0]
 
 
 def groups(dtype=torch.bfloat16):
@@ -56,6 +54,11 @@ def groups(dtype=torch.bfloat16):
                 f'{prefix}.lora_B.weight': torch.randn(3, outs, 2).to(dtype)
             })
     return result
+
+
+def test_normal_module_rules_match_nvidia_offline_converter():
+    from cookbook.rl.grpo.convert_twinkle_dsv4_lora_for_vllm import NORMAL_MODULE_MAPPING
+    assert {suffix: rule.nvidia for suffix, rule in NORMAL_MODULE_RULES.items()} == NORMAL_MODULE_MAPPING
 
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
@@ -78,6 +81,78 @@ def test_conversion_matches_independent_offline_recipe(dtype):
         for tensor in group.values():
             tensor.zero_()
     assert any(t.count_nonzero() for t in actual.values())  # owned storage
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+def test_mixed_ordinary_and_routed_lora_conversion(dtype):
+    metadata = fixture_config(dtype)
+    metadata['peft_config']['target_modules'] = 'all-linear'
+    source = groups(dtype)
+    ordinary = {}
+    for suffix in ('self_attn.q_a_proj', 'mlp.shared_experts.gate_proj'):
+        name = f'base_model.model.model.layers.0.{suffix}'
+        ordinary[f'{name}.lora_A.weight'] = torch.randn(2, 8).to(dtype)
+        ordinary[f'{name}.lora_B.weight'] = torch.randn(4, 2).to(dtype)
+    source.insert(1, ordinary)  # A/B and ordinary/routed tensors need not be contiguous.
+    adapter = new_adapter(metadata)
+    converted, config = adapter.process((item for group in source for item in group.items()), metadata['peft_config'])
+    converted = dict(converted)
+    assert sum(len(group) for group in source) == 12
+    assert len(converted) == 40
+    assert config['target_modules'] == ['experts', 'w1', 'wq_a']
+    for suffix, mapped in (('self_attn.q_a_proj', 'attn.wq_a'),
+                           ('mlp.shared_experts.gate_proj', 'ffn.shared_experts.w1')):
+        for side in ('A', 'B'):
+            original = ordinary[f'base_model.model.model.layers.0.{suffix}.lora_{side}.weight']
+            assert torch.equal(converted[f'{PREFIX}.0.{mapped}.lora_{side}.weight'], original)
+
+
+@pytest.mark.parametrize('suffix,rule', NORMAL_MODULE_RULES.items())
+def test_normal_only_modules_follow_offline_nvidia_mapping(suffix, rule):
+    metadata = fixture_config()
+    metadata['peft_config']['target_parameters'] = []
+    metadata['peft_config']['target_modules'] = 'all-linear'
+    prefix = f'model.layers.0.{suffix}'
+    a = torch.ones(2, 8, dtype=torch.bfloat16)
+    b = torch.ones(4, 2, dtype=torch.bfloat16)
+    adapter = new_adapter(metadata)
+    converted, config = adapter.process(
+        [(f'{prefix}.lora_B.weight', b), (f'{prefix}.lora_A.weight', a)], metadata['peft_config'])
+    converted = dict(converted)
+    mapped = rule.nvidia
+    assert list(converted) == [f'{PREFIX}.0.{mapped}.lora_A.weight', f'{PREFIX}.0.{mapped}.lora_B.weight']
+    assert torch.equal(converted[f'{PREFIX}.0.{mapped}.lora_A.weight'], a)
+    assert torch.equal(converted[f'{PREFIX}.0.{mapped}.lora_B.weight'], b)
+    assert len(converted) == 2
+    assert config['target_parameters'] is None
+
+
+def test_ordinary_lora_pair_must_be_complete():
+    metadata = fixture_config()
+    metadata['peft_config']['target_parameters'] = []
+    metadata['peft_config']['target_modules'] = ['q_a_proj']
+    adapter = new_adapter(metadata)
+    with pytest.raises(ValueError, match='Incomplete'):
+        adapter.process(
+            [('model.layers.0.self_attn.q_a_proj.lora_A.weight', torch.ones(2, 8, dtype=torch.bfloat16))],
+            metadata['peft_config'])
+
+
+def test_empty_adapter_and_normal_target_collision_are_rejected():
+    metadata = fixture_config()
+    metadata['peft_config']['target_parameters'] = []
+    metadata['peft_config']['target_modules'] = 'all-linear'
+    adapter = new_adapter(metadata)
+    with pytest.raises(ValueError, match='Empty source LoRA'):
+        adapter.process([], metadata['peft_config'])
+    values = []
+    for suffix in ('self_attn.compressor.indexer.weights_proj',
+                   'self_attn.compressor.indexer.scorer.weights_proj'):
+        prefix = f'model.layers.0.{suffix}'
+        values.extend(((f'{prefix}.lora_A.weight', torch.ones(2, 8, dtype=torch.bfloat16)),
+                       (f'{prefix}.lora_B.weight', torch.ones(4, 2, dtype=torch.bfloat16))))
+    with pytest.raises(ValueError, match='Conflicting LoRA target'):
+        adapter.process(values, metadata['peft_config'])
 
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
@@ -115,19 +190,34 @@ def test_parity_with_existing_nvidia_offline_converter(tmp_path, dtype):
 def test_scaling_and_rejections():
     m = fixture_config()
     adapter = new_adapter(m)
-    assert adapter.scale == 4 and adapter.peft_config['target_modules'] == ['experts']
+    _, config = adapter.process((item for group in groups() for item in group.items()), m['peft_config'])
+    assert config['lora_alpha'] == 8 and config['r'] == 2
     m['peft_config']['use_rslora'] = True
-    assert new_adapter(m).scale == 8 / (2**0.5)
+    _, config = new_adapter(m).process((item for group in groups() for item in group.items()), m['peft_config'])
+    assert config['use_rslora'] is True
     config = dict(m['peft_config'])
-    for bad in [dict(target_modules='all-linear'), dict(use_dora=True), dict(rank_pattern={'x': 1})]:
+    for bad in [dict(target_parameters=['unsupported']), dict(target_parameters='mlp.experts.down_proj'),
+                dict(target_modules=1), dict(use_dora=True), dict(rank_pattern={'x': 1})]:
         with pytest.raises(ValueError):
-            target_peft_config(config | bad)
+            new_adapter(m).process([], config | bad)
     with pytest.raises(ValueError, match='Incomplete'):
         list(convert_groups(groups()[:-1], fixture_config()))
-    with pytest.raises(ValueError, match='duplicate'):
+    with pytest.raises(ValueError, match='Duplicate'):
         list(convert_groups(groups() + groups()[:1], fixture_config()))
     with pytest.raises(ValueError, match='dtype'):
         list(convert_groups(groups(torch.float32), fixture_config()))
+
+
+def test_target_config_is_built_only_after_conversion():
+    metadata = fixture_config()
+    source_config = dict(metadata['peft_config'])
+    adapter = new_adapter(metadata)
+    _, target_config = adapter.process((item for group in groups() for item in group.items()), source_config)
+    assert metadata['peft_config'] == source_config
+    assert target_config['target_modules'] == ['experts']
+    assert target_config['target_parameters'] is None
+    assert target_config['r'] == source_config['r']
+    assert target_config['lora_alpha'] == source_config['lora_alpha']
 
 
 def test_explicit_tensor_request_payload_roundtrip(monkeypatch):
@@ -181,7 +271,7 @@ def test_worker_processes_then_uses_existing_inplace_loader(monkeypatch):
     assert calls[0][1].load_inplace is True
     assert calls[0][1].lora_int_id == 111
     assert calls[0][1].lora_tensors.keys() == dict(convert_groups(groups(), fixture_config())).keys()
-    assert not worker._get_weight_adapter(ADAPTER_CONFIG).pending
+    assert not hasattr(worker._get_weight_adapter(ADAPTER_CONFIG), 'pending')
 
 
 def test_default_load_hook_is_identity_and_keeps_inplace_install(monkeypatch):
@@ -499,15 +589,14 @@ def test_source_identity_is_explicit_not_key_or_shape_inference():
     adapter = new_adapter(m)
     # B arrives first, and A/B of different parameters interleave across buckets.
     items = list(renamed.items())
-    for item in items[1::2] + items[::2]:
-        adapter.consume_weights([item])
-    actual, _, report = adapter.finish_update()
+    actual, _ = adapter.process(items[1::2] + items[::2], m['peft_config'])
+    actual = dict(actual)
     expected = dict(convert_groups(groups(), fixture_config()))
     assert actual.keys() == expected.keys()
     assert all(torch.equal(actual[k], v) for k, v in expected.items())
-    assert not adapter.pending
-    assert report['source_tensor_count'] == 8 and report['tensor_count'] == 36
-    assert report['target_nbytes'] > report['source_nbytes']  # duplicated shared A, only on rollout
+    assert len(raw) == 8 and len(actual) == 36
+    assert sum(t.numel() * t.element_size() for t in actual.values()) > sum(
+        t.numel() * t.element_size() for t in raw.values())  # duplicated shared A, only on rollout
     for value in raw.values():
         value.zero_()
     assert all(torch.equal(actual[k], v) for k, v in expected.items())
@@ -526,7 +615,7 @@ def test_invalid_stream_rejected_before_installation(bad):
     else:
         value = value.float()
     with pytest.raises(ValueError):
-        adapter.consume_weights([(name, value)])
+        adapter.process([(name, value)], fixture_config()['peft_config'])
 
 
 def test_no_weight_adapter_fails_before_consuming_stream(monkeypatch):
@@ -555,13 +644,13 @@ def test_numeric_hook_precedes_split_and_constants_survive_updates(monkeypatch):
             self.constant = torch.tensor(2.0)
             events.append('initialize')
 
-        def adapt_numeric_pair(self, layer, projection, a, b):
+        def transform_pair(self, layer, suffix, a, b):
             events.append('numeric')
             return a * self.constant, b
 
-        def convert_layout(self, projection, a, b):
+        def _outputs(self, layer, suffix, a, b):
             events.append('layout')
-            yield from super().convert_layout(projection, a, b)
+            yield from super()._outputs(layer, suffix, a, b)
 
     worker = object.__new__(TwinkleWorkerExtension)
     worker.device, worker.rank = torch.device('cuda'), 0
@@ -585,7 +674,7 @@ def test_numeric_hook_precedes_split_and_constants_survive_updates(monkeypatch):
         expected = dict(convert_groups(groups(), fixture_config()))
         assert all(
             torch.equal(value, expected[name] * (2 if '.lora_A.' in name else 1)) for name, value in result.items())
-        assert adapter.constant.item() == 2 and not adapter.pending and not adapter.converted
+        assert adapter.constant.item() == 2 and not hasattr(adapter, 'pending')
     assert events.count('initialize') == 1
     assert events[1:] == ['numeric', 'layout'] * 12
 
@@ -612,6 +701,12 @@ def test_target_record_names_match_save_without_touching_base():
     for tenant, slot, rank in [('tenant_a', 'lora_0', 2), ('tenant_b', 'lora_1', 3)]:
         config = LoraConfig(r=rank, lora_alpha=8, target_modules=[], target_parameters=sorted(TARGETS))
         manager.acquire(tenant, slot, config)
+    gather_calls = []
+
+    def gather(_, group, slot):
+        gather_calls.append((slot, tuple(group)))
+        return group
+
     model = types.SimpleNamespace(
         model=root,
         _check_adapter_valid=lambda _: None,
@@ -621,9 +716,13 @@ def test_target_record_names_match_save_without_touching_base():
             find_lora_by_tenant=lambda t: types.SimpleNamespace(
                 adapter_name=manager.tenant_to_slot[t], tenant_config=manager.tenant_configs[t])),
         hf_config=types.SimpleNamespace(to_dict=lambda: fixture_config()['model_config']),
-        strategy=types.SimpleNamespace(gather_adapter_state_dict=lambda model, group, slot: group))
+        strategy=types.SimpleNamespace(gather_adapter_state_dict=gather))
     for tenant in ('tenant_a', 'tenant_b'):
-        state = {k: v for group in iter_lora_source_groups(model, tenant) for k, v in group.items()}
+        before = len(gather_calls)
+        groups = list(iter_lora_source_groups(model, tenant))
+        assert len(groups) == len(gather_calls) - before == 2
+        assert all(len(group) == 4 for group in groups)
+        state = {k: v for group in groups for k, v in group.items()}
         saved = manager.get_state_dict(tenant)
         for wrapper in manager.wrappers:
             for side in ('A', 'B'):
@@ -632,6 +731,71 @@ def test_target_record_names_match_save_without_touching_base():
         metadata = fixture_config()
         metadata['peft_config'] = manager.tenant_configs[tenant].to_dict()
         assert len(dict(convert_groups([state], metadata))) == 36
+
+
+def test_actor_exports_regular_lora_with_actual_rank():
+    from twinkle.model.multi_lora import MultiLora
+    from twinkle.model.transformers.weight_sync import iter_lora_source_groups
+
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    root.model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(2)])
+    for layer in root.model.layers:
+        layer.self_attn = torch.nn.Module()
+        # Register in reverse name order; gather order must still be stable.
+        for target in ('q_a_proj', 'kv_proj'):
+            projection = torch.nn.Module()
+            projection.lora_A = torch.nn.ModuleDict({'lora_0': torch.nn.Linear(8, 4, bias=False)})
+            projection.lora_B = torch.nn.ModuleDict({'lora_0': torch.nn.Linear(4, 6, bias=False)})
+            setattr(layer.self_attn, target, projection)
+    tenant = types.SimpleNamespace(adapter_name='lora_0', tenant_config=types.SimpleNamespace(
+        r=2, target_modules='all-linear'))
+    multi_adapter = types.SimpleNamespace(
+        module=root, target_parameter_manager=types.SimpleNamespace(tenant_to_slot={}, wrappers=[]),
+        find_lora_by_tenant=lambda _: tenant,
+        _is_target_parameter_lora_name=MultiLora._is_target_parameter_lora_name,
+        _read_param_tensor=lambda parameter: parameter,
+        _slice_rank_tensor=MultiLora._slice_rank_tensor,
+        match_target_modules=MultiLora.match_target_modules)
+    calls = []
+
+    def gather(_, group, __):
+        calls.append(tuple(group))
+        return group
+
+    model = types.SimpleNamespace(model=root, multi_adapter=multi_adapter,
+                                  strategy=types.SimpleNamespace(gather_adapter_state_dict=gather))
+    groups = list(iter_lora_source_groups(model, 'tenant_a'))
+    assert len(groups) == len(calls) == 2
+    assert all(len(group) == 4 for group in groups)
+    assert all(list(group) == sorted(group) for group in groups)
+    exported = {name: value for group in groups for name, value in group.items()}
+    prefix = 'model.layers.0.self_attn.q_a_proj'
+    assert exported[f'{prefix}.lora_A.weight'].shape == (2, 8)
+    assert exported[f'{prefix}.lora_B.weight'].shape == (6, 2)
+    assert torch.equal(exported[f'{prefix}.lora_A.weight'],
+                       root.model.layers[0].self_attn.q_a_proj.lora_A['lora_0'].weight[:2])
+
+
+def test_actor_rejects_unsupported_trained_lora_instead_of_silently_omitting_it():
+    from twinkle.model.multi_lora import MultiLora
+    from twinkle.model.transformers.weight_sync import iter_lora_source_groups
+
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    root.model.embed_tokens = torch.nn.Module()
+    root.model.embed_tokens.lora_embedding_A = torch.nn.ParameterDict(
+        {'lora_0': torch.nn.Parameter(torch.ones(8, 2))})
+    tenant = types.SimpleNamespace(adapter_name='lora_0', tenant_config=types.SimpleNamespace(
+        r=2, target_modules=['embed_tokens']))
+    multi_adapter = types.SimpleNamespace(
+        module=root, target_parameter_manager=types.SimpleNamespace(tenant_to_slot={}, wrappers=[]),
+        find_lora_by_tenant=lambda _: tenant,
+        _is_target_parameter_lora_name=MultiLora._is_target_parameter_lora_name,
+        match_target_modules=MultiLora.match_target_modules)
+    model = types.SimpleNamespace(model=root, multi_adapter=multi_adapter)
+    with pytest.raises(ValueError, match='Unsupported trainable LoRA tensor'):
+        list(iter_lora_source_groups(model, 'tenant_a'))
 
 
 @pytest.mark.parametrize('rank', [0, -1])
@@ -782,11 +946,15 @@ def test_conversion_failure_releases_staging_and_does_not_install(monkeypatch):
     worker.add_lora = lambda _: pytest.fail('Must not install an invalid adapter')
     def fail(*args):
         raise RuntimeError('injected converter failure')
-    monkeypatch.setattr(adapter, 'adapt_numeric_pair', fail)
+    original = adapter.transform_pair
+    monkeypatch.setattr(adapter, 'transform_pair', fail)
     with pytest.raises(RuntimeError, match='converter failure'):
-        worker._load_weights(list(groups()[0].items()), fixture_config()['peft_config'],
+        worker._load_weights([item for group in groups() for item in group.items()], fixture_config()['peft_config'],
                              False, lora_only=True, weight_adapter=ADAPTER_CONFIG)
-    assert not adapter.pending and not adapter.converted
+    monkeypatch.setattr(adapter, 'transform_pair', original)
+    assert not hasattr(adapter, 'pending')
+    assert len(adapter.process((item for group in groups() for item in group.items()),
+                               fixture_config()['peft_config'])[0]) == 36
 
 
 @pytest.mark.parametrize('npu', [False, True])

@@ -36,9 +36,10 @@ def test_periodic_lora_save_counts_global_batches_not_microbatches(tmp_path):
 @pytest.fixture
 def setup_example(monkeypatch, tmp_path):
     for key in ('ACTOR_GPUS', 'ACTOR_NPUS', 'GPUS_PER_NODE', 'NPUS_PER_NODE',
-                'ACTOR_EP', 'ROLLOUT_TP', 'ROLLOUT_START_RANK', 'ACTOR_PRECISION',
+                'ACTOR_EP', 'ROLLOUT_TP', 'ROLLOUT_DP', 'ROLLOUT_START_RANK', 'ACTOR_PRECISION',
                 'LORA_R', 'LORA_ALPHA', 'MAX_MODEL_LEN', 'MAX_NUM_SEQS',
-                'MAX_NUM_BATCHED_TOKENS', 'GPU_MEMORY_UTILIZATION'):
+                'MAX_NUM_BATCHED_TOKENS', 'GPU_MEMORY_UTILIZATION',
+                'LORA_TARGET_MODULES', 'LORA_TARGET_PARAMETERS'):
         monkeypatch.delenv(key, raising=False)
     for key in ('ACTOR_MODEL', 'ROLLOUT_MODEL'):
         path = tmp_path / key
@@ -97,6 +98,7 @@ def test_example_backend_configuration(setup_example, monkeypatch, backend, prec
     groups = calls['initialize']['groups']
     assert groups[0].ranks == list(range(devices))
     assert groups[1].ranks == list(range(start, start + tp))
+    assert calls['sampler']['device_mesh'].data_world_size == 1
     assert all(group.device_type == platform for group in groups)
     assert str(calls['actor']['device_mesh'].device_type) == device
     assert str(calls['sampler']['device_mesh'].device_type) == device
@@ -124,7 +126,55 @@ def test_example_backend_configuration(setup_example, monkeypatch, backend, prec
         assert not adapter['options'] and engine['kv_cache_dtype'] == 'fp8'
 
 
-@pytest.mark.parametrize('key,value', [('ACTOR_NPUS', '0'), ('ROLLOUT_TP', '0'),
+def test_four_rollout_replicas_span_two_nodes(setup_example, monkeypatch):
+    calls, actor, sampler = setup_example
+    monkeypatch.setenv('ACTOR_NPUS', '32')
+    monkeypatch.setenv('ACTOR_EP', '32')
+    monkeypatch.setenv('ROLLOUT_START_RANK', '32')
+    monkeypatch.setenv('ROLLOUT_TP', '8')
+    monkeypatch.setenv('ROLLOUT_DP', '4')
+
+    example.build_workers(actor, sampler, backend='ascend')
+
+    group = calls['initialize']['groups'][1]
+    mesh = calls['sampler']['device_mesh']
+    assert group.ranks == list(range(32, 64))
+    assert group.gpus_per_worker == 8
+    assert mesh.world_size == 32
+    assert mesh.data_world_size == 4
+    assert calls['sampler']['engine_args']['tensor_parallel_size'] == 8
+
+
+def test_rollout_replica_cannot_cross_node(setup_example, monkeypatch):
+    calls, actor, sampler = setup_example
+    monkeypatch.setenv('ACTOR_NPUS', '4')
+    monkeypatch.setenv('ROLLOUT_START_RANK', '4')
+    monkeypatch.setenv('ROLLOUT_TP', '8')
+    monkeypatch.setenv('ROLLOUT_DP', '2')
+
+    with pytest.raises(ValueError, match='keep rollout TP on one node'):
+        example.build_workers(actor, sampler, backend='ascend')
+    assert 'initialize' not in calls
+
+
+@pytest.mark.parametrize('backend', ['nvidia', 'ascend'])
+def test_example_preallocates_selected_ordinary_lora_slots(setup_example, monkeypatch, backend):
+    calls, actor, sampler = setup_example
+    monkeypatch.setenv('LORA_TARGET_MODULES', 'self_attn.q_a_proj,mlp.shared_experts.gate_proj')
+    monkeypatch.setenv('LORA_TARGET_PARAMETERS', '')
+    example.build_workers(actor, sampler, backend=backend)
+    expected = {'self_attn.q_a_proj', 'mlp.shared_experts.gate_proj'}
+    assert calls['actor']['lora_config'].target_modules == expected
+    _, tenant = calls['tenant']
+    assert tenant.target_modules == expected and not tenant.target_parameters
+    options = calls['sampler']['engine_args']['weight_adapter']['options']
+    if backend == 'ascend':
+        assert options['recipe'] == 'w8a8_dynamic_quarot_v1'
+    else:
+        assert options == {}
+
+
+@pytest.mark.parametrize('key,value', [('ACTOR_NPUS', '0'), ('ROLLOUT_TP', '0'), ('ROLLOUT_DP', '0'),
                                       ('NPUS_PER_NODE', '0'), ('ROLLOUT_START_RANK', '2'),
                                       ('ROLLOUT_START_RANK', '15'), ('ACTOR_EP', '3')])
 def test_bad_npu_topology_fails_before_ray(setup_example, monkeypatch, key, value):

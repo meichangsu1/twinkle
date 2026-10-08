@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Opt-in Ascend W8A8_DYNAMIC QuaRot adaptation for source-native routed LoRA.
+"""Opt-in Ascend W8A8_DYNAMIC QuaRot adaptation for source-native LoRA.
 
 Only checkpoint headers, FFN norms and Q are read at initialization. Online
 adapter tensors still arrive through the existing Checkpoint Engine. CPU FP32
@@ -12,12 +12,10 @@ import torch
 from pathlib import Path
 from safetensors import safe_open
 
-from .dsv4_lora import PREFIX, DeepSeekV4LoraAdapter
+from .dsv4_lora import NORMAL_MODULE_RULES, PREFIX, TARGETS, DeepSeekV4LoraAdapter
 
 QUAROT_RECIPE = 'w8a8_dynamic_quarot_v1'
 _DIMENSIONS = ('num_hidden_layers', 'n_routed_experts', 'hidden_size', 'moe_intermediate_size')
-
-
 def _read_json(path):
     with path.open(encoding='utf-8') as stream:
         value = json.load(stream)
@@ -70,8 +68,12 @@ class _Checkpoint:
             raise ValueError(f'Expected one checkpoint key from {candidates}, found {found}')
         return found[0]
 
-    def norm(self, layer, hidden):
-        key = self.select([f'layers.{layer}.ffn_norm.weight', f'layers.{layer}.post_attention_layernorm.weight'])
+    def norm(self, layer, hidden, *, kind='ffn'):
+        names = (('ffn_norm', 'post_attention_layernorm') if kind == 'ffn'
+                 else ('attn_norm', 'input_layernorm') if kind == 'attn' else None)
+        if names is None:
+            raise ValueError(f'Unknown norm kind: {kind}')
+        key = self.select([f'layers.{layer}.{name}.weight' for name in names])
         actual, path = self.locations[key]
         with safe_open(str(path), framework='pt', device='cpu') as handle:
             if handle.get_slice(actual).get_shape() != [hidden]:
@@ -163,8 +165,20 @@ def transform_quarot_pair(a, b, projection, gamma, rotation):
     return output
 
 
+@torch.no_grad()
+@torch.autocast(device_type='cpu', enabled=False)
+def transform_quarot_normal_pair(a, b, rule, gamma, rotation):
+    """Transform an ordinary LoRA pair to the quantized base coordinates."""
+    if rule in ('attention_input', 'ffn_input'):
+        a = ((a.detach().cpu().float() * gamma) @ rotation).to(a.dtype).to(a.device)
+    elif rule == 'hidden_output':
+        b = (rotation.T @ b.detach().cpu().float()).to(b.dtype).to(b.device)
+    return a, b
+
+
 class DeepSeekV4AscendQuaRotLoraAdapter(DeepSeekV4LoraAdapter):
-    """Explicitly selected audited norm-fusion/global-rotation recipe, routed-only."""
+    """Convert source LoRA to the Ascend W8A8 QuaRot layout."""
+    backend = 'ascend'
 
     def initialize(self, target_context, options):
         if str(target_context['device']).split(':', 1)[0] not in ('npu', 'privateuseone'):
@@ -173,10 +187,37 @@ class DeepSeekV4AscendQuaRotLoraAdapter(DeepSeekV4LoraAdapter):
         if (set(options) != {'training_base_model', 'recipe'} or options.get('recipe') != QUAROT_RECIPE
                 or not isinstance(options.get('training_base_model'), str) or not options['training_base_model']):
             raise ValueError(f'Ascend QuaRot requires training_base_model and recipe={QUAROT_RECIPE!r}')
+        self.training_base_model = options['training_base_model']
+        self._attention_gammas = {}
+        self._attention_checkpoints = None
         self.rotation, self.gammas = _load_constants(options['training_base_model'], target_context)
 
-    def adapt_numeric_pair(self, layer, projection, a, b):
-        return transform_quarot_pair(a, b, projection, self.gammas[layer], self.rotation)
+    def transform_pair(self, layer, suffix, a, b):
+        if suffix in TARGETS:
+            projection = suffix.rsplit('.', 1)[-1]
+            return transform_quarot_pair(a, b, projection, self.gammas[layer], self.rotation)
+        rule = NORMAL_MODULE_RULES[suffix].quarot
+        gamma = self.gammas[layer] if rule == 'ffn_input' else None
+        if rule == 'attention_input':
+            gamma = self._attention_gamma(layer)
+        return transform_quarot_normal_pair(a, b, rule, gamma, self.rotation)
+
+    def _attention_gamma(self, layer):
+        if layer not in self._attention_gammas:
+            if self._attention_checkpoints is None:
+                self._attention_checkpoints = (
+                    _Checkpoint(self.training_base_model), _Checkpoint(self.target['model_path']))
+            original, quant = self._attention_checkpoints
+            hidden = self.target['model_config']['hidden_size']
+            gamma = original.norm(layer, hidden, kind='attn')
+            quant_gamma = quant.norm(layer, hidden, kind='attn')
+            if not torch.equal(quant_gamma, torch.ones_like(quant_gamma)):
+                raise ValueError(f'Layer {layer}: expected all-one quantized attention norm')
+            self._attention_gammas[layer] = gamma
+        return self._attention_gammas[layer]
+
+    def normal_runtime_target(self, mapped_suffix):
+        return mapped_suffix.rsplit('.', 1)[-1]
 
     def map_name(self, layer, expert, projection, side):
         return f'{PREFIX}.{layer}.mlp.experts.{expert}.{projection}.lora_{side}.weight'
