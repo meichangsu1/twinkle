@@ -4,17 +4,28 @@
 This is a memory/compute-path probe, not a training-quality test: completion
 token IDs and advantages are synthetic. Run it against the same actor base,
 FSDP/EP topology, and sequence length as the GRPO job.
+
+ACTOR-PROBE records identify each rank's last completed stage. The diagnostic
+RPC timeout defaults to 900 seconds (PREFLIGHT_RPC_TIMEOUT); model setup is
+not covered by that timer. PREFLIGHT_SYNC_BEFORE_GATHER=1 optionally drains
+queued NPU work before token gathering and may change reproduction timing.
 """
+import json
 import os
 import random
+import socket
 import time
+import traceback
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from peft import LoraConfig
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, remote_class, remote_function
+from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.template import DeepseekV4Template
@@ -25,21 +36,138 @@ TENANT = 'tenant_a'
 GIB = 1024**3
 
 
+def _trace(stage, **details):
+    """Emit a unique, flushed record without launching a device operation."""
+    record = dict(time=time.time(), host=socket.gethostname(), pid=os.getpid(), rank=int(os.environ.get('RANK', '-1')),
+                  stage=stage)
+    record.update(details)
+    print('[ACTOR-PROBE] ' + json.dumps(record), flush=True)
+
+
+@contextmanager
+def _stage(name, **details):
+    _trace(name + '.enter', **details)
+    try:
+        yield
+    except BaseException as exc:
+        _trace(name + '.error', error=repr(exc))
+        traceback.print_exc()
+        raise
+    else:
+        _trace(name + '.exit')
+
+
+def _group_details(group):
+    import torch.distributed as dist
+
+    members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
+    return dict(group_name=getattr(group, 'group_name', None), backend=dist.get_backend(group),
+                members=members, device=str(torch.npu.current_device()))
+
+
 @remote_class()
 class PreflightActor(MultiLoraTransformersModel):
+
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    def forward_backward(self, **kwargs):
+        optimizer_config = self.optimizer_group[kwargs['adapter_name']]
+        with _stage('forward_backward', microbatch=optimizer_config.cur_step + 1):
+            return super().forward_backward(**kwargs)
+
+    @remote_function()
+    def clip_grad_norm(self, max_grad_norm=1.0, norm_type=2, **kwargs):
+        # Trace the existing implementation, rather than copying or replacing
+        # its LoRA, normalization, or collective logic. Patches are worker-local.
+        from twinkle.model.transformers import transformers as implementation
+
+        original_adapter = self.multi_adapter.adapter
+        original_gather = implementation.torch_util.gather_object
+        original_norm = implementation.normalize_and_clip_grad_norm
+
+        @contextmanager
+        def traced_adapter(*args, **options):
+            with _stage('adapter_context'):
+                with original_adapter(*args, **options) as slot:
+                    _trace('adapter.ready')
+                    yield slot
+
+        def traced_gather(value, mesh, group=None):
+            if os.environ.get('PREFLIGHT_SYNC_BEFORE_GATHER', '0') == '1':
+                with _stage('pre_token_gather_sync'):
+                    torch.npu.synchronize()
+            with _stage('token_gather', local_num_tokens=value, **_group_details(group)):
+                return original_gather(value, mesh, group)
+
+        def traced_norm(*args, **options):
+            with _stage('gradient_norm', **_group_details(options.get('group'))):
+                return original_norm(*args, **options)
+
+        with patch.object(self.multi_adapter, 'adapter', traced_adapter), \
+                patch.object(implementation.torch_util, 'gather_object', traced_gather), \
+                patch.object(implementation, 'normalize_and_clip_grad_norm', traced_norm):
+            return super().clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+
+    @remote_function(dispatch='all')
+    def clip_grad_and_step(self, max_grad_norm=1.0, norm_type=2, **kwargs):
+        with _stage('optimizer_update'):
+            optimizer_config = self.optimizer_group[kwargs['adapter_name']]
+            with _stage('clip_grad_norm', cur_step=optimizer_config.cur_step,
+                        gas=optimizer_config.gradient_accumulation_steps):
+                self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+            with _stage('optimizer_step'):
+                self.step(**kwargs)
+            with _stage('zero_grad'):
+                self.zero_grad(**kwargs)
+            with _stage('lr_step'):
+                self.lr_step(**kwargs)
 
     @remote_function(dispatch='all', lazy_collect=False)
     def npu_memory(self):
         """Return every rank's current and peak allocator usage."""
         import torch.distributed as dist
 
-        torch.npu.synchronize()
-        return {
+        with _stage('memory_sync'):
+            torch.npu.synchronize()
+        snapshot = {
             'rank': dist.get_rank(),
             'allocated_gib': round(torch.npu.memory_allocated() / GIB, 3),
             'reserved_gib': round(torch.npu.memory_reserved() / GIB, 3),
             'peak_allocated_gib': round(torch.npu.max_memory_allocated() / GIB, 3),
         }
+        _trace('memory.snapshot', **snapshot)
+        return snapshot
+
+
+def _probe_call(actor, method, **kwargs):
+    """Inspect ready failures before waiting for earlier, possibly hung ranks."""
+    import ray
+
+    # Only this diagnostic driver uses lazy calls; normal Twinkle collection
+    # and the underlying worker dispatch are unchanged.
+    with patch.object(actor, '_lazy_collect', True, create=True):
+        result = getattr(actor, method)(**kwargs)
+    indices = {ref: index for index, ref in enumerate(result._futures)}
+    pending = list(indices)
+    started = time.monotonic()
+    timeout = _positive_env('PREFLIGHT_RPC_TIMEOUT', '900')
+    next_progress = started + 30
+    while pending:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError(f'{method} exceeded {timeout}s; pending worker indices: '
+                               f'{sorted(indices[ref] for ref in pending)}. Check their ACTOR-PROBE records.')
+        ready, pending = ray.wait(pending, num_returns=1, timeout=min(5, remaining))
+        for ref in ready:
+            try:
+                ray.get(ref)
+            except BaseException as exc:
+                _trace('driver.rpc_error', method=method, worker_index=indices[ref], error=repr(exc))
+                raise
+        if pending and time.monotonic() >= next_progress:
+            _trace('driver.waiting', method=method, seconds=round(time.monotonic() - started, 1),
+                   pending_worker_indices=sorted(indices[ref] for ref in pending))
+            next_progress = time.monotonic() + 30
+    return result()  # Preserve the original result collector and ordering.
 
 
 def _positive_env(name, default):
@@ -90,7 +218,7 @@ def _make_features(model_path, data_path, count, generations, completion_tokens,
 
 
 def _memory_summary(actor, stage):
-    snapshots = actor.npu_memory()
+    snapshots = _probe_call(actor, 'npu_memory')
     if isinstance(snapshots, dict):
         snapshots = [snapshots]
     highest = max(snapshots, key=lambda entry: entry['peak_allocated_gib'])
@@ -185,9 +313,9 @@ def main():
     for index in range(microbatches):
         # Omitting old_logps makes GRPOLoss use detached current logprobs.
         # Nonzero synthetic advantages still exercise the actual backward path.
-        actor.forward_backward(inputs=features, advantages=[1.0] * actor_devices, adapter_name=TENANT)
+        _probe_call(actor, 'forward_backward', inputs=features, advantages=[1.0] * actor_devices, adapter_name=TENANT)
         _memory_summary(actor, f'after_microbatch_{index + 1}')
-    actor.clip_grad_and_step(adapter_name=TENANT)
+    _probe_call(actor, 'clip_grad_and_step', adapter_name=TENANT)
     _memory_summary(actor, 'after_optimizer_step')
     print(f'PASSED actor-only preflight in {time.monotonic() - start:.1f}s; '
           'this does not validate rollout, weight sync, or reward quality', flush=True)
