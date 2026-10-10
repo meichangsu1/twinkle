@@ -54,6 +54,42 @@ def test_out_of_order_completions_preserve_original_collector(monkeypatch):
     assert not hasattr(actor, '_lazy_collect')
 
 
+@pytest.mark.parametrize('existing_flag', [None, False, True])
+def test_uninitialized_module_driver_restores_flag_without_module_hooks(monkeypatch, existing_flag):
+    # remote_class does not initialize nn.Module on the driver: only the
+    # remote workers have _parameters/_modules. Match that actual proxy type.
+    actor = object.__new__(probe.PreflightActor)
+    assert '_parameters' not in vars(actor)
+    if existing_flag is not None:
+        vars(actor)['_lazy_collect'] = existing_flag
+    expected = ['rank 0']
+
+    def invoke():
+        assert actor._lazy_collect is True
+        return _fake_call([], expected)
+
+    vars(actor)['npu_memory'] = invoke
+    monkeypatch.setattr(ray, 'wait', lambda *a, **kw: pytest.fail('No pending references'))
+    assert probe._probe_call(actor, 'npu_memory') is expected
+    if existing_flag is None:
+        assert '_lazy_collect' not in vars(actor)
+    else:
+        assert actor._lazy_collect is existing_flag
+
+
+def test_uninitialized_module_driver_restores_flag_when_dispatch_fails():
+    actor = object.__new__(probe.PreflightActor)
+
+    def invoke():
+        assert actor._lazy_collect is True
+        raise RuntimeError('dispatch failed')
+
+    vars(actor)['npu_memory'] = invoke
+    with pytest.raises(RuntimeError, match='dispatch failed'):
+        probe._probe_call(actor, 'npu_memory')
+    assert '_lazy_collect' not in vars(actor)
+
+
 def test_timeout_identifies_pending_worker_indices(monkeypatch):
     refs = [object(), object()]
     actor = SimpleNamespace(npu_memory=lambda: _fake_call(refs, None))

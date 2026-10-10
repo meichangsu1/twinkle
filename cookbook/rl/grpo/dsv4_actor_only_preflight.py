@@ -143,9 +143,19 @@ def _probe_call(actor, method, **kwargs):
     import ray
 
     # Only this diagnostic driver uses lazy calls; normal Twinkle collection
-    # and the underlying worker dispatch are unchanged.
-    with patch.object(actor, '_lazy_collect', True, create=True):
+    # and the underlying worker dispatch are unchanged. The driver proxy has
+    # no nn.Module internals, so restore its flag without Module.__delattr__.
+    actor_state = vars(actor)
+    had_flag = '_lazy_collect' in actor_state
+    previous_flag = actor_state.get('_lazy_collect')
+    actor_state['_lazy_collect'] = True
+    try:
         result = getattr(actor, method)(**kwargs)
+    finally:
+        if had_flag:
+            actor_state['_lazy_collect'] = previous_flag
+        else:
+            actor_state.pop('_lazy_collect')
     indices = {ref: index for index, ref in enumerate(result._futures)}
     pending = list(indices)
     started = time.monotonic()
