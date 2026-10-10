@@ -1,5 +1,8 @@
 """CPU orchestration tests for the examples; not GPU/NPU hardware validation."""
 import json
+import os
+import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -126,23 +129,59 @@ def test_example_backend_configuration(setup_example, monkeypatch, backend, prec
         assert not adapter['options'] and engine['kv_cache_dtype'] == 'fp8'
 
 
-def test_four_rollout_replicas_span_two_nodes(setup_example, monkeypatch):
+@pytest.mark.parametrize('replicas', [2, 4])
+def test_rollout_replicas_use_disjoint_tp8_groups(setup_example, monkeypatch, replicas):
     calls, actor, sampler = setup_example
     monkeypatch.setenv('ACTOR_NPUS', '32')
     monkeypatch.setenv('ACTOR_EP', '32')
     monkeypatch.setenv('ROLLOUT_START_RANK', '32')
     monkeypatch.setenv('ROLLOUT_TP', '8')
-    monkeypatch.setenv('ROLLOUT_DP', '4')
+    monkeypatch.setenv('ROLLOUT_DP', str(replicas))
 
     example.build_workers(actor, sampler, backend='ascend')
 
     group = calls['initialize']['groups'][1]
     mesh = calls['sampler']['device_mesh']
-    assert group.ranks == list(range(32, 64))
+    assert group.ranks == list(range(32, 32 + replicas * 8))
     assert group.gpus_per_worker == 8
-    assert mesh.world_size == 32
-    assert mesh.data_world_size == 4
+    assert mesh.world_size == replicas * 8
+    assert mesh.data_world_size == replicas
     assert calls['sampler']['engine_args']['tensor_parallel_size'] == 8
+
+
+@pytest.mark.parametrize('override,expected', [(None, '2'), ('2', '2'), ('4', '4')])
+def test_full_rollout_launcher_default_and_override(override, expected):
+    script = Path(example.__file__).with_name('run_dsv4_full_4node_npu_dapo.sh')
+    setup = script.read_text().split('exec bash ', 1)[0]
+    environment = dict(os.environ)
+    environment.pop('ROLLOUT_DP', None)
+    if override is not None:
+        environment['ROLLOUT_DP'] = override
+    result = subprocess.check_output(
+        ['/bin/bash', '-c', setup + '\nprintf "%s" "$ROLLOUT_DP"'], env=environment, text=True)
+    assert result == expected
+
+
+@pytest.mark.parametrize('replicas,nodes,npus,passed', [
+    (2, 3, 48, True), (2, 4, 64, True), (2, 2, 64, False),
+    (2, 4, 32, False), (4, 4, 64, True), (4, 3, 64, False),
+])
+def test_full_ray_preflight_allows_idle_nodes(monkeypatch, replicas, nodes, npus, passed):
+    script = Path(example.__file__).with_name('run_dsv4_full_npu_dapo.sh')
+    preflight = script.read_text().split("python - <<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+    for name, value in dict(RAY_ADDRESS='head:6379', ROLLOUT_START_RANK='32',
+                            ROLLOUT_TP='8', ROLLOUT_DP=str(replicas), NPUS_PER_NODE='16').items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setitem(sys.modules, 'ray', types.SimpleNamespace(
+        init=lambda **kwargs: None,
+        nodes=lambda: [{'Alive': True}] * nodes,
+        cluster_resources=lambda: {'NPU': npus},
+        shutdown=lambda: None))
+    if passed:
+        exec(compile(preflight, str(script), 'exec'), {})
+    else:
+        with pytest.raises(RuntimeError, match='requires at least'):
+            exec(compile(preflight, str(script), 'exec'), {})
 
 
 def test_rollout_replica_cannot_cross_node(setup_example, monkeypatch):

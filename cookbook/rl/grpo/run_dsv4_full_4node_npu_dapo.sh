@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Full-model DAPO GRPO: two 16-NPU actor nodes and two 16-NPU rollout nodes.
+# Full-model DAPO GRPO: two actor nodes; default two TP8 rollout instances on one node.
 set -euo pipefail
 
-export ROLLOUT_DP=4
+export ROLLOUT_DP=${ROLLOUT_DP:-2}
 # A 4096-token completion previously exhausted actor memory; allow override
 # after measuring full-model memory with the new rollout topology.
 export MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}

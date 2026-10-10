@@ -71,8 +71,8 @@ expected_nodes = (int(os.environ['ROLLOUT_START_RANK'])
                   + int(os.environ['NPUS_PER_NODE']) - 1) // int(os.environ['NPUS_PER_NODE'])
 expected_npus = expected_nodes * int(os.environ['NPUS_PER_NODE'])
 print(f'Full Ray preflight: alive_nodes={len(alive)}, NPU_resources={available}')
-if len(alive) != expected_nodes or available < expected_npus:
-    raise RuntimeError(f'Full run requires {expected_nodes} alive Ray nodes '
+if len(alive) < expected_nodes or available < expected_npus:
+    raise RuntimeError(f'Full run requires at least {expected_nodes} alive Ray nodes '
                        f'and at least {expected_npus} NPU resources')
 ray.shutdown()
 PY

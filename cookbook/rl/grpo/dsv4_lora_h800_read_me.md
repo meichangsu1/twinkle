@@ -2,8 +2,9 @@
 
 ## 全层四节点 DAPO（四层四节点通过后的下一步）
 
-四台 A3 各 16 张 NPU：actor 使用两个节点的 32 张卡；rollout 在另外两个节点上
-运行四个独立 TP8 实例（`ROLLOUT_DP=4`）。沿用四层测试的 Ray 集群时，先确认
+四台 A3 各 16 张 NPU：actor 使用两个节点的 32 张卡；当前默认 rollout 在另一个节点上
+运行两个独立 TP8 实例（`ROLLOUT_DP=2`），第四台节点空闲。需要恢复四实例时显式设置
+`ROLLOUT_DP=4`，rollout 会使用两个节点。沿用四层测试的 Ray 集群时，先确认
 没有正在运行的任务，直接执行下方 `run`，不要再次执行 `head`/`worker`。
 四台容器的 `/opt/twinkle` 都需有已测通的 Python 源码；把
 `run_dsv4_full_npu_dapo.sh` 和 `run_dsv4_full_4node_npu_dapo.sh` 放在
@@ -31,7 +32,7 @@ DATASET_MAX_ROWS=2000 STEPS=1 BATCH_SIZE=32 NUM_GENERATIONS=2 MAX_NEW_TOKENS=307
   bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh run
 ```
 
-确认首轮完成、无 actor OOM、四个 rollout 实例均收到 LoRA 后，再启动正式训练：
+确认首轮完成、无 actor OOM、两个 rollout 实例均收到 LoRA 后，再启动正式训练：
 
 ```bash
 STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 MAX_NEW_TOKENS=3072 \
@@ -43,8 +44,8 @@ STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 MAX_NEW_TOKENS=3072 
 四节点脚本默认 `MAX_NEW_TOKENS=2048`；上述启动命令显式设置为 3072。
 先前 4096 曾触发 actor OOM，但 3072 仍需在全层首轮验证显存；同时结合
 `length_cap_rate` 评估答案截断，不能把链路成功当作
-reward 已可稳定上升。每个 TP8 实例的 `MAX_NUM_SEQS` 默认 4，四实例合计最多
-16 条并发序列。输出默认写入 `/highcode/shared_data/dsv4_logs/full_*/`。
+reward 已可稳定上升。每个 TP8 实例的 `MAX_NUM_SEQS` 默认 4，两实例合计最多
+8 条并发序列。输出默认写入 `/highcode/shared_data/dsv4_logs/full_*/`。
 
 ## NPU 全层：保存真实训练 batch，再单独重放 actor
 
