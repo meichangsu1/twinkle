@@ -2,6 +2,8 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import json
+import numpy as np
 import pytest
 import ray
 import torch
@@ -215,3 +217,163 @@ def test_optimizer_probe_keeps_the_existing_step_order(monkeypatch):
     assert calls == ['clip', 'step', 'zero', 'lr']
     assert events[0] == 'optimizer_update.enter'
     assert events[-1] == 'optimizer_update.exit'
+
+
+@pytest.fixture
+def real_batch(tmp_path, monkeypatch):
+    model_path = tmp_path / 'base'
+    model_path.mkdir()
+    (model_path / 'config.json').write_text('{}')
+    monkeypatch.setenv('ACTOR_MODEL', str(model_path))
+    monkeypatch.setenv('LR', '5e-6')
+    monkeypatch.setenv('NPUS_PER_NODE', '2')
+    for key in ('LORA_TARGET_MODULES', 'LORA_TARGET_PARAMETERS', 'TWINKLE_FAIL_FAST'):
+        monkeypatch.delenv(key, raising=False)
+    actor = SimpleNamespace(device_mesh=SimpleNamespace(world_size=2, ep_size=2))
+    features = [dict(input_ids=[10, 20 + i, 30 + i], labels=[20 + i, 30 + i, -100],
+                     attention_mask=[1, 1, 1], completion_mask=[0, 1, 1]) for i in range(4)]
+    logps = [[-0.25 - i, -0.5 - i] for i in range(4)]
+    advantages = [-0.5, 1.5, 0.0, 0.0]
+    path = probe.save_actor_batch(tmp_path, actor, 0, 2, features, logps, advantages)
+    return path, probe._read_actor_batch(path)
+
+
+def test_batch_capture_preserves_inputs_logprobs_and_resolved_topology(real_batch):
+    path, batch = real_batch
+    assert batch['format'] == 'dsv4_actor_batch_v1'
+    assert batch['training_step'] == 0 and batch['micro_size'] == 2
+    assert batch['features'][3]['input_ids'] == [10, 23, 33]
+    assert batch['old_logps'][3] == [-3.25, -3.5]
+    assert batch['advantages'] == [-0.5, 1.5, 0.0, 0.0]
+    assert batch['actor_env']['ACTOR_NPUS'] == batch['actor_env']['ACTOR_EP'] == '2'
+    assert batch['actor_env']['LR'] == '5e-6'
+    assert batch['actor_env']['LORA_TARGET_PARAMETERS'] == 'mlp.experts.gate_up_proj,mlp.experts.down_proj'
+    assert 'RAY_ADDRESS' not in batch['actor_env']
+
+
+def test_batch_capture_supports_cpu_arrays_and_refuses_overwrite(tmp_path, monkeypatch):
+    monkeypatch.setenv('ACTOR_MODEL', str(tmp_path))
+    actor = SimpleNamespace(device_mesh=SimpleNamespace(world_size=1, ep_size=1))
+    features = [dict(input_ids=torch.tensor([1, 2]), labels=np.array([2, -100]), length=np.int64(2))]
+    path = probe.save_actor_batch(tmp_path, actor, 0, 1, features, [[-0.125]], [0.0])
+    original = path.read_bytes()
+    batch = probe._read_actor_batch(path)
+    assert batch['features'] == [dict(input_ids=[1, 2], labels=[2, -100], length=2)]
+    with pytest.raises(FileExistsError):
+        probe.save_actor_batch(tmp_path, actor, 0, 1, [], [], [])
+    assert path.read_bytes() == original
+    with pytest.raises(ValueError, match='CPU inputs'):
+        probe._json_array(torch.empty(1, device='meta'))
+
+
+@pytest.mark.parametrize('field,value', [('format', 'other'), ('features', []), ('old_logps', []),
+                                        ('advantages', [0.0]), ('micro_size', 0), ('micro_size', 3),
+                                        ('micro_size', 1)])
+def test_bad_replay_packet_fails_before_model_setup(real_batch, field, value):
+    path, batch = real_batch
+    batch[field] = value
+    path.write_text(json.dumps(batch))
+    with pytest.raises(ValueError):
+        probe._read_actor_batch(path)
+
+
+def test_replay_uses_distinct_saved_microbatches_and_only_then_updates(real_batch, monkeypatch):
+    path, batch = real_batch
+    actor = object()
+    calls = []
+
+    def invoke(received_actor, method, **kwargs):
+        assert received_actor is actor
+        calls.append((method, kwargs))
+        return {'loss': torch.tensor(0.25)}
+
+    monkeypatch.setattr(probe, '_probe_call', invoke)
+    monkeypatch.setattr(probe, '_memory_summary', lambda *a: pytest.fail('No extra NPU memory sync'))
+    probe._replay_actor_batch(actor, batch)
+    assert [method for method, _ in calls] == ['forward_backward', 'forward_backward', 'clip_grad_and_step']
+    for index, (_, kwargs) in enumerate(calls[:2]):
+        start = index * 2
+        assert kwargs == dict(inputs=batch['features'][start:start + 2], old_logps=batch['old_logps'][start:start + 2],
+                              advantages=batch['advantages'][start:start + 2], adapter_name=probe.TENANT)
+
+
+def test_replay_does_not_update_after_a_failed_microbatch(real_batch, monkeypatch):
+    path, batch = real_batch
+    calls = []
+
+    def invoke(actor, method, **kwargs):
+        calls.append(method)
+        raise RuntimeError('rank 1 loss computation failed')
+
+    monkeypatch.setattr(probe, '_probe_call', invoke)
+    with pytest.raises(RuntimeError, match='rank 1 loss'):
+        probe._replay_actor_batch(object(), batch)
+    assert calls == ['forward_backward']
+
+
+def test_replay_keeps_ragged_features_masks_and_rollout_logprobs(real_batch, monkeypatch):
+    path, batch = real_batch
+    batch['features'][1] = dict(input_ids=[10, 21, 31, 41], labels=[-100, 31, 41, -100],
+                                completion_mask=[0, 1, 1, 0])
+    batch['old_logps'][1] = [-0.75, -1.25]
+    batch['features'][3] = dict(input_ids=[10, 23], labels=[23, -100], completion_mask=[1, 0])
+    batch['old_logps'][3] = [-2.5]
+    path.write_text(json.dumps(batch))
+    restored = probe._read_actor_batch(path)
+    calls = []
+    monkeypatch.setattr(probe, '_probe_call',
+                        lambda actor, method, **kw: calls.append((method, kw)) or {'loss': 0.0})
+    probe._replay_actor_batch(object(), restored)
+    assert calls[0][1]['inputs'][1] == batch['features'][1]
+    assert calls[1][1]['inputs'][1] == batch['features'][3]
+    assert calls[1][1]['old_logps'] == batch['old_logps'][2:]
+
+
+def test_replay_rejects_explicit_extra_sync_before_runtime_setup(real_batch, monkeypatch):
+    path, batch = real_batch
+    monkeypatch.setenv('ACTOR_REPLAY_BATCH', str(path))
+    monkeypatch.setenv('PREFLIGHT_SYNC_BEFORE_GATHER', '1')
+    monkeypatch.setattr(probe, 'ensure_npu_backend', lambda: pytest.fail('Reject timing changes before model setup'))
+    with pytest.raises(ValueError, match='PREFLIGHT_SYNC_BEFORE_GATHER=0'):
+        probe.main()
+
+
+def test_replay_main_needs_no_dataset_and_syncs_memory_only_after_update(real_batch, monkeypatch, capsys):
+    path, batch = real_batch
+    monkeypatch.setenv('ACTOR_REPLAY_BATCH', str(path))
+    monkeypatch.setenv('RAY_ADDRESS', 'head:6379')
+    monkeypatch.setenv('ACTOR_NPUS', '99')  # Captured actor configuration wins.
+    monkeypatch.setenv('BATCH_SIZE', '0')  # Synthetic-only settings are not read.
+    monkeypatch.setenv('PREFLIGHT_SYNC_BEFORE_GATHER', '0')
+    monkeypatch.delenv('DAPO_PATH', raising=False)
+    monkeypatch.setattr(probe, 'ensure_npu_backend', lambda: None)
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(is_available=lambda: True), raising=False)
+    monkeypatch.setattr(probe, '_make_features', lambda *a: pytest.fail('Do not re-encode saved input tokens'))
+    monkeypatch.setattr(ray, 'init', lambda **kw: None)
+    monkeypatch.setattr(ray, 'cluster_resources', lambda: {'NPU': 2})
+    import transformers
+    monkeypatch.setattr(transformers.AutoConfig, 'from_pretrained',
+                        lambda *a, **kw: SimpleNamespace(n_routed_experts=2, use_cache=True))
+    monkeypatch.setattr(probe.twinkle, 'initialize', lambda **kw: None)
+    settings, events = {}, []
+
+    class Actor:
+        def __init__(self, **kwargs):
+            settings.update(kwargs)
+
+        def add_adapter_to_model(self, *args, **kwargs):
+            pass
+
+        def __getattr__(self, method):
+            assert method.startswith('set_')
+            return lambda *a, **kw: settings.update({method: kw})
+
+    monkeypatch.setattr(probe, 'PreflightActor', Actor)
+    monkeypatch.setattr(probe, '_probe_call',
+                        lambda actor, method, **kw: events.append(method) or {'loss': torch.tensor(0.0)})
+    monkeypatch.setattr(probe, '_memory_summary', lambda actor, stage: events.append(stage))
+    probe.main()
+    assert events == ['forward_backward', 'forward_backward', 'clip_grad_and_step', 'after_optimizer_step']
+    assert settings['device_mesh'].world_size == 2
+    assert settings['set_template']['enable_thinking'] is False
+    assert 'PASSED actor batch replay' in capsys.readouterr().out

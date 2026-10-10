@@ -294,3 +294,79 @@ def test_missing_ascend_oracle_dependency_fails_before_loading(monkeypatch, tmp_
     monkeypatch.setattr(audit, 'build_workers', lambda *a, **kw: pytest.fail('Do not load models'))
     with pytest.raises(FileNotFoundError, match='diagnose_dsv4_quarot.py'):
         audit.main(backend='ascend')
+
+
+@pytest.mark.parametrize('diagnostics', [False, True])
+@pytest.mark.parametrize('fail_forward', [False, True])
+def test_grpo_optional_actor_diagnostic_captures_before_failure_without_changing_default(
+        setup_example, monkeypatch, tmp_path, diagnostics, fail_forward):
+    from cookbook.rl.grpo import dsv4_actor_only_preflight as probe, dsv4_dapo
+
+    output = tmp_path / 'run'
+    for key, value in dict(DATASET_KIND='dapo', DATASET_MAX_ROWS='0', STEPS='1', BATCH_SIZE='2', NUM_GENERATIONS='2',
+                           REPORT_DIR=str(output), SAVE_EVERY_GBS='0', ACTOR_MICRO_BATCH_PER_RANK='1',
+                           ACTOR_DIAGNOSTICS=str(int(diagnostics))).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv('FINAL_CHECKPOINT_DIR', raising=False)
+    monkeypatch.setattr(example, 'local_dapo', lambda: [{'user_data': []}, {'user_data': []}])
+    monkeypatch.setattr(dsv4_dapo, 'DAPOMathProcessor', lambda: types.SimpleNamespace(preprocess=lambda row: row))
+    monkeypatch.setattr(dsv4_dapo, 'DAPOMathAccuracyReward', lambda: lambda inputs: [1.0, 0.0, 0.0, 0.0])
+    events, forwards, rpc_methods = [], [], []
+
+    class Actor:
+        device_mesh = types.SimpleNamespace(data_world_size=2, world_size=2, ep_size=2)
+
+        def forward_backward(self, **kwargs):
+            assert (output / 'actor_batch_0.json').exists() == diagnostics
+            forwards.append(kwargs)
+            events.append('backward')
+            if fail_forward and len(forwards) == 2:
+                raise RuntimeError('rank 1 failed during backward')
+            return {'loss': torch.tensor(0.0)}
+
+        def clip_grad_and_step(self, **kwargs):
+            events.append('update')
+
+    def sample(prompts, params):
+        events.append('sample')
+        sequences = []
+        for i in range(4):
+            tokens = [20 + i, 30 + i]
+            sequences.append(types.SimpleNamespace(
+                tokens=tokens, logprobs=[[(token, -0.25 - i)] for token in tokens], decoded='Answer: 34',
+                new_input_feature=dict(input_ids=[10] + tokens, labels=tokens + [-100])))
+        return [types.SimpleNamespace(sequences=sequences[:2], prompt_token_ids=[10]),
+                types.SimpleNamespace(sequences=sequences[2:], prompt_token_ids=[10])]
+
+    def build(**kwargs):
+        assert kwargs == ({'model_cls': probe.PreflightActor} if diagnostics else {})
+        return (Actor(), types.SimpleNamespace(sample=sample),
+                types.SimpleNamespace(sync_weights=lambda **kw: events.append('sync')))
+
+    def rpc(actor, method, **kwargs):
+        rpc_methods.append(method)
+        return getattr(actor, method)(**kwargs)
+
+    monkeypatch.setattr(probe, '_probe_call', rpc)
+    monkeypatch.setattr(probe, '_memory_summary', lambda *a: pytest.fail('Do not synchronize NPU memory in GRPO'))
+    if fail_forward:
+        with pytest.raises(RuntimeError, match='rank 1 failed'):
+            example.main(worker_builder=build)
+        assert events == ['sync', 'sample', 'backward', 'backward']
+        assert not (output / 'round_0.json').exists()
+    else:
+        example.main(worker_builder=build)
+        assert events == ['sync', 'sample', 'backward', 'backward', 'update', 'sync']
+        assert (output / 'final_sync.json').exists()
+    assert rpc_methods == (['forward_backward', 'forward_backward'] + ([] if fail_forward else ['clip_grad_and_step'])
+                           if diagnostics else [])
+    if diagnostics:
+        batch = probe._read_actor_batch(output / 'actor_batch_0.json')
+        for index, call in enumerate(forwards):
+            start = index * 2
+            assert call['inputs'] == batch['features'][start:start + 2]
+            assert call['old_logps'] == batch['old_logps'][start:start + 2]
+            assert call['advantages'] == batch['advantages'][start:start + 2]
+        assert batch['advantages'][2:] == [0.0, 0.0]
+    else:
+        assert not list(output.glob('actor_batch_*.json'))

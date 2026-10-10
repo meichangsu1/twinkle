@@ -245,7 +245,16 @@ def main(worker_builder=None):
     output = Path(os.environ.get('REPORT_DIR', './dsv4_grpo_reports')).resolve()
     output.mkdir(parents=True, exist_ok=False)
     checkpoint_root = Path(os.environ.get('CHECKPOINT_DIR', str(output / 'checkpoints'))).expanduser().resolve()
-    model, sampler, manager = (worker_builder or build_workers)()
+    actor_diagnostics = os.environ.get('ACTOR_DIAGNOSTICS', '0') == '1'
+    if actor_diagnostics:
+        from .dsv4_actor_only_preflight import PreflightActor, _probe_call, save_actor_batch
+
+        ensure_npu_backend()
+        if not torch.npu.is_available():
+            raise RuntimeError('ACTOR_DIAGNOSTICS is an Ascend actor diagnostic')
+        model, sampler, manager = (worker_builder or build_workers)(model_cls=PreflightActor)
+    else:
+        model, sampler, manager = (worker_builder or build_workers)()
     advantage_fn = GRPOAdvantage()
     if (batch * generations) % model.device_mesh.data_world_size:
         raise ValueError('BATCH_SIZE * NUM_GENERATIONS must be divisible by actor data_world_size')
@@ -292,22 +301,33 @@ def main(worker_builder=None):
                         prompt_tokens=response.prompt_token_ids))
         rewards = reward_fn(reward_inputs)
         advantages = advantage_fn(rewards, num_generations=generations, scale='group').tolist()
-        train_start = time.monotonic()
         micro_size = actor_micro_batch_size(len(features), model.device_mesh.data_world_size)
+        if actor_diagnostics:
+            path = save_actor_batch(output, model, step, micro_size, features, old_logps, advantages)
+            report['actor_batch'] = str(path)
+        train_start = time.monotonic()
         micro_losses = []
         for start in range(0, len(features), micro_size):
             end = start + micro_size
-            result = model.forward_backward(
-                inputs=features[start:end],
-                old_logps=old_logps[start:end],
-                advantages=advantages[start:end],
-                adapter_name=TENANT)
+            if actor_diagnostics:
+                result = _probe_call(model, 'forward_backward', inputs=features[start:end],
+                                     old_logps=old_logps[start:end], advantages=advantages[start:end],
+                                     adapter_name=TENANT)
+            else:
+                result = model.forward_backward(
+                    inputs=features[start:end],
+                    old_logps=old_logps[start:end],
+                    advantages=advantages[start:end],
+                    adapter_name=TENANT)
             micro_loss = result.get('loss') if isinstance(result, dict) else None
             if isinstance(micro_loss, torch.Tensor):
                 micro_loss = micro_loss.detach().float().item() if micro_loss.numel() == 1 else None
             if isinstance(micro_loss, (int, float)):
                 micro_losses.append(float(micro_loss))
-        model.clip_grad_and_step(adapter_name=TENANT)
+        if actor_diagnostics:
+            _probe_call(model, 'clip_grad_and_step', adapter_name=TENANT)
+        else:
+            model.clip_grad_and_step(adapter_name=TENANT)
         report['train_seconds'] = time.monotonic() - train_start
         save_start = time.monotonic()
         checkpoint_path = save_checkpoint_if_due(model, step + 1, save_every_gbs, checkpoint_root)

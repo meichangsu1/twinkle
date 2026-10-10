@@ -46,6 +46,87 @@ STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 MAX_NEW_TOKENS=3072 
 reward 已可稳定上升。每个 TP8 实例的 `MAX_NUM_SEQS` 默认 4，四实例合计最多
 16 条并发序列。输出默认写入 `/highcode/shared_data/dsv4_logs/full_*/`。
 
+## NPU 全层：保存真实训练 batch，再单独重放 actor
+
+当合成输入的 actor-only 测试通过、真实 GRPO 仍在训练阶段卡住时，先保存真实输入，
+避免每次诊断都重新 rollout。将更新后的 `dsv4_lora_h800.py` 和
+`dsv4_actor_only_preflight.py` 同步到四台容器的 `/opt/twinkle/cookbook/rl/grpo/`。
+这里只改示例与诊断入口，不改 Checkpoint Engine、FSDP 或 HCCL 实现。
+已有健康的四节点 Ray 集群可以复用；先确认上一轮任务退出且卡已释放。
+
+### 1. 在 head 捕获第 0 步，并记录各 actor rank 阶段
+
+```bash
+cd /opt/twinkle
+PYTHONNOUSERSITE=1 RAY_DEDUP_LOGS=0 ACTOR_DIAGNOSTICS=1 \
+  PREFLIGHT_RPC_TIMEOUT=900 PREFLIGHT_SYNC_BEFORE_GATHER=0 \
+  DAPO_PATH=/highcode/shared_data/DAPO-Math-17k/DAPO-Math-17k \
+  DATASET_MAX_ROWS=2000 STEPS=1 BATCH_SIZE=32 NUM_GENERATIONS=4 \
+  MAX_NEW_TOKENS=3072 SAVE_EVERY_GBS=0 \
+  bash /highcode/shared_data/rl/run_dsv4_full_4node_npu_dapo.sh run
+```
+
+脚本仍在后台运行，启动输出给出本次 `full_*/grpo.log` 和 `report/` 路径。
+日志打印 `Actor batch saved before training:` 后，`report/actor_batch_0.json` 已写完，
+即使之后训练失败，该文件也保留。它包含原始 input features（含实际 token、label
+和 mask）、rollout `old_logps`、advantage、微批大小与 actor 配置，不重新编码文本。
+
+`ACTOR_DIAGNOSTICS=1` 还使用诊断 actor 记录 `[ACTOR-PROBE]` 阶段，并优先收集
+已返回的 rank 异常，避免先等待低编号 rank 而遮住其他 rank 的报错。真实训练中
+不增加 `npu_memory` 或 `torch.npu.synchronize()` 调用。
+不设置该开关时，维持原有训练与结果收集路径，不保存这些 batch 文件。
+
+### 2. 不再运行 rollout，重放刚保存的 batch
+
+先等上一任务退出、32 张 actor 卡释放。以下命令仅在 head 执行；将
+`full_实际目录` 替换为上一步启动输出中的目录。无需设置数据集、回答长度或微批
+参数，重放会使用文件中保存的 actor 配置和微批边界；Ray 地址与网卡仍由命令指定。
+
+```bash
+cd /opt/twinkle
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export PYTHONPATH="/opt/twinkle/src:/opt/twinkle${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONNOUSERSITE=1 TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO RAY_DEDUP_LOGS=0
+export RAY_ADDRESS=11.173.4.131:6379
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export NETWORK_IFACE=bond0 GLOO_SOCKET_IFNAME=bond0 HCCL_SOCKET_IFNAME=bond0
+export HCCL_CONNECT_TIMEOUT=7200 HCCL_EXEC_TIMEOUT=0
+export PREFLIGHT_RPC_TIMEOUT=900 PREFLIGHT_SYNC_BEFORE_GATHER=0
+export ACTOR_REPLAY_BATCH=/highcode/shared_data/dsv4_logs/full_实际目录/report/actor_batch_0.json
+test -f "$ACTOR_REPLAY_BATCH"
+mkdir -p /highcode/shared_data/dsv4_logs
+PROBE_DIR=$(mktemp -d /highcode/shared_data/dsv4_logs/actor_replay_XXXXXXXX)
+nohup /usr/local/python3.12.13/bin/python3 -u \
+  -m cookbook.rl.grpo.dsv4_actor_only_preflight \
+  >"$PROBE_DIR/actor.log" 2>&1 </dev/null &
+echo "Replay PID=$! Log=$PROBE_DIR/actor.log"
+```
+
+重放逐个使用保存的不同微批，传入原始 `old_logps` 和 advantage；不再用同一批
+随机 token 重复反传。只在 optimizer 更新完成后收集一次显存，不在反向之前或
+微批之间插入显式 NPU 同步。未设置 `ACTOR_REPLAY_BATCH` 时，原来的合成测试
+仍保留逐微批显存同步，因此两种测试的执行时序不能混同。
+
+### 3. 看结果与范围
+
+```bash
+grep '\[ACTOR-PROBE\]' "$PROBE_DIR/actor.log" | tail -n 120
+grep -E 'PASSED|rpc_error|\.error|pending_worker_indices|Traceback' "$PROBE_DIR/actor.log" | tail -n 80
+```
+
+关注每个 rank 的最后阶段：`forward_backward`、`adapter_context`、`token_gather`、
+`gradient_norm` 和 `optimizer_step`。优先看最早的 `.error` 或 `driver.rpc_error`，
+不是把其他 rank 后续的 HCCL 超时都当成根因。RPC 超时列出的 pending rank
+只表示尚未返回，需要结合阶段日志判断。
+
+重放只保存输入，不保存 LoRA、优化器或随机数状态，也不复现 rollout 与 actor
+同时存在时的资源占用或物理节点分配。因此先捕获第 0 步；后续步在新初始化的
+adapter 上重放，不是当时训练状态的精确恢复。即使打印 `PASSED actor batch replay`，
+也只说明该输入在这次 actor-only 条件下完成，不能宣称正式 GRPO 的故障已修复。
+
 ## 其他 NPU DAPO 入口（开发环境四层与旧三节点全层）
 
 本节使用两份独立脚本：四层开发环境使用 `run_dsv4_mini_npu_dapo.sh`，

@@ -1,9 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Exercise the full DSV4 GRPO actor without rollout or weight synchronization.
 
-This is a memory/compute-path probe, not a training-quality test: completion
-token IDs and advantages are synthetic. Run it against the same actor base,
-FSDP/EP topology, and sequence length as the GRPO job.
+By default completion token IDs and advantages are synthetic. Set
+ACTOR_REPLAY_BATCH to a batch saved with ACTOR_DIAGNOSTICS=1 to replay actual
+features, rollout logprobs and advantages without running rollout again.
+Replay preserves microbatch boundaries and does not synchronize NPU memory
+between microbatches. It initializes a fresh adapter/optimizer, not a saved
+training state; start with a capture of training_step=0.
 
 ACTOR-PROBE records identify each rank's last completed stage. The diagnostic
 RPC timeout defaults to 900 seconds (PREFLIGHT_RPC_TIMEOUT); model setup is
@@ -21,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import numpy as np
 from peft import LoraConfig
 
 import twinkle
@@ -235,12 +239,78 @@ def _memory_summary(actor, stage):
     print(f'{stage}: ranks={len(snapshots)} highest_peak={highest}', flush=True)
 
 
+def _json_array(value):
+    if isinstance(value, torch.Tensor):
+        if value.device.type != 'cpu':
+            raise ValueError('Actor batch capture requires CPU inputs; it must not synchronize NPU tensors')
+        return value.tolist()
+    if isinstance(value, (np.ndarray, np.generic)):
+        return value.tolist()
+    raise TypeError(f'Cannot capture {type(value).__name__} as JSON')
+
+
+def save_actor_batch(output, model, step, micro_size, features, old_logps, advantages):
+    """Persist driver inputs before forward/backward, without saving weights."""
+    defaults = dict(NPUS_PER_NODE='16', ACTOR_PRECISION='bf16', ACTOR_MAX_LENGTH='8192',
+                    LORA_R='8', LORA_ALPHA='32', LR='1e-5', LORA_TARGET_MODULES='',
+                    LORA_TARGET_PARAMETERS='mlp.experts.gate_up_proj,mlp.experts.down_proj',
+                    TWINKLE_FAIL_FAST='1')
+    actor_env = {name: os.environ.get(name, default) for name, default in defaults.items()}
+    actor_env.update(ACTOR_MODEL=str(Path(os.environ['ACTOR_MODEL']).expanduser().resolve()),
+                     ACTOR_NPUS=str(model.device_mesh.world_size), ACTOR_EP=str(model.device_mesh.ep_size or 1))
+    batch = dict(format='dsv4_actor_batch_v1', training_step=step, actor_env=actor_env,
+                 micro_size=micro_size, features=features, old_logps=old_logps, advantages=advantages)
+    path = output / f'actor_batch_{step}.json'
+    with path.open('x', encoding='utf-8') as handle:
+        json.dump(batch, handle, ensure_ascii=False, default=_json_array)
+    print(f'Actor batch saved before training: {path}', flush=True)
+    return path
+
+
+def _read_actor_batch(path):
+    batch = json.loads(Path(path).expanduser().read_text(encoding='utf-8'))
+    if batch['format'] != 'dsv4_actor_batch_v1':
+        raise ValueError('Unsupported actor replay batch format')
+    count = len(batch['features'])
+    micro_size = batch['micro_size']
+    world_size = int(batch['actor_env']['ACTOR_NPUS'])
+    if (not count or world_size <= 0 or len(batch['old_logps']) != count or len(batch['advantages']) != count
+            or micro_size <= 0 or count % micro_size or micro_size % world_size):
+        raise ValueError('Actor replay batch has inconsistent sample counts or microbatch size')
+    return batch
+
+
+def _replay_actor_batch(actor, batch):
+    """Match GRPO slicing and loss collection, with no extra device sync RPCs."""
+    micro_size = batch['micro_size']
+    for start in range(0, len(batch['features']), micro_size):
+        end = start + micro_size
+        result = _probe_call(actor, 'forward_backward', inputs=batch['features'][start:end],
+                             old_logps=batch['old_logps'][start:end], advantages=batch['advantages'][start:end],
+                             adapter_name=TENANT)
+        loss = result.get('loss') if isinstance(result, dict) else None
+        if isinstance(loss, torch.Tensor):
+            loss = loss.detach().float().item() if loss.numel() == 1 else None
+        loss = float(loss) if isinstance(loss, (int, float)) else None
+        _trace('driver.microbatch_complete', microbatch=start // micro_size + 1, loss=loss)
+    _probe_call(actor, 'clip_grad_and_step', adapter_name=TENANT)
+
+
 def main():
+    replay_path = os.environ.get('ACTOR_REPLAY_BATCH')
+    replay = _read_actor_batch(replay_path) if replay_path else None
+    if replay is not None:
+        # Restore actor settings only. Ray address, devices and network remain
+        # the launcher's responsibility; no dataset/tokenizer re-encoding occurs.
+        os.environ.update(replay['actor_env'])
+        print(f'Replaying {replay_path}, training_step={replay["training_step"]}; '
+              'fresh adapter/optimizer, no per-microbatch NPU synchronization', flush=True)
+        if os.environ.get('PREFLIGHT_SYNC_BEFORE_GATHER', '0') != '0':
+            raise ValueError('Set PREFLIGHT_SYNC_BEFORE_GATHER=0 to preserve GRPO replay timing')
     ensure_npu_backend()
     if not torch.npu.is_available():
         raise RuntimeError('NPU runtime is unavailable on the driver')
     model_path = Path(os.environ['ACTOR_MODEL']).expanduser().resolve()
-    data_path = Path(os.environ['DAPO_PATH']).expanduser().resolve()
     if not (model_path / 'config.json').is_file():
         raise FileNotFoundError(model_path / 'config.json')
     actor_devices = _positive_env('ACTOR_NPUS', '32')
@@ -249,13 +319,6 @@ def main():
     rank = _positive_env('LORA_R', '8')
     alpha = _positive_env('LORA_ALPHA', '32')
     max_length = _positive_env('ACTOR_MAX_LENGTH', os.environ.get('MAX_MODEL_LEN', '8192'))
-    completion_tokens = _positive_env('PREFLIGHT_COMPLETION_TOKENS', os.environ.get('MAX_NEW_TOKENS', '4096'))
-    batch = _positive_env('BATCH_SIZE', '64')
-    generations = _positive_env('NUM_GENERATIONS', '4')
-    if actor_devices % generations or batch * generations % actor_devices:
-        raise ValueError('NUM_GENERATIONS must divide ACTOR_NPUS and BATCH_SIZE * NUM_GENERATIONS '
-                         'must be divisible by ACTOR_NPUS')
-    microbatches = _positive_env('PREFLIGHT_MICROBATCHES', str(batch * generations // actor_devices))
     precision = os.environ.get('ACTOR_PRECISION', 'bf16')
     if precision not in ('bf16', 'fp16'):
         raise ValueError('ACTOR_PRECISION must be bf16 or fp16')
@@ -268,8 +331,20 @@ def main():
     if config.n_routed_experts % ep:
         raise ValueError('ACTOR_EP must divide n_routed_experts')
     config.use_cache = False
-    features = _make_features(model_path, data_path, actor_devices, generations, completion_tokens, max_length,
-                              config.vocab_size)
+    if replay is None:
+        data_path = Path(os.environ['DAPO_PATH']).expanduser().resolve()
+        completion_tokens = _positive_env('PREFLIGHT_COMPLETION_TOKENS', os.environ.get('MAX_NEW_TOKENS', '4096'))
+        batch = _positive_env('BATCH_SIZE', '64')
+        generations = _positive_env('NUM_GENERATIONS', '4')
+        if actor_devices % generations or batch * generations % actor_devices:
+            raise ValueError('NUM_GENERATIONS must divide ACTOR_NPUS and BATCH_SIZE * NUM_GENERATIONS '
+                             'must be divisible by ACTOR_NPUS')
+        microbatches = _positive_env('PREFLIGHT_MICROBATCHES', str(batch * generations // actor_devices))
+        features = _make_features(model_path, data_path, actor_devices, generations, completion_tokens, max_length,
+                                  config.vocab_size)
+    else:
+        features = replay['features']
+        microbatches = len(features) // replay['micro_size']
     lengths = [len(feature['input_ids']) for feature in features]
     print(f'Actor-only preflight: ranks={actor_devices} EP={ep} microbatches={microbatches} '
           f'prompt+completion lengths={min(lengths)}..{max(lengths)}', flush=True)
@@ -289,7 +364,11 @@ def main():
         lazy_collect=False,
         groups=[DeviceGroup(name='actor', ranks=list(range(actor_devices)), device_type='NPU')],
     )
-    placeholder = LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=0, target_modules=['q_a_proj'])
+    from .dsv4_lora_h800 import lora_targets_from_env
+
+    target_modules, target_parameters = lora_targets_from_env()
+    placeholder = LoraConfig(r=rank, lora_alpha=alpha, lora_dropout=0,
+                             target_modules=target_modules or ['q_a_proj'])
     actor = PreflightActor(
         model_id=str(model_path),
         config=config,
@@ -309,25 +388,32 @@ def main():
         r=rank,
         lora_alpha=alpha,
         lora_dropout=0,
-        target_modules=[],
-        target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj'],
+        target_modules=target_modules,
+        target_parameters=target_parameters,
     )
     actor.add_adapter_to_model(TENANT, lora, gradient_accumulation_steps=1)
     actor.set_optimizer('AdamW', lr=float(os.environ.get('LR', '5e-6')), adapter_name=TENANT)
     actor.set_loss('GRPOLoss', beta=0.0, epsilon=0.2, adapter_name=TENANT)
     actor.set_processor(InputProcessor, adapter_name=TENANT)
-    actor.set_template('DeepseekV4Template', model_id=str(model_path), adapter_name=TENANT)
-    _memory_summary(actor, 'before_forward')
+    actor.set_template('DeepseekV4Template', model_id=str(model_path), adapter_name=TENANT,
+                       enable_thinking=replay is None)
 
+    if replay is None:
+        _memory_summary(actor, 'before_forward')
     start = time.monotonic()
-    for index in range(microbatches):
-        # Omitting old_logps makes GRPOLoss use detached current logprobs.
-        # Nonzero synthetic advantages still exercise the actual backward path.
-        _probe_call(actor, 'forward_backward', inputs=features, advantages=[1.0] * actor_devices, adapter_name=TENANT)
-        _memory_summary(actor, f'after_microbatch_{index + 1}')
-    _probe_call(actor, 'clip_grad_and_step', adapter_name=TENANT)
+    if replay is None:
+        for index in range(microbatches):
+            # Omitting old_logps makes GRPOLoss use detached current logprobs.
+            # Nonzero synthetic advantages still exercise the actual backward path.
+            _probe_call(actor, 'forward_backward', inputs=features, advantages=[1.0] * actor_devices,
+                        adapter_name=TENANT)
+            _memory_summary(actor, f'after_microbatch_{index + 1}')
+        _probe_call(actor, 'clip_grad_and_step', adapter_name=TENANT)
+    else:
+        _replay_actor_batch(actor, replay)
     _memory_summary(actor, 'after_optimizer_step')
-    print(f'PASSED actor-only preflight in {time.monotonic() - start:.1f}s; '
+    name = 'actor batch replay' if replay is not None else 'actor-only preflight'
+    print(f'PASSED {name} in {time.monotonic() - start:.1f}s; '
           'this does not validate rollout, weight sync, or reward quality', flush=True)
 
 
