@@ -7,27 +7,22 @@ from twinkle.checkpoint_engine.base import CheckpointEngine
 class CheckpointEngineMixin:
 
     _checkpoint_engine: CheckpointEngine = None
-    _bucket_size: int = 3072 << 20  # 2 GB
+    _bucket_size: int = 3072 << 20  # 3 GiB per buffer
 
-    def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
+    def _get_or_create_checkpoint_engine(self, rebuild_group: bool = False) -> 'CheckpointEngine':
         """Get or create the checkpoint engine instance (lazy singleton)."""
         if self._checkpoint_engine is None:
             if Platform.get_platform().__name__ == 'GPU':
                 from twinkle.checkpoint_engine import NCCLCheckpointEngine
-                self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size)
+                self._checkpoint_engine = NCCLCheckpointEngine(self._bucket_size, rebuild_group=rebuild_group)
             elif Platform.get_platform().__name__ == 'NPU':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
 
-                # Reusing HCCL communicator across sync steps avoids frequent
-                # stream/channel allocation and reduces resource exhaustion risk.
-                self._checkpoint_engine = HCCLCheckpointEngine(
-                    self._bucket_size,
-                    rebuild_group=False,
-                )
+                self._checkpoint_engine = HCCLCheckpointEngine(self._bucket_size, rebuild_group=rebuild_group)
         return self._checkpoint_engine
 
     @remote_function(collect='first', lazy_collect=False)
-    def prepare_checkpoint_engine(self, is_master):
+    def prepare_checkpoint_engine(self, is_master, *, rebuild_group: bool = False):
         # Slice dispatch retains a singleton list, whose truth value would be
         # True even for [False]. Only rank 0 may create a metadata publisher.
         if isinstance(is_master, list):
@@ -36,7 +31,7 @@ class CheckpointEngineMixin:
             is_master = is_master[0]
         if not isinstance(is_master, bool):
             raise ValueError('Checkpoint master flag must be boolean')
-        engine = self._get_or_create_checkpoint_engine()
+        engine = self._get_or_create_checkpoint_engine(rebuild_group=rebuild_group)
         engine.is_master = is_master
         return engine.prepare()
 

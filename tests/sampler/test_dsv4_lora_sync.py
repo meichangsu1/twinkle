@@ -444,12 +444,12 @@ class FakePeer:
         return method
 
 
-def peers(monkeypatch):
+def peers(monkeypatch, **manager_options):
     backend = types.SimpleNamespace(build_topology=lambda *args: ({}, {}))
     monkeypatch.setattr(CheckpointEngineManager, 'decide_backend_engine', lambda *args: backend)
     calls = []
     actor, sampler = FakePeer(calls, 'actor'), FakePeer(calls, 'sampler')
-    return CheckpointEngineManager(actor, sampler), calls
+    return CheckpointEngineManager(actor, sampler, **manager_options), calls
 
 
 def test_manager_first_and_repeated_lora_only_reuse_existing_transport(monkeypatch):
@@ -464,7 +464,7 @@ def test_manager_first_and_repeated_lora_only_reuse_existing_transport(monkeypat
         if name in {'send_weights', 'receive_weights'}:
             assert kwargs['lora_only'] is True
         if name == 'prepare_checkpoint_engine':
-            assert kwargs == {}
+            assert kwargs == {'rebuild_group': False}
         if name == 'receive_weights':
             assert set(kwargs) == {'base_sync_done', 'peft_config', 'lora_only'}
     manager.sampler.fail = 'receive_weights'
@@ -487,6 +487,26 @@ def test_manager_legacy_modes_unchanged(monkeypatch):
         assert not any(n == 'check_lora_sync_bucket' for _, n, _, _ in calls)
 
 
+@pytest.mark.parametrize('rebuild_group', [False, True])
+def test_manager_passes_rebuild_to_both_peers_without_changing_pipeline(monkeypatch, rebuild_group):
+    manager, calls = peers(monkeypatch, rebuild_group=rebuild_group)
+    manager.model.device_mesh.world_size = 4
+    for _ in range(20):
+        start = len(calls)
+        manager.sync_weights(merge_and_sync=False, lora_only=True, adapter_name='tenant_a')
+        update = calls[start:]
+        assert [(kind, name) for kind, name, _, _ in update] == [
+            ('actor', 'get_peft_config_dict'),
+            ('actor', 'prepare_checkpoint_engine'), ('sampler', 'prepare_checkpoint_engine'),
+            ('actor', 'init_checkpoint_process_group'), ('sampler', 'init_checkpoint_process_group'),
+            ('actor', 'send_weights'), ('sampler', 'receive_weights'),
+            ('actor', 'finalize_checkpoint_engine'), ('sampler', 'finalize_checkpoint_engine')]
+        prepares = [(args, kwargs) for _, name, args, kwargs in update if name == 'prepare_checkpoint_engine']
+        assert prepares == [
+            (([True, False, False, False],), {'rebuild_group': rebuild_group}),
+            ((False,), {'rebuild_group': rebuild_group})]
+
+
 def test_invalid_lora_only_options_do_not_start_transport(monkeypatch):
     manager, calls = peers(monkeypatch)
     for kwargs in [
@@ -498,28 +518,37 @@ def test_invalid_lora_only_options_do_not_start_transport(monkeypatch):
     assert calls == []
 
 
-def test_manager_keeps_original_constructor_signature(monkeypatch):
+def test_manager_only_adds_optional_rebuild_configuration(monkeypatch):
     import inspect
     manager, calls = peers(monkeypatch)
     assert list(inspect.signature(CheckpointEngineManager.__init__).parameters) == [
-        'self', 'model', 'sampler', 'platform']
+        'self', 'model', 'sampler', 'platform', 'rebuild_group']
+    assert not manager.rebuild_group
     assert '_bucket_size_mb' not in vars(manager) and '_ipc_bucket_size_mb' not in vars(manager)
     assert calls == []
 
 
-def test_ray_slice_master_flag_is_unwrapped():
+@pytest.mark.parametrize('rebuild_group', [False, True])
+def test_ray_slice_master_flag_is_unwrapped(rebuild_group):
     from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
     from twinkle.infra import _dispatch_args
     workers = [object() for _ in range(4)]
-    dispatched = _dispatch_args(workers, 'slice', 'all', None, ([True, False, False, False], ), {})
-    flags = []
+    dispatched = _dispatch_args(
+        workers, 'slice', 'all', None, ([True, False, False, False], ), {'rebuild_group': rebuild_group})
+    flags, settings = [], []
+
+    def get_engine(**kwargs):
+        settings.append(kwargs['rebuild_group'])
+        return engine
+
     for _, args, kwargs in dispatched:
         engine = types.SimpleNamespace(is_master=None)
         engine.prepare = lambda: engine.is_master
         mixin = CheckpointEngineMixin()
-        mixin._get_or_create_checkpoint_engine = lambda: engine
+        mixin._get_or_create_checkpoint_engine = get_engine
         flags.append(CheckpointEngineMixin.prepare_checkpoint_engine.__wrapped__(mixin, *args, **kwargs))
     assert flags == [True, False, False, False]
+    assert settings == [rebuild_group] * 4
 
 
 @pytest.mark.parametrize('lora_only', [False, True])
@@ -568,7 +597,7 @@ def test_prepare_preserves_original_bucket_configuration(bucket_size):
     engine = types.SimpleNamespace(is_master=False, prepare=lambda: {})
     calls = []
 
-    def get_engine():
+    def get_engine(**kwargs):
         calls.append('get')
         mixin._checkpoint_engine = engine
         return engine

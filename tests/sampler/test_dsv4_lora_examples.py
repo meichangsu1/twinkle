@@ -96,7 +96,7 @@ def test_example_backend_configuration(setup_example, monkeypatch, backend, prec
         monkeypatch.setenv('ACTOR_GPUS', '99')
         devices, per_node, tp, start, platform, device = 4, 16, 4, 16, 'NPU', 'npu'
     _, _, manager = example.build_workers(actor, sampler, {'worker_extension_cls': 'test.Worker'}, backend=backend)
-    assert manager == 'manager' and calls['manager'] == {'platform': platform}
+    assert manager == 'manager' and calls['manager'] == {'platform': platform, 'rebuild_group': True}
     assert calls['initialize']['nproc_per_node'] == per_node
     groups = calls['initialize']['groups']
     assert groups[0].ranks == list(range(devices))

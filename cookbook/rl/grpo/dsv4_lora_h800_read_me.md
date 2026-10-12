@@ -47,12 +47,38 @@ STEPS=100 BATCH_SIZE=64 NUM_GENERATIONS=4 SAVE_EVERY_GBS=50 MAX_NEW_TOKENS=3072 
 reward 已可稳定上升。每个 TP8 实例的 `MAX_NUM_SEQS` 默认 4，两实例合计最多
 8 条并发序列。输出默认写入 `/highcode/shared_data/dsv4_logs/full_*/`。
 
+### 同步后释放通信桶，降低 actor 训练显存占用
+
+DSV4 H800 和 NPU 示例都使用显式配置：
+
+```python
+CheckpointEngineManager(model, sampler, platform=platform, rebuild_group=True)
+```
+
+配置经现有 `prepare` 阶段传给两端，创建各自的 NCCL/HCCL Engine，不使用环境
+变量。每次同步结束由 Engine 的 `finalize()` 释放同步专用的通信组和两个桶；
+NPU 还调用 `torch.npu.empty_cache()` 归还空闲缓存。默认每桶 3 GiB，两个桶共
+6 GiB；下次同步重新创建，不改训练 FSDP/EP 的通信组。配置在 Engine 首次
+创建时确定，修改配置后需重新创建 worker。其他任务默认 `rebuild_group=False`，
+仍复用同步组。重新建组会增加同步开销。这项修改不保证消除其他来源的 OOM，
+需用原来的真实 batch 再验证。
+
+将以下四个运行文件替换到所有参与节点的 `/opt/twinkle/` 对应位置：
+
+- `src/twinkle/checkpoint_engine/manager.py`
+- `src/twinkle/checkpoint_engine/mixin.py`
+- `src/twinkle/checkpoint_engine/hccl_checkpoint_engine.py`
+- `cookbook/rl/grpo/dsv4_lora_h800.py`
+
+先让旧 GRPO 任务及其 actor、sampler 退出，再重新启动 `run`。健康的 Ray
+集群可以复用，但已创建的 worker 不会因替换文件而自动更新。
+
 ## NPU 全层：保存真实训练 batch，再单独重放 actor
 
 当合成输入的 actor-only 测试通过、真实 GRPO 仍在训练阶段卡住时，先保存真实输入，
 避免每次诊断都重新 rollout。将更新后的 `dsv4_lora_h800.py` 和
 `dsv4_actor_only_preflight.py` 同步到四台容器的 `/opt/twinkle/cookbook/rl/grpo/`。
-这里只改示例与诊断入口，不改 Checkpoint Engine、FSDP 或 HCCL 实现。
+诊断开关本身只改示例与诊断入口，不改 FSDP 或 HCCL 算子实现。
 已有健康的四节点 Ray 集群可以复用；先确认上一轮任务退出且卡已释放。
 
 ### 1. 在 head 捕获第 0 步，并记录各 actor rank 阶段

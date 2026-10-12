@@ -147,34 +147,38 @@ class HCCLCheckpointEngine(CheckpointEngine):
         return None
 
     def finalize(self):
-        if self.rebuild_group:
-            if self.socket is not None:
-                try:
-                    self.socket.close()
-                except Exception as e:
-                    logger.warning(f'Error closing ZMQ socket: {e}')
-                self.socket = None
+        if not self.rebuild_group or not self._prepared:
+            return
 
-            if self._zmq_ctx is not None:
-                try:
-                    self._zmq_ctx.term()
-                except Exception as e:
-                    logger.warning(f'Error terminating ZMQ context: {e}')
-                self._zmq_ctx = None
+        torch.npu.synchronize(self.device)
+        if self.pyhccl is not None:
+            if self.pyhccl.available:
+                self.pyhccl.hccl.hcclCommDestroy(self.pyhccl.comm)
+            self.pyhccl = None
 
-            if self.rank is not None and self.rank >= 0 and self.pyhccl is not None:
-                try:
-                    self.pyhccl.destroyComm(self.pyhccl.comm)
-                except Exception:
-                    pass
-                self.pyhccl = None
+        if self.socket is not None:
+            try:
+                self.socket.close()
+            except Exception as e:
+                logger.warning(f'Error closing ZMQ socket: {e}')
+            self.socket = None
 
-            self.rank = None
-            self.world_size = None
-            self.send_buf = None
-            self.recv_buf = None
-            self._prepared = False
-            self._group_initialized = False
+        if self._zmq_ctx is not None:
+            try:
+                self._zmq_ctx.term()
+            except Exception as e:
+                logger.warning(f'Error terminating ZMQ context: {e}')
+            self._zmq_ctx = None
+
+        self.rank = None
+        self.world_size = None
+        self.send_buf = None
+        self.recv_buf = None
+        self._prepared = False
+        self._group_initialized = False
+        # HCCL allocates outside PyTorch; return idle cached blocks to the driver
+        # before actor training starts, not merely the Python tensor references.
+        torch.npu.empty_cache()
 
     @classmethod
     def build_topology(

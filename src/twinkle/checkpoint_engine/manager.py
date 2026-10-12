@@ -39,6 +39,10 @@ class CheckpointEngineManager:
     Usage:
         >>> manager = CheckpointEngineManager(model=model, sampler=sampler)
         >>> manager.sync_weights()  # Call after each training step
+
+    Set rebuild_group=True to release checkpoint buffers and the sync group
+    after every update. The default reuses them. This option is fixed when the
+    peer engines are first created; it does not affect training process groups.
     """
 
     def __init__(
@@ -46,10 +50,14 @@ class CheckpointEngineManager:
         model: 'CheckpointEngineMixin',
         sampler: 'CheckpointEngineMixin',
         platform: str = 'GPU',
+        *,
+        rebuild_group: bool = False,
     ) -> None:
         self.model = model
         self.sampler = sampler
         self.backend_cls = self.decide_backend_engine(platform)
+        # Applies to both peers when their checkpoint engines are first created.
+        self.rebuild_group = rebuild_group
 
         # Validate Ray actors
         assert hasattr(model, '_actors') and model._actors, \
@@ -111,9 +119,9 @@ class CheckpointEngineManager:
             if merge_and_sync or not adapter_name:
                 raise ValueError('lora_only requires merge_and_sync=False and an explicit adapter_name')
             peft_config = self.model.get_peft_config_dict(adapter_name)
-        model_metadata = self.model.prepare_checkpoint_engine([True]
-                                                              + [False] * (self.model.device_mesh.world_size - 1))
-        self.sampler.prepare_checkpoint_engine(False)
+        model_metadata = self.model.prepare_checkpoint_engine(
+            [True] + [False] * (self.model.device_mesh.world_size - 1), rebuild_group=self.rebuild_group)
+        self.sampler.prepare_checkpoint_engine(False, rebuild_group=self.rebuild_group)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
             self.model.device_mesh.world_size,
             self.sampler.device_mesh.data_world_size,

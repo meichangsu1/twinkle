@@ -161,7 +161,7 @@ def build_workers(model_cls=MultiLoraTransformersModel,
     sampler = sampler_cls(
         model_id=rollout_path, remote_group='rollout', device_mesh=rollout_mesh, engine_args=engine_args)
     sampler.set_template('DeepseekV4Template', model_id=actor_path, enable_thinking=False)
-    return model, sampler, CheckpointEngineManager(model, sampler, platform=platform)
+    return model, sampler, CheckpointEngineManager(model, sampler, platform=platform, rebuild_group=True)
 
 
 def local_gsm8k():
