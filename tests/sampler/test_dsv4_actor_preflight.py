@@ -105,6 +105,7 @@ def test_timeout_identifies_pending_worker_indices(monkeypatch):
 
 @pytest.fixture
 def fake_clip(monkeypatch):
+    monkeypatch.delenv('TWINKLE_CKPT_MEMORY_AUDIT', raising=False)
     events = []
     actor = object.__new__(probe.PreflightActor)
     torch.nn.Module.__init__(actor)
@@ -140,6 +141,31 @@ def fake_clip(monkeypatch):
     monkeypatch.setattr(implementation, 'normalize_and_clip_grad_norm', norm)
     monkeypatch.setattr(probe.MultiLoraTransformersModel, 'clip_grad_norm', clip)
     return actor, events, adapter, gather, norm
+
+
+@pytest.mark.parametrize('enabled', ['0', '1'])
+def test_memory_trace_is_optional_and_adds_no_device_barrier(monkeypatch, enabled):
+    monkeypatch.setenv('TWINKLE_CKPT_MEMORY_AUDIT', enabled)
+    records = []
+    monkeypatch.setattr(probe, '_trace', lambda stage, **kw: records.append(dict(stage=stage, **kw)))
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(
+        mem_get_info=lambda: (100, 1000), memory_allocated=lambda: 600, memory_reserved=lambda: 800,
+        synchronize=lambda: pytest.fail('Memory observation must not add a barrier')), raising=False)
+    probe._trace_memory('token_gather.memory')
+    assert records == ([dict(stage='token_gather.memory', allocated_bytes=600, reserved_bytes=800,
+                            free_bytes=100, total_bytes=1000)] if enabled == '1' else [])
+
+
+def test_gather_memory_is_recorded_before_collective_without_synchronizing(fake_clip, monkeypatch):
+    actor, events, *_ = fake_clip
+    monkeypatch.setenv('TWINKLE_CKPT_MEMORY_AUDIT', '1')
+    monkeypatch.setenv('PREFLIGHT_SYNC_BEFORE_GATHER', '0')
+    monkeypatch.setattr(torch.npu, 'mem_get_info', lambda: (100, 1000), raising=False)
+    monkeypatch.setattr(torch.npu, 'memory_allocated', lambda: 600, raising=False)
+    monkeypatch.setattr(torch.npu, 'memory_reserved', lambda: 800, raising=False)
+    actor.clip_grad_norm(adapter_name=probe.TENANT)
+    assert events.index('token_gather.enter') < events.index('token_gather.memory') < events.index('original_gather')
+    assert 'device_sync' not in events
 
 
 @pytest.mark.parametrize('sync', ['0', '1'])
@@ -377,3 +403,85 @@ def test_replay_main_needs_no_dataset_and_syncs_memory_only_after_update(real_ba
     assert settings['device_mesh'].world_size == 2
     assert settings['set_template']['enable_thinking'] is False
     assert 'PASSED actor batch replay' in capsys.readouterr().out
+
+
+def test_sync_replay_main_restores_capture_without_entering_synthetic_path(real_batch, monkeypatch):
+    path, batch = real_batch
+    monkeypatch.setenv('ACTOR_REPLAY_BATCH', str(path))
+    monkeypatch.setenv('ACTOR_REPLAY_SYNC', '1')
+    monkeypatch.setenv('ACTOR_NPUS', '99')
+    monkeypatch.setenv('PREFLIGHT_SYNC_BEFORE_GATHER', '0')
+    monkeypatch.delenv('DAPO_PATH', raising=False)
+    monkeypatch.setattr(probe, 'ensure_npu_backend', lambda: pytest.fail('Do not enter actor-only setup'))
+    received = []
+
+    def replay(restored):
+        import os
+        assert os.environ['ACTOR_NPUS'] == batch['actor_env']['ACTOR_NPUS']
+        received.append(restored)
+
+    monkeypatch.setattr(probe, '_sync_and_replay_actor_batch', replay)
+    probe.main()
+    assert received == [batch]
+
+
+def test_sync_replay_requires_saved_batch_before_runtime_setup(monkeypatch):
+    monkeypatch.setenv('ACTOR_REPLAY_SYNC', '1')
+    monkeypatch.delenv('ACTOR_REPLAY_BATCH', raising=False)
+    monkeypatch.setattr(probe, 'ensure_npu_backend', lambda: pytest.fail('Do not generate synthetic data'))
+    with pytest.raises(ValueError, match='requires ACTOR_REPLAY_BATCH'):
+        probe.main()
+
+
+@pytest.mark.parametrize('failure', [None, 'sync', 'backward'])
+def test_real_sync_precedes_saved_training_without_sampling(real_batch, monkeypatch, capsys, failure):
+    from cookbook.rl.grpo import dsv4_lora_npu as npu
+
+    _, batch = real_batch
+    monkeypatch.setenv('RAY_ADDRESS', 'head:6379')
+    events = []
+    actor = object()
+    sampler = SimpleNamespace(sample=lambda *a, **kw: pytest.fail('No new rollout may be generated'))
+
+    def sync(**kwargs):
+        assert kwargs == dict(merge_and_sync=False, lora_only=True, adapter_name=probe.TENANT)
+        events.append('sync')
+        if failure == 'sync':
+            raise RuntimeError('weight sync failed')
+
+    def build(**kwargs):
+        assert kwargs == dict(model_cls=probe.PreflightActor)
+        events.append('build')
+        return actor, sampler, SimpleNamespace(sync_weights=sync)
+
+    def invoke(received_actor, method, **kwargs):
+        assert received_actor is actor
+        events.append(method)
+        if failure == 'backward':
+            raise RuntimeError('backward failed')
+        return {'loss': 0.0}
+
+    monkeypatch.setattr(npu, 'connect_existing_ray_if_configured', lambda: events.append('connect'))
+    monkeypatch.setattr(npu, 'build_workers', build)
+    monkeypatch.setattr(probe, '_probe_call', invoke)
+    monkeypatch.setattr(probe, '_memory_summary', lambda actor, stage: events.append(stage))
+    if failure:
+        with pytest.raises(RuntimeError, match=failure if failure == 'backward' else 'weight sync'):
+            probe._sync_and_replay_actor_batch(batch)
+        assert events == ['connect', 'build', 'sync'] + (['forward_backward'] if failure == 'backward' else [])
+        assert 'PASSED' not in capsys.readouterr().out
+    else:
+        probe._sync_and_replay_actor_batch(batch)
+        assert events == ['connect', 'build', 'sync', 'forward_backward', 'forward_backward',
+                          'clip_grad_and_step', 'after_optimizer_step']
+        assert 'PASSED weight sync + actor batch replay' in capsys.readouterr().out
+
+
+def test_sync_replay_requires_existing_ray_address(real_batch, monkeypatch):
+    from cookbook.rl.grpo import dsv4_lora_npu as npu
+
+    _, batch = real_batch
+    monkeypatch.delenv('RAY_ADDRESS', raising=False)
+    monkeypatch.setattr(npu, 'build_workers', lambda **kw: pytest.fail('Reject missing Ray address before loading'))
+    with pytest.raises(ValueError, match='RAY_ADDRESS'):
+        probe._sync_and_replay_actor_batch(batch)

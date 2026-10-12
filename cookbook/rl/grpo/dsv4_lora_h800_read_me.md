@@ -73,6 +73,82 @@ NPU 还调用 `torch.npu.empty_cache()` 归还空闲缓存。默认每桶 3 GiB�
 先让旧 GRPO 任务及其 actor、sampler 退出，再重新启动 `run`。健康的 Ray
 集群可以复用，但已创建的 worker 不会因替换文件而自动更新。
 
+### 检查同步桶是否真正回收
+
+仅看 `send_buf=None` 或后续 HCCL 申请失败，不能判断桶的显存是否
+已经归还。将当前 `src/twinkle/checkpoint_engine/hccl_checkpoint_engine.py`
+和 `cookbook/rl/grpo/dsv4_actor_only_preflight.py` 替换到所有参与节点，
+让旧任务及其 worker 退出。不需重启健康的 Ray 集群或重装包。
+已经保存 `report/actor_batch_0.json` 时，直接进行一次真实权重同步后重放，
+不再生成回答、不重新计算 reward。仍加载 vLLM 基座，以保留真实的
+HCCL → SHM → vLLM 安装 → finalize 链路；不是只创建空桶模拟释放。
+以四节点全层、两个 TP8 接收实例为例，将 `ACTOR_REPLAY_BATCH` 换成已有文件：
+
+```bash
+cd /opt/twinkle
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export PYTHONPATH="/opt/twinkle/src:/opt/twinkle${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONNOUSERSITE=1 TWINKLE_TRUST_REMOTE_CODE=1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export LOG_LEVEL=INFO RAY_DEDUP_LOGS=0
+export RAY_ADDRESS=11.173.4.131:6379
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export NETWORK_IFACE=bond0 GLOO_SOCKET_IFNAME=bond0 HCCL_SOCKET_IFNAME=bond0
+export HCCL_CONNECT_TIMEOUT=7200 HCCL_EXEC_TIMEOUT=0
+export ROLLOUT_MODEL=/highcode/shared_data/DeepSeek-V4-Flash-0731-W8A8-HW/DeepSeek-V4-Flash-0731-W8A8-HW_20260803_01
+export ROLLOUT_START_RANK=32 ROLLOUT_TP=8 ROLLOUT_DP=2
+export MAX_MODEL_LEN=8192 MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=4096
+export GPU_MEMORY_UTILIZATION=0.85 TWINKLE_VLLM_BUCKET_SIZE_MB=64
+export TWINKLE_CKPT_MEMORY_AUDIT=1 ACTOR_REPLAY_SYNC=1
+export PREFLIGHT_RPC_TIMEOUT=900 PREFLIGHT_SYNC_BEFORE_GATHER=0
+export ACTOR_REPLAY_BATCH=/highcode/shared_data/dsv4_logs/full_实际目录/report/actor_batch_0.json
+test -f "$ACTOR_REPLAY_BATCH"
+mkdir -p /highcode/shared_data/dsv4_logs
+PROBE_DIR=$(mktemp -d /highcode/shared_data/dsv4_logs/sync_replay_XXXXXXXX)
+set -o pipefail
+/usr/local/python3.12.13/bin/python3 -u \
+  -m cookbook.rl.grpo.dsv4_actor_only_preflight \
+  2>&1 | tee "$PROBE_DIR/actor.log"
+```
+
+训练侧配置、回答 token、logprob、advantage 和微批边界全部来自保存的 batch，
+不需设置数据集、`MAX_NEW_TOKENS` 或 `BATCH_SIZE`。若故障时使用四个接收实例，
+保持 `ROLLOUT_DP=4`。该命令前台运行，日志写入 `$PROBE_DIR/actor.log`。
+先用 `training_step=0` 的 capture；重放初始化新的 adapter/optimizer，
+不会恢复后续步的训练权重和优化器状态。取同一个 PID/rank 的
+`[CKPT-MEM]` 和训练前后的 `[ACTOR-PROBE]` 显存记录对比，例如此前出错的 rank 9：
+
+```bash
+LOG="$PROBE_DIR/actor.log"
+grep -E '\[CKPT-MEM\]|"stage": "(before_forward|token_gather)\.memory"' "$LOG" \
+  | grep '"rank": 9'
+```
+
+所有 `*_bytes` 都是字节，除以 `1073741824` 得到 GiB；默认两个桶合计
+`6442450944` 字节（约 6 GiB），以日志的实际桶大小为准。比较：
+
+| 阶段 | 要确认的内容 |
+| --- | --- |
+| `prepare.before_allocate` / `prepare.after_allocate` | 本次分配桶实际增加了多少 allocated |
+| `finalize.skipped` | 若 `rebuild_group=false` 且桶仍在，这个 worker 实际未执行释放 |
+| `finalize.before_release` / `finalize.after_drop_refs` | 桶字段归零时，allocated 是否也下降了对应大小 |
+| `finalize.after_empty_cache` | reserved 是否下降，驱动可用 free 是否增加 |
+| `before_forward.memory` / `token_gather.memory` | 桶回收后，训练是否又占用/缓存了显存 |
+
+桶字段归零但 allocated 未下降，优先查是否仍有 tensor/view 持有底层
+存储。allocated 已降，但 `empty_cache()` 后 reserved/free 仍无相应改善，
+需检查缓存块是否真正归还；不能把清除 Python 字段当成物理显存释放。
+若释放后已经回到近似分配桶前的状态，只在 token 收集前又占满，再查
+训练阶段的活跃分配和缓存。`free_bytes` 是驱动层可用显存，也受同卡
+其他进程影响，不是仅本 actor 的统计。
+
+此开关不改 HCCL/Gloo 后端、不调用额外 `empty_cache()` 或 NPU 同步。
+`finalize.before_release` 利用原来已有的同步点，训练阶段记录不新增
+设备 barrier。成功结束后仍调用现有显存汇总。诊断结束后取消
+`TWINKLE_CKPT_MEMORY_AUDIT`。不设置 `ACTOR_REPLAY_SYNC=1` 时，重放仍是
+原来的 actor-only 路径，不加载 vLLM、不进行权重同步。
+
 ## NPU 全层：保存真实训练 batch，再单独重放 actor
 
 当合成输入的 actor-only 测试通过、真实 GRPO 仍在训练阶段卡住时，先保存真实输入，

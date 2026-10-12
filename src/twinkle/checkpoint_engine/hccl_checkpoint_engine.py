@@ -8,7 +8,9 @@ reliable ZMQ REQ/REP control channel for bucket metadata handshakes.
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import time
 import torch
 import zmq
@@ -119,6 +121,30 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.socket.connect(address)
         logger.debug(f'ZMQ REQ client connected to {address}')
 
+    def _audit_memory(self, stage):
+        """Optional counters only: do not retain tensors or synchronize here."""
+        if os.environ.get('TWINKLE_CKPT_MEMORY_AUDIT', '0') != '1':
+            return
+        free, total = torch.npu.mem_get_info(self.device)
+        record = {
+            'stage': stage,
+            'host': socket.gethostname(),
+            'pid': os.getpid(),
+            'rank': int(os.environ.get('RANK', '-1')),
+            'worker': os.environ.get('WORKER_NAME', ''),
+            'device': self.device,
+            'checkpoint_rank': self.rank,
+            'rebuild_group': self.rebuild_group,
+            'prepared': self._prepared,
+            'allocated_bytes': torch.npu.memory_allocated(self.device),
+            'reserved_bytes': torch.npu.memory_reserved(self.device),
+            'free_bytes': free,
+            'total_bytes': total,
+            'send_buf_bytes': self.send_buf.numel() * self.send_buf.element_size() if self.send_buf is not None else 0,
+            'recv_buf_bytes': self.recv_buf.numel() * self.recv_buf.element_size() if self.recv_buf is not None else 0,
+        }
+        logger.info('[CKPT-MEM] %s', json.dumps(record))
+
     def prepare(self) -> MasterMetadata | None:
         if self._prepared:
             if self.is_master:
@@ -130,8 +156,10 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 )
             return None
 
+        self._audit_memory('prepare.before_allocate')
         self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
         self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
+        self._audit_memory('prepare.after_allocate')
 
         if self.is_master:
             self._start_zmq_server()
@@ -148,9 +176,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
     def finalize(self):
         if not self.rebuild_group or not self._prepared:
+            self._audit_memory('finalize.skipped')
             return
 
         torch.npu.synchronize(self.device)
+        self._audit_memory('finalize.before_release')
         if self.pyhccl is not None:
             if self.pyhccl.available:
                 self.pyhccl.hccl.hcclCommDestroy(self.pyhccl.comm)
@@ -176,9 +206,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.recv_buf = None
         self._prepared = False
         self._group_initialized = False
+        self._audit_memory('finalize.after_drop_refs')
         # HCCL allocates outside PyTorch; return idle cached blocks to the driver
         # before actor training starts, not merely the Python tensor references.
         torch.npu.empty_cache()
+        self._audit_memory('finalize.after_empty_cache')
 
     @classmethod
     def build_topology(

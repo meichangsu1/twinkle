@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Exercise the full DSV4 GRPO actor without rollout or weight synchronization.
+"""Exercise the full DSV4 GRPO actor without generating new rollout tokens.
 
 By default completion token IDs and advantages are synthetic. Set
 ACTOR_REPLAY_BATCH to a batch saved with ACTOR_DIAGNOSTICS=1 to replay actual
@@ -7,6 +7,9 @@ features, rollout logprobs and advantages without running rollout again.
 Replay preserves microbatch boundaries and does not synchronize NPU memory
 between microbatches. It initializes a fresh adapter/optimizer, not a saved
 training state; start with a capture of training_step=0.
+ACTOR_REPLAY_SYNC=1 loads the usual Ascend rollout workers and performs one
+real checkpoint update before replay. It tests sync-buffer release without
+calling sample(); the default actor-only mode does not synchronize weights.
 
 ACTOR-PROBE records identify each rank's last completed stage. The diagnostic
 RPC timeout defaults to 900 seconds (PREFLIGHT_RPC_TIMEOUT); model setup is
@@ -48,6 +51,15 @@ def _trace(stage, **details):
     print('[ACTOR-PROBE] ' + json.dumps(record), flush=True)
 
 
+def _trace_memory(stage):
+    """Observe allocator/driver counters without adding a device barrier."""
+    if os.environ.get('TWINKLE_CKPT_MEMORY_AUDIT', '0') != '1':
+        return
+    free, total = torch.npu.mem_get_info()
+    _trace(stage, allocated_bytes=torch.npu.memory_allocated(), reserved_bytes=torch.npu.memory_reserved(),
+           free_bytes=free, total_bytes=total)
+
+
 @contextmanager
 def _stage(name, **details):
     _trace(name + '.enter', **details)
@@ -76,6 +88,7 @@ class PreflightActor(MultiLoraTransformersModel):
     def forward_backward(self, **kwargs):
         optimizer_config = self.optimizer_group[kwargs['adapter_name']]
         with _stage('forward_backward', microbatch=optimizer_config.cur_step + 1):
+            _trace_memory('before_forward.memory')
             return super().forward_backward(**kwargs)
 
     @remote_function()
@@ -100,6 +113,7 @@ class PreflightActor(MultiLoraTransformersModel):
                 with _stage('pre_token_gather_sync'):
                     torch.npu.synchronize()
             with _stage('token_gather', local_num_tokens=value, **_group_details(group)):
+                _trace_memory('token_gather.memory')
                 return original_gather(value, mesh, group)
 
         def traced_norm(*args, **options):
@@ -296,9 +310,29 @@ def _replay_actor_batch(actor, batch):
     _probe_call(actor, 'clip_grad_and_step', adapter_name=TENANT)
 
 
+def _sync_and_replay_actor_batch(batch):
+    """Use the real receive/install/finalize path, never generate new tokens."""
+    from .dsv4_lora_npu import build_workers, connect_existing_ray_if_configured
+
+    if not os.environ.get('RAY_ADDRESS', '').strip():
+        raise ValueError('Set RAY_ADDRESS to the existing multi-node Ray head')
+    connect_existing_ray_if_configured()
+    actor, sampler, manager = build_workers(model_cls=PreflightActor)
+    start = time.monotonic()
+    with _stage('driver.weight_sync'):
+        manager.sync_weights(merge_and_sync=False, lora_only=True, adapter_name=TENANT)
+    _replay_actor_batch(actor, batch)
+    _memory_summary(actor, 'after_optimizer_step')
+    print(f'PASSED weight sync + actor batch replay in {time.monotonic() - start:.1f}s; '
+          'fresh adapter/optimizer, no new rollout or reward-quality validation', flush=True)
+
+
 def main():
     replay_path = os.environ.get('ACTOR_REPLAY_BATCH')
     replay = _read_actor_batch(replay_path) if replay_path else None
+    sync_replay = os.environ.get('ACTOR_REPLAY_SYNC', '0') == '1'
+    if sync_replay and replay is None:
+        raise ValueError('ACTOR_REPLAY_SYNC=1 requires ACTOR_REPLAY_BATCH')
     if replay is not None:
         # Restore actor settings only. Ray address, devices and network remain
         # the launcher's responsibility; no dataset/tokenizer re-encoding occurs.
@@ -307,6 +341,9 @@ def main():
               'fresh adapter/optimizer, no per-microbatch NPU synchronization', flush=True)
         if os.environ.get('PREFLIGHT_SYNC_BEFORE_GATHER', '0') != '0':
             raise ValueError('Set PREFLIGHT_SYNC_BEFORE_GATHER=0 to preserve GRPO replay timing')
+    if sync_replay:
+        _sync_and_replay_actor_batch(replay)
+        return
     ensure_npu_backend()
     if not torch.npu.is_available():
         raise RuntimeError('NPU runtime is unavailable on the driver')

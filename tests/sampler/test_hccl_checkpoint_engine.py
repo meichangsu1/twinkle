@@ -1,5 +1,6 @@
 """CPU lifecycle tests; no real HCCL transfer or NPU memory validation."""
 import importlib
+import json
 import types
 import weakref
 
@@ -15,6 +16,7 @@ mixin_module = importlib.import_module('twinkle.checkpoint_engine.mixin')
 
 @pytest.fixture
 def runtime(monkeypatch):
+    monkeypatch.delenv('TWINKLE_CKPT_MEMORY_AUDIT', raising=False)
     events, buffers, communicators = [], [], []
     zeros, tensor = torch.zeros, torch.tensor
 
@@ -60,6 +62,84 @@ def runtime(monkeypatch):
     monkeypatch.setattr(HCCLCheckpointEngine, '_connect_zmq_client', lambda engine, metadata: open_channel(engine))
     monkeypatch.setattr(hccl_module, 'stateless_init_process_group', init_group)
     return types.SimpleNamespace(events=events, buffers=buffers, communicators=communicators)
+
+
+def _install_memory_audit(monkeypatch, runtime, *, keep_view=False):
+    """Model active vs cached allocations; these are not real NPU counters."""
+    records = []
+    cache = {'after_empty_cache': None}
+
+    def allocated():
+        return sum(buffer.numel() * buffer.element_size() for ref in runtime.buffers
+                   if (buffer := ref()) is not None)
+
+    def reserved():
+        return cache['after_empty_cache'] if cache['after_empty_cache'] is not None else len(runtime.buffers) * 32
+
+    def empty_cache():
+        cache['after_empty_cache'] = allocated()
+        runtime.events.append(('empty_cache',))
+        if not keep_view:
+            assert allocated() == 0
+
+    def log(format, *args):
+        if format.startswith('[CKPT-MEM]'):
+            records.append(json.loads(args[0]))
+            runtime.events.append(('audit', records[-1]['stage']))
+
+    monkeypatch.setenv('TWINKLE_CKPT_MEMORY_AUDIT', '1')
+    monkeypatch.setenv('RANK', '9')
+    monkeypatch.setattr(torch.npu, 'memory_allocated', lambda device: allocated(), raising=False)
+    monkeypatch.setattr(torch.npu, 'memory_reserved', lambda device: reserved(), raising=False)
+    monkeypatch.setattr(torch.npu, 'mem_get_info', lambda device: (1024 - reserved(), 1024), raising=False)
+    monkeypatch.setattr(torch.npu, 'empty_cache', empty_cache)
+    monkeypatch.setattr(hccl_module.logger, 'info', log)
+    return records
+
+
+def test_memory_audit_distinguishes_dropped_tensors_and_released_cache(monkeypatch, runtime):
+    records = _install_memory_audit(monkeypatch, runtime)
+    engine = HCCLCheckpointEngine(bucket_size=32, rebuild_group=True)
+    engine.prepare()
+    engine.init_process_group(-1, 3, None)
+    engine.finalize()
+
+    assert [record['stage'] for record in records] == [
+        'prepare.before_allocate', 'prepare.after_allocate', 'finalize.before_release',
+        'finalize.after_drop_refs', 'finalize.after_empty_cache']
+    assert [record['allocated_bytes'] for record in records] == [0, 64, 64, 0, 0]
+    assert [record['reserved_bytes'] for record in records] == [0, 64, 64, 64, 0]
+    assert [record['free_bytes'] for record in records] == [1024, 960, 960, 960, 1024]
+    assert records[2]['send_buf_bytes'] == records[2]['recv_buf_bytes'] == 32
+    assert records[3]['send_buf_bytes'] == records[3]['recv_buf_bytes'] == 0
+    assert all(record['rank'] == 9 and record['rebuild_group'] for record in records)
+    assert records[2]['checkpoint_rank'] == -1 and records[3]['checkpoint_rank'] is None
+    assert runtime.events.count(('synchronize', 0)) == 1  # Only the pre-existing finalize barrier.
+    assert runtime.events.index(('synchronize', 0)) < runtime.events.index(('audit', 'finalize.before_release'))
+
+
+def test_memory_audit_exposes_skipped_finalize(monkeypatch, runtime):
+    records = _install_memory_audit(monkeypatch, runtime)
+    engine = HCCLCheckpointEngine(bucket_size=32, rebuild_group=False)
+    engine.prepare()
+    engine.finalize()
+    assert records[-1]['stage'] == 'finalize.skipped'
+    assert not records[-1]['rebuild_group']
+    assert records[-1]['allocated_bytes'] == 64
+    assert records[-1]['send_buf_bytes'] == records[-1]['recv_buf_bytes'] == 32
+    assert not any(event[0] in ('synchronize', 'empty_cache') for event in runtime.events)
+
+
+def test_memory_audit_does_not_claim_zero_allocation_when_view_survives(monkeypatch, runtime):
+    records = _install_memory_audit(monkeypatch, runtime, keep_view=True)
+    engine = HCCLCheckpointEngine(bucket_size=32, rebuild_group=True)
+    engine.prepare()
+    held_view = engine.send_buf[:1]
+    engine.finalize()
+    assert engine.send_buf is None and engine.recv_buf is None
+    assert held_view.numel() == 1
+    assert records[-1]['send_buf_bytes'] == records[-1]['recv_buf_bytes'] == 0
+    assert records[-1]['allocated_bytes'] == records[-1]['reserved_bytes'] == 32
 
 
 @pytest.mark.parametrize('rank', [0, 1, -1])
