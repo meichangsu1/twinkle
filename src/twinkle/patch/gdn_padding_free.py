@@ -1,6 +1,5 @@
 import torch
 import transformers
-from importlib import import_module
 from packaging.version import Version
 from transformers.utils.import_utils import is_flash_linear_attention_available
 from typing import Optional
@@ -9,38 +8,22 @@ from twinkle.patch import Patch
 from twinkle.utils.utils import call_with_supported_kwargs
 
 
-def _is_qwen35_model(hf_config) -> bool:
-    return 'qwen3_5' in getattr(hf_config, 'model_type', '')
-
-
-def _iter_qwen35_class_pairs():
-    class_specs = (
-        (
-            'transformers.models.qwen3_5.modeling_qwen3_5',
-            'Qwen3_5DecoderLayer',
-            'Qwen3_5GatedDeltaNet',
-        ),
-        (
-            'transformers.models.qwen3_5_moe.modeling_qwen3_5_moe',
-            'Qwen3_5MoeDecoderLayer',
-            'Qwen3_5MoeGatedDeltaNet',
-        ),
-    )
-    for module_name, decoder_class_name, gdn_class_name in class_specs:
-        try:
-            modeling_module = import_module(module_name)
-            yield getattr(modeling_module, decoder_class_name), getattr(modeling_module, gdn_class_name)
-        except Exception:
-            continue
-
-
-def _find_qwen35_class_pairs(module: Optional[torch.nn.Module], hf_config, enable_sp: bool):
-    if module is None or enable_sp or not _is_qwen35_model(hf_config):
+def _find_gdn_class_pairs(module: Optional[torch.nn.Module], enable_sp: bool):
+    if module is None or enable_sp:
         return ()
+    supported_names = {'Qwen3_5GatedDeltaNet', 'Qwen3_5MoeGatedDeltaNet'}
     class_pairs = []
-    for decoder_layer_cls, gated_delta_net_cls in _iter_qwen35_class_pairs():
-        if any(isinstance(submodule, gated_delta_net_cls) for submodule in module.modules()):
-            class_pairs.append((decoder_layer_cls, gated_delta_net_cls))
+    for layer in module.modules():
+        gdn = getattr(layer, 'linear_attn', None)
+        if not isinstance(gdn, torch.nn.Module):
+            continue
+        if type(gdn).__name__ not in supported_names:
+            continue
+        # Match concrete class names without inheriting support through the MRO.
+        # No Transformers internal import path is needed.
+        pair = (type(layer), type(gdn))
+        if pair not in class_pairs:
+            class_pairs.append(pair)
     return tuple(class_pairs)
 
 
@@ -136,18 +119,22 @@ def _patch_gdn_kernels_for_cu_seqlens(
 
 class GatedDeltaNetPaddingFreePatch(Patch):
 
+    @staticmethod
+    def is_applicable(module: torch.nn.Module, *, enable_sp: bool = False) -> bool:
+        """Detect supported GatedDeltaNet layers by type, rather than model names."""
+        return bool(_find_gdn_class_pairs(module, enable_sp))
+
     def __call__(self, module, *args, **kwargs):
         del args
-        qwen35_class_pairs = _find_qwen35_class_pairs(
+        gdn_class_pairs = _find_gdn_class_pairs(
             module,
-            kwargs.get('hf_config'),
             bool(kwargs.get('enable_sp', False)),
         )
-        if not qwen35_class_pairs:
+        if not gdn_class_pairs:
             return
         module._twinkle_gdn_padding_free_patched = True
 
-        for decoder_layer_cls, gated_delta_net_cls in qwen35_class_pairs:
+        for decoder_layer_cls, gated_delta_net_cls in gdn_class_pairs:
             if getattr(gated_delta_net_cls, '_twinkle_sp_linear_patched', False):
                 continue
 
@@ -165,7 +152,8 @@ class GatedDeltaNetPaddingFreePatch(Patch):
                     _origin_decoder_forward=origin_decoder_forward,
                     **extra_kwargs,
                 ):
-                    if getattr(layer, 'layer_type', None) != 'linear_attention':
+                    if (getattr(layer, 'layer_type', None) != 'linear_attention'
+                            or extra_kwargs.get('cu_seq_lens_q') is None):
                         return call_with_supported_kwargs(
                             _origin_decoder_forward,
                             layer,
