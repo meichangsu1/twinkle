@@ -91,7 +91,8 @@ python scripts/benchmark_sticky_session.py \
 三个 token 范围分别覆盖固定参数 `--prompt-tokens`、`--append-tokens`、`--max-tokens`。
 初始长度按 episode 采样，追加长度与生成上限按轮采样，均为闭区间内的均匀整数。
 生成上限不是强制输出长度，模型遇到 EOS 仍可提前结束；真实输出长度单独统计。
-上下文容量按各范围最大值校验。
+上下文容量按各范围最大值校验。`--max-model-len` 同时设置引擎的 `max_model_len` 和模板的
+`max_length`，包含输入与生成结果拼接后的完整长度。
 
 `--tool-wait-ms MIN MAX` 在第一轮之后、每轮采样之前模拟工具等待，时长在范围内均匀采样。
 等待发生在调用端线程里，占用一个活跃 episode 名额；此时执行 lease 已释放，会话绑定仍保留。
@@ -148,6 +149,23 @@ python scripts/plot_sticky_session.py /tmp/sticky-session-npu/summary.json
 缺失指标留空；有请求错误或 episode 未完成的测量会被排除，并在图上标注数量。
 仅有部分组或部分 repeat 时仍可画已有结果，缺少配对 B/D 时比值图提示不可用。
 mock 结果显式标记 `SYNTHETIC / MOCK`；中途失败的实验标记 `INCOMPLETE RUN`。
+
+## 失败排查
+
+`Trial failed` 是测量结束后的检查结果，不直接说明引擎错误原因。
+异常信息会分别列出 `sampling_errors`、`active_leases` 和 `session_count`：
+前者非零表示有采样请求失败，后两者非零表示路由清理后仍有残留。
+若有采样错误，终端会打印首个错误及 episode、turn、输入长度、生成上限；
+`summary.json` 的对应 trial 同时保留最多三个 `error_examples`。
+完整逐请求错误始终保存在 `requests.jsonl` 中，可查询：
+
+```bash
+rg '"error"' /path/to/experiment/requests.jsonl
+```
+
+需要引擎侧上下文时，启动命令加 `--worker-logs`，将 Ray worker/引擎日志转发到终端。
+只有看到具体异常后才能区分上下文长度、超时、内存不足或引擎退出等问题；
+不要仅凭汇总检查的报错判断为 sticky 会话泄漏。
 
 ## 输出与解读
 

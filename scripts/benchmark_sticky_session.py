@@ -196,7 +196,7 @@ class BenchmarkWorker:
             'disable_log_stats': False,
             'seed': config['seed'],
         })
-        self.sampler.set_template('Template', model_id=config['model'])
+        self.sampler.set_template('Template', model_id=config['model'], max_length=config['max_model_len'])
         engine = self.sampler.engine.engine
         actual = engine.vllm_config.cache_config.enable_prefix_caching
         if bool(actual) != prefix_cache:
@@ -388,6 +388,9 @@ def summarize(rows, wall_s, status):
     completed = sum(bool(values[-1].get('episode_finished')) for values in by_episode.values())
     result = {
         'wall_s': wall_s, 'requests': len(rows), 'errors': len(rows) - len(success),
+        'error_examples': [{key: row.get(key) for key in
+                            ['episode_id', 'turn', 'input_tokens', 'max_tokens', 'error_type', 'error']}
+                           for row in rows if row.get('error') is not None][:3],
         'completed_episodes': completed, 'episodes_per_s': completed / wall_s,
         'output_tokens_per_s': sum(row['output_tokens'] for row in success) / wall_s,
         'cache_metric_coverage': len(known) / len(success) if success else 0,
@@ -404,6 +407,21 @@ def summarize(rows, wall_s, status):
         values = [row[name] for row in success if row.get(name) is not None]
         result[name] = {'count': len(values), 'p50': percentile(values, 0.5), 'p95': percentile(values, 0.95)}
     return result
+
+
+def check_trial(trial, output_dir):
+    status = trial['router_after']
+    if trial['errors'] or status['active_leases'] or status['session_count']:
+        detail = (f'Trial failed: group={trial["group"]}, repeat={trial["repeat"]}, '
+                  f'concurrency={trial["concurrency"]}, sampling_errors={trial["errors"]}, '
+                  f'active_leases={status["active_leases"]}, session_count={status["session_count"]}. '
+                  f'Details: {output_dir / "requests.jsonl"}')
+        if trial['error_examples']:
+            first = trial['error_examples'][0]
+            detail += (f'\nFirst sampling error: episode={first["episode_id"]}, turn={first["turn"]}, '
+                       f'input_tokens={first["input_tokens"]}, max_tokens={first["max_tokens"]}'
+                       f'\n{first["error"]}')
+        raise RuntimeError(detail)
 
 
 def run_trial(sampler, workload, group, repeat, concurrency, output):
@@ -426,7 +444,8 @@ def run_trial(sampler, workload, group, repeat, concurrency, output):
                 began = time.perf_counter()
                 row = {'group': group, 'repeat': repeat, 'concurrency': concurrency,
                        'session_affinity': affinity, 'prefix_cache': cache, 'episode_id': episode_id,
-                       'turn': turn, 'input_hash': prompt_key(tokens), 'started_s': began - started,
+                       'turn': turn, 'input_hash': prompt_key(tokens), 'input_tokens': len(tokens),
+                       'started_s': began - started,
                        'planned_tool_wait_s': wait_s, 'max_tokens': max_tokens}
                 try:
                     result = sampler.sample([{'input_ids': tokens}], session_ids=session_ids, max_tokens=max_tokens)[0]
@@ -434,6 +453,7 @@ def run_trial(sampler, workload, group, repeat, concurrency, output):
                     row['episode_finished'] = turn == len(episode['prompts']) - 1
                 except Exception as exc:
                     row['error'] = f'{type(exc).__name__}: {exc}'
+                    row['error_type'] = type(exc).__name__
                 finished = time.perf_counter()
                 row.update(finished_s=finished - started, latency_s=finished - began)
                 episode_rows.append(row)
@@ -444,6 +464,7 @@ def run_trial(sampler, workload, group, repeat, concurrency, output):
                 sampler.release_sessions(session_ids)
         return episode_rows
 
+    logged_error = False
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [executor.submit(run_episode, episode) for episode in workload]
         for future in as_completed(futures):
@@ -451,6 +472,13 @@ def run_trial(sampler, workload, group, repeat, concurrency, output):
             rows.extend(episode_rows)
             for row in episode_rows:
                 output.write(json.dumps(row, allow_nan=False) + '\n')
+                if row.get('error') and not logged_error:
+                    output.flush()
+                    logger.error('Sampling failed: group=%s repeat=%s concurrency=%s episode=%s turn=%s '
+                                 'input_tokens=%s max_tokens=%s\n%s',
+                                 group, repeat, concurrency, row['episode_id'], row['turn'],
+                                 row['input_tokens'], row['max_tokens'], row['error'])
+                    logged_error = True
     wall_s = time.perf_counter() - started
     output.flush()
     result = summarize(rows, wall_s, sampler.status())
@@ -515,6 +543,7 @@ def parse_args(argv=None):
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--timeout', type=float, default=300)
     parser.add_argument('--ray-address')
+    parser.add_argument('--worker-logs', action='store_true', help='Forward Ray worker/engine logs to the driver.')
     parser.add_argument('--output-dir', type=Path, required=True,
                         help='New directory; existing results are not overwritten.')
     args = parser.parse_args(argv)
@@ -569,7 +598,7 @@ def main(argv=None):
     (args.output_dir / 'config.json').write_text(json.dumps(manifest, indent=2) + '\n')
     try:
         ray.init(address=args.ray_address, namespace=f'sticky-benchmark-{time.time_ns()}',
-                 include_dashboard=False, log_to_driver=False,
+                 include_dashboard=False, log_to_driver=args.worker_logs,
                  **(local_ray_options(config) if not args.ray_address else {}))
         resources = ray.available_resources()
         resource = 'NPU' if args.device == 'npu' else 'GPU'
@@ -607,9 +636,7 @@ def main(argv=None):
                                             args.backend, group, concurrency, repeat)
                                 trial = run_trial(sampler, workload, group, repeat, concurrency, output)
                                 manifest['trials'].append(trial)
-                                status = trial['router_after']
-                                if trial['errors'] or status['active_leases'] or status['session_count']:
-                                    raise RuntimeError('Trial failed or leaked routing state; inspect requests.jsonl')
+                                check_trial(trial, args.output_dir)
                                 if (GROUPS[group][0] and args.max_sessions >= min(concurrency, args.episodes)
                                         and trial['worker_switches']):
                                     raise RuntimeError('Sticky routing changed replicas while bindings remain valid')

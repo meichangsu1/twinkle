@@ -10,6 +10,7 @@ import pytest
 from scripts.benchmark_sticky_session import (
     BenchmarkWorker,
     build_workload,
+    check_trial,
     comparisons,
     local_ray_options,
     parse_args,
@@ -53,7 +54,8 @@ def test_variable_workload_freezes_lengths_budgets_and_waits_with_one_seed():
 
 
 @pytest.mark.parametrize('fail_turn', [None, 1])
-def test_replay_preserves_plan_and_session_but_releases_execution_during_tool_wait(monkeypatch, fail_turn):
+def test_replay_preserves_plan_and_session_but_releases_execution_during_tool_wait(
+        monkeypatch, fail_turn, tmp_path, caplog):
     from io import StringIO
 
     import scripts.benchmark_sticky_session as benchmark
@@ -110,8 +112,20 @@ def test_replay_preserves_plan_and_session_but_releases_execution_during_tool_wa
         assert [row['max_tokens'] for row in rows] == workload[0]['max_tokens'][:len(calls)]
         assert result['planned_tool_wait_s'] == pytest.approx(sum(waits))
         if fail_turn is None:
+            check_trial(result, tmp_path)
             assert result['episode_latency_p95_s'] == pytest.approx(0.036)
             assert result['latency_s']['p95'] == pytest.approx(0.01)
+            assert result['error_examples'] == []
+        else:
+            assert result['error_examples'] == [{
+                'episode_id': 'episode', 'turn': 1, 'input_tokens': 2, 'max_tokens': 4,
+                'error_type': 'RuntimeError', 'error': 'RuntimeError: planned failure',
+            }]
+            with pytest.raises(RuntimeError, match='sampling_errors=1, active_leases=0, session_count=0') as error:
+                check_trial(result, tmp_path)
+            assert 'episode=episode, turn=1, input_tokens=2, max_tokens=4' in str(error.value)
+            assert 'planned failure' in str(error.value)
+            assert 'Sampling failed:' in caplog.text and 'planned failure' in caplog.text
         return [(tokens, budget) for tokens, budget, _ in calls], waits
 
     assert replay('B') == replay('D')
@@ -148,6 +162,7 @@ def test_summary_uses_token_weighted_cache_hits_and_only_completed_episode_laten
     assert result['episodes_per_s'] == 0.5
     assert result['episode_latency_p95_s'] == 1.0
     assert result['errors'] == 1
+    assert result['error_examples'][0]['error'] == 'failed'
     assert result['engine_ttft_s'] == {'count': 0, 'p50': None, 'p95': None}
     rows[0]['cached_tokens'] = None
     assert summarize(rows, 2.0, {})['cache_hit_fraction'] is None
@@ -158,18 +173,35 @@ def test_comparisons_exclude_failed_trials():
                         {'group': 'D', 'repeat': 0, 'concurrency': 2, 'errors': 0}]) == []
 
 
-def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeypatch):
+@pytest.mark.parametrize('leases,sessions', [(1, 0), (0, 1)])
+def test_trial_error_distinguishes_routing_leak_from_sampling_failure(tmp_path, leases, sessions):
+    result = {'group': 'D', 'repeat': 0, 'concurrency': 8, 'errors': 0, 'error_examples': [],
+              'router_after': {'active_leases': leases, 'session_count': sessions}}
+    with pytest.raises(RuntimeError) as error:
+        check_trial(result, tmp_path)
+    assert f'sampling_errors=0, active_leases={leases}, session_count={sessions}' in str(error.value)
+    assert 'First sampling error' not in str(error.value)
+
+
+@pytest.mark.parametrize('prompt_length,output_length', [(3, 1), (8192, 63)])
+def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeypatch, prompt_length, output_length):
     import asyncio
 
     import ray
 
     import twinkle.infra as infra
     import twinkle.sampler.vllm_sampler as sampler_module
+    from twinkle.template import Template
+
+    tokens = list(range(prompt_length))
+    completion = [4] * output_length
+    model_limit = 12288 if prompt_length > 128 else 128
+    output_limit = output_length + 2
 
     async def generate(*args, **kwargs):
         yield SimpleNamespace(
-            request_id='engine-generated-id', prompt_token_ids=[1, 2, 3], num_cached_tokens=2,
-            outputs=[SimpleNamespace(token_ids=[4])],
+            request_id='engine-generated-id', prompt_token_ids=tokens, num_cached_tokens=2,
+            outputs=[SimpleNamespace(token_ids=completion)],
             metrics=SimpleNamespace(first_token_latency=0.1, scheduled_ts=10.0, first_token_ts=10.05),
         )
 
@@ -183,16 +215,22 @@ def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeyp
                     enable_prefix_caching=engine_args['enable_prefix_caching'])),
             ))
 
-        def set_template(self, *args, **kwargs):
-            pass
+        def set_template(self, template_cls, **kwargs):
+            # Exercise the real post-generation concat/check pipeline without downloading a tokenizer.
+            self.template = Template.__new__(Template)
+            self.template.max_length = kwargs.get('max_length', 8192)
+            self.template.truncation_strategy = 'raise'
 
         def sample(self, inputs, sampling_params):
-            assert sampling_params.max_tokens == 3
+            assert sampling_params.max_tokens == output_limit
             async def drain():
                 outputs = [output async for output in self.engine.engine.generate()]
-                assert outputs[-1].outputs[0].token_ids == [4]
+                assert outputs[-1].outputs[0].token_ids == completion
+                feature = self.template.concat_input_feature(inputs[0], completion)
+                assert len(feature['input_ids']) == len(feature['labels']) == prompt_length + output_length
+                assert feature['input_ids'] == tokens + completion
                 return [SimpleNamespace(prompt_token_ids=inputs[0]['input_ids'],
-                                        sequences=[SimpleNamespace(tokens=[4])])]
+                                        sequences=[SimpleNamespace(tokens=completion)])]
 
             return asyncio.run(drain())
 
@@ -202,13 +240,13 @@ def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeyp
     monkeypatch.setattr(infra, 'initialize', lambda **kwargs: None)
     monkeypatch.setattr(sampler_module, 'vLLMSampler', FakeSampler)
     worker = BenchmarkWorker({'backend': 'vllm', 'device': 'cuda', 'model': 'unused', 'tensor_parallel_size': 1,
-                              'gpu_memory_utilization': 0.5, 'max_model_len': 128, 'seed': 0,
-                              'max_tokens': 8}, True)
-    result = asyncio.run(worker._twinkle_async_sample([{'input_ids': [1, 2, 3]}], max_tokens=3))[0]
+                              'gpu_memory_utilization': 0.5, 'max_model_len': model_limit, 'seed': 0,
+                              'max_tokens': 128}, True)
+    result = asyncio.run(worker._twinkle_async_sample([{'input_ids': tokens}], max_tokens=output_limit))[0]
     assert result['engine_request_id'] == 'engine-generated-id'
     assert result['cached_tokens'] == 2
     assert result['engine_prefill_s'] == pytest.approx(0.05)
-    assert result['output_tokens'] == 1
+    assert result['output_tokens'] == output_length
     assert result['metrics_source'] == 'vllm_request_output'
     assert worker.observations == {} and worker.active == 0
     assert worker.info()['device_ids'] == ['2']
