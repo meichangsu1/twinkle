@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import re
+import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 from twinkle.data_format import Trajectory
@@ -158,10 +159,15 @@ class MultiTurnRollout(Rollout):
     Per-call overrides via ``**kwargs``:
         * ``sampling_params``: :class:`SamplingParams` for every episode.
         * ``response_callback``: chooses a backend for each assistant turn and
-          returns one :class:`SampledSequence`.
+          returns one :class:`SampledSequence`. Its ``adapter_kwargs`` contains
+          backend call options, including routing IDs, and is read-only.
         * ``tool_manager``: a single :class:`ToolManager` or a 1:1 list.
         * ``adapter_path`` / ``use_base_model``: see ``__init__``.
         * ``followup_fn``: see ``__init__``.
+        * ``session_affinity``: defaults to True for capable samplers. Each episode
+          prepares its own ``adapter_kwargs`` once, including ``session_ids``, and
+          reuses it across turns. Callbacks forward it to ``sample()``; exit releases
+          bindings without clearing prefix caches.
     """
 
     def __init__(
@@ -184,6 +190,7 @@ class MultiTurnRollout(Rollout):
         response_callback: Optional[ResponseCallback] = None,
         api_appended_as: Literal['demonstration', 'context'] = 'demonstration',
         api_kwargs: Optional[Dict[str, Any]] = None,
+        session_affinity: bool = True,
     ):
         super().__init__()
         if isinstance(sampler, (API, APISampler)):
@@ -247,6 +254,7 @@ class MultiTurnRollout(Rollout):
         # forward-tunnel alternative to ``ExternalRollout``'s reverse endpoint;
         # both stay selectable and general.
         self.harness = harness
+        self.session_affinity = session_affinity
         # A LoRA directory on disk, forwarded to every sample call. Training syncs
         # its adapter into the sampler directly, but evaluating a saved one has no
         # such channel: without this, an eval script would silently measure the
@@ -358,6 +366,7 @@ class MultiTurnRollout(Rollout):
             'tool_managers': self._broadcast(kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
             'followup_fn': kwargs.get('followup_fn', self.followup_fn),
             'harnesses': self._resolve_harness(kwargs.get('harness', self.harness), n),
+            'session_affinity': kwargs.get('session_affinity', self.session_affinity),
         }
 
     def _resolve_harness(self, harness, n: int) -> List[Any]:
@@ -385,6 +394,20 @@ class MultiTurnRollout(Rollout):
         return TurnLedger(self.template, label=label, max_tokens=self.max_trajectory_tokens)
 
     def _run_one(self, trajectory: Trajectory, index: int, ctx: Dict[str, Any]) -> Trajectory:
+        sample = getattr(type(self.sampler), 'sample', None)
+        enabled = ctx['session_affinity'] and getattr(sample, '_supports_session_affinity', False)
+        session_id = uuid.uuid4().hex if enabled else None
+        adapter_kwargs = dict(ctx['adapter_kwargs'])
+        if enabled:
+            adapter_kwargs['session_ids'] = [session_id]
+        episode_ctx = dict(ctx, adapter_kwargs=adapter_kwargs)
+        try:
+            return self._run_with_harness(trajectory, index, episode_ctx)
+        finally:
+            if session_id is not None:
+                self.sampler.release_sessions([session_id])
+
+    def _run_with_harness(self, trajectory: Trajectory, index: int, ctx: dict[str, Any]) -> Trajectory:
         # A harness from a pool is leased for the episode and returned after, so
         # its per-episode state (an agent's memory, say) never leaks into the
         # next one. Anything else is used as passed.

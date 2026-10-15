@@ -251,6 +251,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         *,
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
+        session_ids: list[str | None] | None = None,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -261,6 +262,10 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
 
             sampling_params: Sampling parameters. ``num_samples`` on these controls how many
                 completions are generated per prompt.
+
+            session_ids: Optional routing IDs aligned with inputs, consumed by the
+                continuous-work dispatch layer. Not passed to the template or engine;
+                local mode performs no instance routing.
 
             adapter_name: LoRA adapter name to sample with; must already be registered.
 

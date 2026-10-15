@@ -61,11 +61,43 @@ results = rollout(trajectories)
 | `api_kwargs` | `Dict` | 传给每次 API 调用的请求字段。 |
 | `tool_manager` | `ToolManager` | 工具分发器。也可以按调用传入。 |
 | `sampling_params` | `SamplingParams` | 默认采样参数。 |
+| `session_affinity` | `bool` | 默认开启；rollout 为支持的 sampler 管理会话 ID，与回调身份无关，可按调用覆盖。 |
 | `max_turns` | `int` | 每个轨迹的最大轮次（默认：6）。 |
 | `max_trajectory_tokens` | `int` | 最大总 token 长度；超出则截断轨迹。 |
 | `trace_dir` | `str` | 每轨迹 JSON 跟踪文件的目录。 |
 | `trace_callback` | `Callable` | 决定是否存储轨迹跟踪。 |
 | `success_callback` | `Callable` | 决定文件名前缀（`ok-` 或 `fail-`）。 |
+
+### 会话保持
+
+`MultiTurnRollout` 默认启用 `session_affinity=True`。sampler 声明支持时，rollout 为每条 episode
+创建唯一会话 ID，并准备一次独立的 `adapter_kwargs`，其中包含 `session_ids=[session_id]`。
+所有轮次和 follow-up 复用这份参数，回调按只读方式使用。
+
+默认回调和自定义回调都通过 `sampler.sample(..., **adapter_kwargs)` 转发参数，不新增回调参数，
+也不按回调身份限制会话保持。`adapter_kwargs` 承载的是后端调用参数，包括 adapter、partial rollout
+和路由选项。自定义回调未转发时，不保证该回调的采样具备会话保持。
+分发层消费 `session_ids`，不向 `InputFeature` 添加字段，也不改变 token、logprob 或训练结果。
+API-only 和旧 sampler 保持原有调用方式，混合后端中的 `APISampler` 不把采样侧参数传给外部 API。
+
+同一采样池的多个调用端通过共享路由 actor 保持绑定。有效绑定优先于负载均衡，但不独占实例。
+轨迹正常结束、截断或异常时解除绑定。采样调用退出时释放占用；第一版不保证超时后仍在运行的
+远程生成继续计入路由负载。
+
+会话表是有上限的 LRU，默认最多 10000 条。满表时可淘汰无在途生成的绑定，包括等待工具的会话；
+全部绑定都在执行时，新请求按普通负载均衡处理，本次不建立绑定。
+因此保持会话只提高缓存复用机会，不保证一直命中。
+
+```python
+rollout = MultiTurnRollout(sampler, template, session_affinity=True)
+results = rollout(trajectories)  # 不需要调用方传 session_ids
+# 可在构造时或本次调用关闭
+results = rollout(trajectories, session_affinity=False)
+```
+
+vLLM 的 prefix cache 仍需通过 `engine_args={"enable_prefix_caching": True}` 显式开启。
+解除绑定不清空引擎缓存，也不改变权重同步流程。
+第一版不调整 `submit_generation()`、TQ 或 PD 实例内部路由。
 
 ### 输出字段
 

@@ -331,6 +331,31 @@ class FakeSampler:
     sample._enable_continous_work = True
 
 
+class RoutingFakeSampler(FakeSampler):
+
+    def __init__(self, template):
+        super().__init__(template)
+        self.sessions_seen = []
+        self.released = []
+        self.fail_generation = False
+
+    def sample(self, pifs, sampling_params=None, *, session_ids=None):
+        sessions = session_ids if session_ids is not None else [None] * len(pifs)
+        assert all('session_id' not in pif and '_twinkle_routing' not in pif for pif in pifs)
+        with self._lock:
+            self.sessions_seen.append((self._key_of(pifs[0]), sessions[0]))
+        if self.fail_generation:
+            raise RuntimeError('routed generation failed')
+        return super().sample(pifs, sampling_params)
+
+    sample._enable_continous_work = True
+    sample._supports_session_affinity = True
+
+    def release_sessions(self, ids):
+        with self._lock:
+            self.released.extend(ids)
+
+
 class EchoTool(Tool):
     """Echoes its arguments as a JSON string."""
 
@@ -434,6 +459,157 @@ def _user_traj(text: str = 'hi') -> dict[str, Any]:
 
 def _tool_call_text(name: str, arguments: dict[str, Any]) -> str:
     return '<tool_call>' + json.dumps({'name': name, 'arguments': arguments}) + '</tool_call>'
+
+
+def _forward_sampler_response(sampler, api, params, *, input_feature, adapter_kwargs, trajectory,
+                              trajectory_index, turn, followups):
+    return sampler.sample([input_feature], params, **adapter_kwargs)[0].sequences[0]
+
+
+def test_routing_parallel_episodes_keep_ids_and_token_alignment(template, tool_manager):
+    sampler = RoutingFakeSampler(template)
+    for key in ['A', 'B']:
+        for text in [_tool_call_text('search', {'q': key}), 'done']:
+            tokens = template.tokenizer.encode(text + '<|im_end|>')
+            sampler.queue_for(key, text, logprobs=[[(token, -0.5)] for token in tokens])
+    inputs = [_user_traj('A'), _user_traj('B')]
+    rollout = MultiTurnRollout(sampler, template, tool_manager=tool_manager)
+    outputs = rollout(inputs)
+    sessions = {}
+    for key, sid in sampler.sessions_seen:
+        assert sid
+        sessions.setdefault(key, set()).add(sid)
+    assert len(sessions['A']) == len(sessions['B']) == 1
+    assert sessions['A'] != sessions['B']
+    assert set(sampler.released) == sessions['A'] | sessions['B']
+    for output in outputs:
+        assert len(output['logprobs']) == _count_trainable(output['labels'])
+        assert '_twinkle_routing' not in output
+    assert all('_twinkle_routing' not in value for value in inputs)
+
+
+def test_routing_followup_reuses_session(template):
+    sampler = RoutingFakeSampler(template)
+    sampler.queue('first')
+    sampler.queue('second')
+    rollout = MultiTurnRollout(sampler, template,
+                              followup_fn=lambda trajectory, count: 'continue' if count == 0 else None)
+    output = rollout([_user_traj()])[0]
+    ids = [sid for _, sid in sampler.sessions_seen]
+    assert len(ids) == 2 and ids[0] == ids[1]
+    assert sampler.released == [ids[0]]
+    assert output['followups'] == 1
+
+
+@pytest.mark.parametrize('failed,reason', [(True, 'stop'), (False, 'length')])
+@pytest.mark.parametrize('callback', [None, _forward_sampler_response], ids=['default', 'custom'])
+def test_routing_cleanup_on_error_and_truncation(template, failed, reason, callback):
+    sampler = RoutingFakeSampler(template)
+    sampler.fail_generation = failed
+    sampler.queue('answer', stop_reason=reason)
+    rollout = MultiTurnRollout(sampler, template, response_callback=callback)
+    if failed:
+        with pytest.raises(RuntimeError, match='routed generation failed'):
+            rollout([_user_traj()])
+    else:
+        assert rollout([_user_traj()])[0]['truncated']
+    assert sampler.released == [sampler.sessions_seen[0][1]]
+
+
+@pytest.mark.parametrize('constructor', [True, False])
+@pytest.mark.parametrize('callback', [None, _forward_sampler_response], ids=['default', 'custom'])
+def test_routing_can_be_disabled(template, constructor, callback):
+    sampler = RoutingFakeSampler(template)
+    sampler.queue('answer')
+    rollout = MultiTurnRollout(sampler, template, session_affinity=not constructor, response_callback=callback)
+    rollout([_user_traj()], **({} if constructor else {'session_affinity': False}))
+    assert sampler.sessions_seen == [('hi', None)]
+    assert sampler.released == []
+
+
+def test_routing_custom_callback_reuses_episode_options_and_isolates_parallel_episodes(template):
+    sampler = RoutingFakeSampler(template)
+    for key in ['A', 'B']:
+        sampler.queue_for(key, 'first')
+        sampler.queue_for(key, 'second')
+    options_seen = {0: [], 1: []}
+    started = threading.Barrier(2)
+
+    def callback(sampler, api, params, *, input_feature, adapter_kwargs, trajectory,
+                 trajectory_index, turn, followups):
+        options_seen[trajectory_index].append(adapter_kwargs)
+        if followups == 0:
+            started.wait(timeout=5)
+        return sampler.sample([input_feature], params, **adapter_kwargs)[0].sequences[0]
+
+    rollout = MultiTurnRollout(
+        sampler, template, response_callback=callback,
+        followup_fn=lambda trajectory, count: 'continue' if count == 0 else None,
+    )
+    outputs = rollout([_user_traj('A'), _user_traj('B')])
+    assert [output['followups'] for output in outputs] == [1, 1]
+    for values in options_seen.values():
+        assert len(values) == 2
+        assert values[0] is values[1]
+        assert len(values[0]['session_ids']) == 1
+    first, second = options_seen[0][0], options_seen[1][0]
+    assert first is not second
+    assert first['session_ids'] is not second['session_ids']
+    assert first['session_ids'] != second['session_ids']
+    for key, options in [('A', first), ('B', second)]:
+        assert [sid for seen_key, sid in sampler.sessions_seen if seen_key == key] == options['session_ids'] * 2
+    assert set(sampler.released) == {first['session_ids'][0], second['session_ids'][0]}
+
+
+def test_routing_api_only_request_has_no_sampler_options(template):
+    requests = []
+
+    def api(request, sampling_params, **kwargs):
+        requests.append((request, kwargs))
+        raise RuntimeError('API unavailable')
+
+    result = MultiTurnRollout(template=template, api=api)([_user_traj()])[0]
+    assert result['truncated']
+    assert len(requests) == 1
+    request, options = requests[0]
+    assert options == {}
+    assert set(request) == {'messages'}
+
+
+def test_routing_mixed_api_callback_cleans_session_without_forwarding_ids_to_api(template):
+    from twinkle_agentic.challenger.agentic import _api_followup_response
+
+    sampler = RoutingFakeSampler(template)
+    sampler.queue('first')
+    requests = []
+
+    def api(request, sampling_params, **kwargs):
+        requests.append((request, kwargs))
+        raise RuntimeError('API unavailable')
+
+    rollout = MultiTurnRollout(
+        sampler, template, api=api, response_callback=_api_followup_response,
+        followup_fn=lambda trajectory, count: 'continue' if count == 0 else None,
+    )
+    result = rollout([_user_traj()])[0]
+    assert result['truncated'] and result['followups'] == 1
+    assert len(sampler.sessions_seen) == 1
+    sid = sampler.sessions_seen[0][1]
+    assert sid and sampler.released == [sid]
+    assert len(requests) == 1
+    request, options = requests[0]
+    assert options == {}
+    assert set(request) == {'messages'}
+
+
+def test_routing_session_id_is_unique_across_calls(template):
+    sampler = RoutingFakeSampler(template)
+    sampler.queue('one')
+    sampler.queue('two')
+    rollout = MultiTurnRollout(sampler, template)
+    rollout([_user_traj()])
+    rollout([_user_traj()])
+    assert len(set(sampler.released)) == 2
 
 
 class FakeTurnController:

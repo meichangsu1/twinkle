@@ -352,6 +352,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
+        session_ids: list[str | None] | None = None,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -361,6 +362,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
                 - Trajectory: Must contain 'messages'. Requires template to be set.
 
             sampling_params: Sampling parameters.
+
+            session_ids: Optional routing IDs aligned with inputs. Each non-None ID reuses
+                an existing instance binding in Ray continuous-work mode. Consumed by the
+                dispatch layer; not passed to the template or engine. Ignored for routing
+                in local mode. Omit for ordinary load balancing.
 
             adapter_name: Optional LoRA adapter name.
 

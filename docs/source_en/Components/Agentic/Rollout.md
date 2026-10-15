@@ -61,11 +61,44 @@ results = rollout(trajectories)
 | `api_kwargs` | `Dict` | Request fields forwarded to each API call. |
 | `tool_manager` | `ToolManager` | Tool dispatcher. Can also be passed per-call. |
 | `sampling_params` | `SamplingParams` | Default sampling parameters. |
+| `session_affinity` | `bool` | Defaults to True; rollout manages IDs for capable samplers regardless of callback identity. Overridable per call. |
 | `max_turns` | `int` | Maximum number of turns per trajectory (default: 6). |
 | `max_trajectory_tokens` | `int` | Max total token length; exceeding truncates the trajectory. |
 | `trace_dir` | `str` | Directory for per-trajectory JSON trace dumps. |
 | `trace_callback` | `Callable` | Decides whether to store a trajectory trace. |
 | `success_callback` | `Callable` | Decides filename prefix (`ok-` vs `fail-`). |
+
+### Session Affinity
+
+`MultiTurnRollout` defaults to `session_affinity=True`. With a capable sampler, rollout creates a unique
+ID and an independent `adapter_kwargs` dictionary once per episode, including `session_ids=[session_id]`.
+All turns and follow-ups reuse these options; callbacks treat them as read-only.
+
+Default and custom callbacks forward options through `sampler.sample(..., **adapter_kwargs)`.
+No additional callback parameter or callback identity check is needed. Despite its name, `adapter_kwargs`
+contains backend call options, including adapters, partial rollout, and routing. A custom callback that
+does not forward these options is not guaranteed to use session affinity.
+Dispatch consumes `session_ids` without adding fields to `InputFeature`. Token, logprob, and training
+outputs are unchanged. API-only paths and older samplers retain their calls; `APISampler` does not
+forward sampler options to external APIs in mixed-backend callbacks.
+
+Clients of the same sampling pool share a routing actor. Existing bindings take priority over load
+balancing without reserving instances. Episode exit removes the binding. Sampling releases occupancy
+when the call exits; this version does not keep timed-out remote tasks charged until actual completion.
+
+The bounded LRU defaults to 10000 bindings. Idle bindings, including sessions waiting on tools, may
+be evicted. If every binding is executing, a new request uses ordinary load balancing without creating
+a binding. Affinity improves cache reuse opportunities rather than guaranteeing hits.
+
+```python
+rollout = MultiTurnRollout(sampler, template, session_affinity=True)
+results = rollout(trajectories)  # No session_ids argument is required.
+results = rollout(trajectories, session_affinity=False)
+```
+
+Enable vLLM caching separately with `engine_args={"enable_prefix_caching": True}`. Closing bindings
+does not clear engine caches or change weight synchronization. This version does not change
+`submit_generation()`, TQ, or routing inside PD instances.
 
 ### Output Fields
 

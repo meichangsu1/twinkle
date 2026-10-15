@@ -12,6 +12,7 @@ from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, get_logger, requires
 from . import _torch_setup
 from .collectors import collect_dp_and_flatten, collect_tensor_dict
+from .routing import RequestRouter, RouteLease, RoutingPolicy, LeastInflightPolicy
 
 logger = get_logger()
 
@@ -377,28 +378,16 @@ def _make_worker_async_companion(func, wrapper):
 
 
 def _cw_state(self, n_workers: int):
-    """Driver-side bookkeeping for ``enable_continous_work``, created on first use.
-
-    ``load`` counts requests handed to each worker and not yet returned, which is
-    what picks the next worker. ``inflight`` keeps those counts honest per method
-    name, and is also what the barrier reads: a method other than the one with
-    requests in flight must wait for them, because the worker now runs methods
-    side by side and something like receiving weights or sleeping would otherwise
-    land on an engine mid-generation.
-
-    The state's own lock is a plain ``Lock``: nothing here takes it while already
-    holding it, so re-entrance is not needed.
-    """
+    """Handle-local method coordination only; routing state lives in the shared actor."""
     state = getattr(self, '_continous_work_state', None)
-    if state is not None and len(state['load']) == n_workers:
+    if state is not None:
         return state
     with _CW_CREATE_LOCK:
         # Re-read: another thread may have created it while this one waited.
         state = getattr(self, '_continous_work_state', None)
-        if state is None or len(state['load']) != n_workers:
+        if state is None:
             state = {
                 'lock': threading.Lock(),
-                'load': [0] * n_workers,
                 'inflight': {},  # method name -> list of pending object refs
             }
             self._continous_work_state = state
@@ -482,21 +471,6 @@ def _cw_unregister(self, func_name: str, refs: List[Any]) -> None:
             state['inflight'].pop(func_name, None)
 
 
-def _cw_plan(n_workers: int, load: List[int], batch_len: int) -> List[List[int]]:
-    """Assign each request to the worker holding the fewest, updating ``load``.
-
-    Least-loaded-first, one request at a time, so a call of one request goes to
-    one worker instead of being padded up to the worker count, and a call of many
-    spreads out. ``load`` is mutated by the caller's lock holder.
-    """
-    per_worker: List[List[int]] = [[] for _ in range(n_workers)]
-    for idx in range(batch_len):
-        target = min(range(n_workers), key=lambda w: load[w])
-        per_worker[target].append(idx)
-        load[target] += 1
-    return per_worker
-
-
 def _cw_batch_len(args, kwargs) -> Optional[int]:
     """Length of the request list, i.e. the first list argument's length.
 
@@ -504,10 +478,41 @@ def _cw_batch_len(args, kwargs) -> Optional[int]:
     everything else is broadcast. Returns None when there is no list to split,
     which is how the caller knows to fall back to the normal dispatch.
     """
+    inputs = args[0] if args else kwargs.get('inputs')
+    if isinstance(inputs, dict):
+        return 1
+    if isinstance(inputs, list):
+        return len(inputs)
     for arg in list(args) + list(kwargs.values()):
         if isinstance(arg, list):
             return len(arg)
     return None
+
+
+def _cw_session_ids(session_ids, batch_len):
+    """Validate call metadata independently of model inputs."""
+    if batch_len is None:
+        raise ValueError('session_ids requires a concrete input batch')
+    if session_ids is None:
+        return [None] * batch_len
+    if not isinstance(session_ids, (list, tuple)) or len(session_ids) != batch_len:
+        raise ValueError('session_ids must contain one entry per input')
+    for sid in session_ids:
+        RequestRouter._validate(sid, 1)
+    return list(session_ids)
+
+
+def _cw_release_sessions(self, ids):
+    from .ray_routing import release_handle_sessions
+    release_handle_sessions(self, ids)
+
+
+def _cw_handle_getstate(self):
+    state = dict(self.__dict__)
+    if '_actors' in state:
+        # Locks and ObjectRefs used by one caller are not shared coordination.
+        state.pop('_continous_work_state', None)
+    return state
 
 
 def _cw_sub_args(args, kwargs, indices: List[int], batch_len: int):
@@ -522,50 +527,54 @@ def _cw_sub_args(args, kwargs, indices: List[int], batch_len: int):
 
 
 def _run_continous_work(self, func_name: str, execute_method, workers, args, kwargs, batch_len: int,
-                        ray_get_timeout: Optional[float]):
-    """Submit one call per chosen worker and return results in the caller's order.
+                        ray_get_timeout: Optional[float], *, session_ids=None):
+    """Route through the pool's actor, submit per instance, and restore input order.
 
-    Submission happens under the lock so that picking a worker and charging it are
-    one step -- several caller threads land here at once, and a split of the two
-    would let them all pick the same idle worker. Waiting happens outside it.
+    Occupancy follows the synchronous call and is released in finally, including
+    on timeout. This does not track remote tasks that outlive the caller.
     """
+    import time
+
     import ray
 
-    state = _cw_state(self, len(workers))
-    submitted = []
-    # The awaitable form, so the worker can hold several of these at once. Book-
-    # keeping still uses the plain name, which is what callers and the barrier see.
-    remote_name = _WORKER_ASYNC_PREFIX + func_name
-    with state['lock']:
-        plan = _cw_plan(len(workers), state['load'], batch_len)
-        for worker_index, indices in enumerate(plan):
-            if not indices:
-                continue
-            sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
-            ref = execute_method(remote_name, [(workers[worker_index], sub_args, sub_kwargs)])[0]
-            submitted.append((worker_index, indices, ref))
-        state['inflight'].setdefault(func_name, []).extend(ref for _, _, ref in submitted)
+    from .ray_routing import get_handle_router
 
+    sessions = _cw_session_ids(session_ids, batch_len)
+    router = get_handle_router(self, workers)
+    leases = ray.get(router.acquire_batch.remote([(sid, 1) for sid in sessions]))
+    grouped = {}
+    for index, lease in enumerate(leases):
+        grouped.setdefault(lease.instance_id, []).append(index)
+    submitted = {}
+    tracked_refs = []
     try:
-        ordered: List[Any] = [None] * batch_len
-        for _, indices, ref in submitted:
-            part = ray.get(ref, timeout=ray_get_timeout) if ray_get_timeout else ray.get(ref)
+        for indices in grouped.values():
+            sub_args, sub_kwargs = _cw_sub_args(args, kwargs, indices, batch_len)
+            ref = execute_method(_WORKER_ASYNC_PREFIX + func_name,
+                                 [(leases[indices[0]].handle, sub_args, sub_kwargs)])[0]
+            submitted[ref] = indices
+            tracked_refs.extend(_cw_register(self, func_name, [ref]))
+
+        ordered = [None] * batch_len
+        deadline = time.monotonic() + ray_get_timeout if ray_get_timeout else None
+        while submitted:
+            remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+            ready, _ = ray.wait(list(submitted), num_returns=1, timeout=remaining)
+            if not ready:
+                raise ray.exceptions.GetTimeoutError('Timed out waiting for sampling results')
+            ref = ready[0]
+            indices = submitted.pop(ref)
+            part = ray.get(ref)
             if not isinstance(part, (list, tuple)) or len(part) != len(indices):
-                raise TypeError(f'{func_name}: enable_continous_work needs one result per request, but a worker given '
-                                f'{len(indices)} request(s) returned {type(part).__name__} of length '
-                                f'{len(part) if isinstance(part, (list, tuple)) else "n/a"}.')
-            for local_index, original_index in enumerate(indices):
-                ordered[original_index] = part[local_index]
+                raise TypeError(f'{func_name}: continuous work requires one result per input')
+            for index, item in zip(indices, part, strict=True):
+                ordered[index] = item
         return ordered
     finally:
-        with state['lock']:
-            pending = state['inflight'].get(func_name, [])
-            for worker_index, indices, ref in submitted:
-                state['load'][worker_index] -= len(indices)
-                if ref in pending:
-                    pending.remove(ref)
-            if not pending:
-                state['inflight'].pop(func_name, None)
+        try:
+            ray.get(router.release_batch.remote([lease.lease_id for lease in leases]))
+        finally:
+            _cw_unregister(self, func_name, tracked_refs)
 
 
 def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
@@ -787,9 +796,20 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             collectives interleaving on one rank deadlock. It is what
             ``enable_continous_work`` needs to reach the worker's engine
             concurrently instead of stopping at the actor boundary.
+
+    Classes with continuous-work methods consume ``routing_config`` at construction
+    (currently ``max_sessions``, default 10000), share a named routing actor per
+    instance pool, and expose ``release_sessions``. Continuous-work methods accept
+    keyword-only ``session_ids`` aligned with the inputs.
     """
 
     def decorator(cls):
+        uses_routing = any(getattr(getattr(cls, name), '_supports_session_affinity', False) for name in dir(cls))
+        if uses_routing:
+            if not hasattr(cls, 'release_sessions'):
+                cls.release_sessions = _cw_release_sessions
+            if '__getstate__' not in cls.__dict__:
+                cls.__getstate__ = _cw_handle_getstate
         # Give every continuous-work method its awaitable form on the class, so Ray
         # has something to await instead of a call that would sit on the actor's
         # event loop and make the others wait behind it.
@@ -809,6 +829,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
             try:
+                if uses_routing:
+                    from .routing import normalize_routing_config
+                    self._routing_config = normalize_routing_config(kwargs.pop('routing_config', None))
                 _maybe_load_worker_notifier()
                 _new_init_body(self, _caller, *args, **kwargs)
             except Exception as _e:
@@ -949,6 +972,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         *args,
                         **kwargs_for_workers)
                     self._actors = _actors
+                    if uses_routing:
+                        from .ray_routing import get_handle_router
+                        get_handle_router(self, _actors)
                     # Remembered so remote_function knows this class's workers run
                     # methods side by side, and that it must therefore track what is
                     # in flight. Without concurrency Ray orders calls per actor and
@@ -1021,6 +1047,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             need no collective between them -- data-parallel sampling, not a
             method with an all-reduce in it. While one such method has requests in
             flight, calling any other method on the same handle waits for them.
+            Routing is shared across clients of the instance pool. Keyword-only
+            ``session_ids`` enables bounded LRU affinity, with one ID (or None)
+            per input. The decorator consumes it before execution, independently
+            of input features. Methods expose the
+            ``_supports_session_affinity`` capability for rollout integration.
     """ # noqa
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -1033,8 +1064,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
             try:
+                session_ids = kwargs.pop('session_ids', None) if enable_continous_work else None
                 device_mesh = getattr(self, 'device_mesh', None)
                 if _mode == 'local':
+                    if session_ids is not None:
+                        _cw_session_ids(session_ids, _cw_batch_len(args, kwargs))
                     return func(self, *args, **kwargs)
                 elif _mode == 'ray':
                     check_unsafe(*args, **kwargs)
@@ -1051,6 +1085,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                 _get_workers([None] * world_size, execute), dispatch, execute, device_mesh, args,
                                 kwargs)
                             _, args, kwargs = _workers_and_args[rank]
+                        if session_ids is not None:
+                            _cw_session_ids(session_ids, _cw_batch_len(args, kwargs))
                         return func(self, *args, **kwargs)
                     else:
                         # This is the driver
@@ -1069,10 +1105,16 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                               'which exists for collectives that must run in lock step.')
                             _workers = _get_workers(self._actors, execute)
                             _batch_len = _cw_batch_len(args, kwargs)
+                            if _batch_len == 0:
+                                _cw_session_ids(session_ids, _batch_len)
+                                return []
                             if _batch_len:
                                 return _run_continous_work(self, func.__name__, execute_method, _workers, args, kwargs,
                                                            _batch_len,
-                                                           getattr(self, '_ray_get_timeout', None) or timeout)
+                                                           getattr(self, '_ray_get_timeout', None) or timeout,
+                                                           session_ids=session_ids)
+                        if session_ids is not None:
+                            raise ValueError('session_ids requires a concrete input batch for routing')
                         if RayHelper.has_ref(args, kwargs):
                             # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
                             # for example, dataloader returns any data list.
@@ -1158,6 +1200,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._lazy_collect = _lazy_collect
         wrapper._sync = sync
         wrapper._enable_continous_work = enable_continous_work
+        wrapper._supports_session_affinity = enable_continous_work
         if enable_continous_work:
             # Attached to the class by remote_class, and called instead of this
             # method when the driver routes requests worker by worker.

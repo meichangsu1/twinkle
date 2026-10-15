@@ -1,5 +1,45 @@
 # vLLMSampler
 
+## Shared Instance Routing
+
+In Ray mode, continuous-work delegates selection to a pool-wide `RequestRouter`. It balances by
+in-flight load, breaks ties randomly, and prefers existing session bindings. `sample()` accepts an
+optional `session_ids` argument. `MultiTurnRollout` prepares IDs once per episode; default and custom
+callbacks pass them through by forwarding `adapter_kwargs` to the sampler.
+
+```python
+sampler = vLLMSampler(
+    model_id='ms://Qwen/Qwen3.5-4B',
+    remote_group='sampler_group',
+    device_mesh=DeviceMesh.from_sizes(dp_size=2),
+    routing_config={"max_sessions": 10000},
+    engine_args={"enable_prefix_caching": True},
+)
+```
+
+The dispatch layer consumes `routing_config`; it never reaches the engine. Currently only the positive
+integer `max_sessions` is supported, defaulting to 10000. Clients with the same actor ID set and Ray
+namespace share one router; conflicting configurations are rejected. The creating job retains the
+router, which is not detached.
+
+`session_ids` contains one nonempty string or `None` per input, in input order. Dispatch consumes this
+argument without modifying `InputFeature` or passing IDs to templates or engines. Omitted IDs and
+`None` entries use ordinary balancing.
+
+```python
+responses = sampler.sample(inputs, session_ids=["episode-A", "episode-B"])
+sampler.release_sessions(["episode-A", "episode-B"])  # When the sessions end.
+```
+
+Sessions do not reserve workers;
+idle bindings may be evicted by the bounded LRU. A full table with all bindings executing falls back
+to ordinary routing for new sessions, without blocking or creating a binding.
+
+`release_sessions(ids)` removes bindings without clearing KV cache and rejects executing sessions.
+Sampling releases occupancy in `finally`, and rollout exit removes the binding. This version does not
+track remote tasks that outlive the caller; timeouts or errors may underestimate actual running work.
+Local single-engine mode accepts the parameter but performs no instance routing and creates no routing actor.
+
 vLLMSampler uses the vLLM engine for efficient inference, supporting high-throughput batch sampling.
 
 ## Usage Example
