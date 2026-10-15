@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Fixed-prompt, multi-turn replay through Twinkle's continuous-work dispatcher.
+"""Reproducible multi-turn replay through Twinkle's continuous-work dispatcher.
 
 GPU: python scripts/benchmark_sticky_session.py --model /path/to/model --output-dir /tmp/sticky-gpu
 NPU: python scripts/benchmark_sticky_session.py --device npu --model /path/to/model --output-dir /tmp/sticky-npu
@@ -9,7 +9,8 @@ CPU: python scripts/benchmark_sticky_session.py --backend mock --episodes 8 --tu
          --repeats 1 --output-dir /tmp/sticky-smoke
 
 Mock cache/timing data are synthetic and cannot establish accelerator performance gains.
-This benchmark fixes weights and prompts; it does not run tools, training, or partial rollout.
+This benchmark fixes weights and replay plans; it can simulate tool waits but does not
+run actual tools, training, or partial rollout.
 """
 from __future__ import annotations
 import argparse
@@ -83,8 +84,14 @@ def prompt_key(tokens):
     return hashlib.sha256(json.dumps(list(tokens), separators=(',', ':')).encode()).hexdigest()
 
 
-def build_workload(encode, episodes, turns, prompt_tokens, append_tokens, seed):
-    """Unique early prefixes, then strictly append-only, frozen token inputs."""
+def build_workload(encode, episodes, turns, prompt_tokens, append_tokens, seed, *, max_tokens=64,
+                   prompt_tokens_range=None, append_tokens_range=None, output_tokens_range=None,
+                   tool_wait_ms=(0, 0)):
+    """Freeze token inputs, output budgets and relative waits once for all groups/repeats."""
+    rng = random.Random(seed)
+    prompt_range = prompt_tokens_range or (prompt_tokens, prompt_tokens)
+    append_range = append_tokens_range or (append_tokens, append_tokens)
+    output_range = output_tokens_range or (max_tokens, max_tokens)
     body = encode(' Document context: cache routing latency worker tokens observation. ')
     if not body:
         raise ValueError('Tokenizer produced an empty document')
@@ -96,13 +103,15 @@ def build_workload(encode, episodes, turns, prompt_tokens, append_tokens, seed):
 
     workload = []
     for episode in range(episodes):
-        tokens = fill(encode(f'Episode {episode}, seed {seed}.\n'), prompt_tokens)
+        tokens = fill(encode(f'Episode {episode}, seed {seed}.\n'), rng.randint(*prompt_range))
         prompts = [tokens]
         for turn in range(1, turns):
-            suffix = fill(encode(f'\nObservation {turn}. '), append_tokens)
+            suffix = fill(encode(f'\nObservation {turn}. '), rng.randint(*append_range))
             tokens = tokens + suffix
             prompts.append(tokens)
-        workload.append({'episode_id': str(episode), 'prompts': prompts})
+        workload.append({'episode_id': str(episode), 'prompts': prompts,
+                         'max_tokens': [rng.randint(*output_range) for _ in range(turns)],
+                         'tool_wait_s': [0.0] + [rng.uniform(*tool_wait_ms) / 1000 for _ in range(turns - 1)]})
     keys = [prompt_key(tokens) for episode in workload for tokens in episode['prompts']]
     if len(set(keys)) != len(keys):
         raise ValueError('Replay prompts must be unique for unambiguous request metric correlation')
@@ -219,7 +228,12 @@ class BenchmarkWorker:
         encode = ((lambda text: list(text.encode())) if self.sampler is None else
                   lambda text: self.sampler.template.tokenizer.encode(text, add_special_tokens=False))
         return build_workload(encode, self.config['episodes'], self.config['turns'],
-                              self.config['prompt_tokens'], self.config['append_tokens'], self.config['seed'])
+                              self.config['prompt_tokens'], self.config['append_tokens'], self.config['seed'],
+                              max_tokens=self.config['max_tokens'],
+                              prompt_tokens_range=self.config['prompt_tokens_range'],
+                              append_tokens_range=self.config['append_tokens_range'],
+                              output_tokens_range=self.config['output_tokens_range'],
+                              tool_wait_ms=self.config['tool_wait_ms'])
 
     def info(self):
         return {'instance_id': self.instance_id, 'prefix_cache': self.prefix_cache,
@@ -240,12 +254,13 @@ class BenchmarkWorker:
         if self.sampler is not None:
             await asyncio.to_thread(self.sampler.shutdown)
 
-    async def _twinkle_async_sample(self, inputs):
+    async def _twinkle_async_sample(self, inputs, max_tokens=None):
+        max_tokens = self.config['max_tokens'] if max_tokens is None else max_tokens
         self.active += 1
         active_at_start = self.active
         try:
             if self.sampler is not None:
-                results = await asyncio.to_thread(self._real_sample, inputs)
+                results = await asyncio.to_thread(self._real_sample, inputs, max_tokens)
                 for result in results:
                     result['worker_active_at_start'] = active_at_start
                 return results
@@ -263,13 +278,13 @@ class BenchmarkWorker:
                         cached = max(cached, matched // 16 * 16)
                 # Synthetic cost only checks harness plumbing; not a vLLM cost model.
                 started = time.perf_counter()
-                await asyncio.sleep(0.001 + (len(tokens) - cached) / 100000)
+                await asyncio.sleep(0.001 + (len(tokens) - cached) / 100000 + max_tokens / 10000)
                 if self.prefix_cache:
                     self.cache.append(list(tokens))
                 elapsed = time.perf_counter() - started
                 results.append({
                     'instance_id': self.instance_id, 'input_tokens': len(tokens),
-                    'output_tokens': self.config['max_tokens'], 'cached_tokens': cached,
+                    'output_tokens': max_tokens, 'cached_tokens': cached,
                     'engine_prefill_s': None, 'engine_queue_s': None, 'engine_ttft_s': None,
                     'first_output_s': None, 'engine_call_s': elapsed,
                     'metrics_source': 'synthetic_mock',
@@ -279,12 +294,12 @@ class BenchmarkWorker:
         finally:
             self.active -= 1
 
-    def _real_sample(self, inputs):
+    def _real_sample(self, inputs, max_tokens):
         from twinkle.data_format import SamplingParams
 
         started = time.perf_counter()
         responses = self.sampler.sample(inputs, sampling_params=SamplingParams(
-            temperature=0.0, max_tokens=self.config['max_tokens'], seed=self.config['seed'],
+            temperature=0.0, max_tokens=max_tokens, seed=self.config['seed'],
         ))
         elapsed = time.perf_counter() - started
         results = []
@@ -311,12 +326,13 @@ class RoutedSampler:
         self.timeout = timeout
         get_handle_router(self, workers)
 
-    def sample(self, inputs, session_ids=None):
+    def sample(self, inputs, session_ids=None, max_tokens=None):
         from twinkle.infra import _run_continous_work
         from twinkle.infra._ray import RayHelper
 
         return _run_continous_work(self, 'sample', RayHelper.execute_all_async, self._actors,
-                                  (inputs,), {}, len(inputs), self.timeout, session_ids=session_ids)
+                                  (inputs,), {'max_tokens': max_tokens}, len(inputs), self.timeout,
+                                  session_ids=session_ids)
 
     def release_sessions(self, ids):
         from twinkle.infra.ray_routing import release_handle_sessions
@@ -381,6 +397,7 @@ def summarize(rows, wall_s, status):
         'worker_switch_fraction': switches / transitions if transitions else None,
         'episode_latency_p50_s': percentile(episode_times, 0.5),
         'episode_latency_p95_s': percentile(episode_times, 0.95),
+        'planned_tool_wait_s': sum(row.get('planned_tool_wait_s', 0) for row in rows),
         'per_instance': by_instance, 'router_after': status,
     }
     for name in ['latency_s', 'engine_ttft_s', 'engine_prefill_s', 'engine_queue_s', 'first_output_s']:
@@ -401,12 +418,18 @@ def run_trial(sampler, workload, group, repeat, concurrency, output):
         session_ids = [f'{group}:{repeat}:{concurrency}:{episode_id}'] if affinity else None
         try:
             for turn, tokens in enumerate(episode['prompts']):
+                wait_s = episode['tool_wait_s'][turn]
+                max_tokens = episode['max_tokens'][turn]
+                # Sampling has already released its lease; only the episode binding survives this wait.
+                if wait_s:
+                    time.sleep(wait_s)
                 began = time.perf_counter()
                 row = {'group': group, 'repeat': repeat, 'concurrency': concurrency,
                        'session_affinity': affinity, 'prefix_cache': cache, 'episode_id': episode_id,
-                       'turn': turn, 'input_hash': prompt_key(tokens), 'started_s': began - started}
+                       'turn': turn, 'input_hash': prompt_key(tokens), 'started_s': began - started,
+                       'planned_tool_wait_s': wait_s, 'max_tokens': max_tokens}
                 try:
-                    result = sampler.sample([{'input_ids': tokens}], session_ids=session_ids)[0]
+                    result = sampler.sample([{'input_ids': tokens}], session_ids=session_ids, max_tokens=max_tokens)[0]
                     row.update(result)
                     row['episode_finished'] = turn == len(episode['prompts']) - 1
                 except Exception as exc:
@@ -476,6 +499,14 @@ def parse_args(argv=None):
     parser.add_argument('--prompt-tokens', type=int, default=2048)
     parser.add_argument('--append-tokens', type=int, default=128)
     parser.add_argument('--max-tokens', type=int, default=64)
+    parser.add_argument('--prompt-tokens-range', nargs=2, type=int, metavar=('MIN', 'MAX'),
+                        help='Per-episode initial prompt lengths; overrides --prompt-tokens.')
+    parser.add_argument('--append-tokens-range', nargs=2, type=int, metavar=('MIN', 'MAX'),
+                        help='Per-turn appended lengths; overrides --append-tokens.')
+    parser.add_argument('--output-tokens-range', nargs=2, type=int, metavar=('MIN', 'MAX'),
+                        help='Per-turn generation limits; overrides --max-tokens. EOS can end generation earlier.')
+    parser.add_argument('--tool-wait-ms', nargs=2, type=float, default=[0, 0], metavar=('MIN', 'MAX'),
+                        help='Simulated tool waits before continuation turns; defaults to no waits.')
     parser.add_argument('--concurrency', nargs='+', type=int, default=[8])
     parser.add_argument('--groups', nargs='+', choices=list(GROUPS), default=list(GROUPS))
     parser.add_argument('--repeats', type=int, default=5)
@@ -487,6 +518,16 @@ def parse_args(argv=None):
     parser.add_argument('--output-dir', type=Path, required=True,
                         help='New directory; existing results are not overwritten.')
     args = parser.parse_args(argv)
+    for name, fixed in [('prompt_tokens_range', 'prompt_tokens'), ('append_tokens_range', 'append_tokens'),
+                        ('output_tokens_range', 'max_tokens')]:
+        bounds = getattr(args, name) or [getattr(args, fixed)] * 2
+        if not 1 <= bounds[0] <= bounds[1]:
+            parser.error(f'--{name.replace("_", "-")} requires 1 <= MIN <= MAX')
+        setattr(args, name, bounds)
+        setattr(args, fixed, bounds[1])
+    if (any(not math.isfinite(value) for value in args.tool_wait_ms)
+            or not 0 <= args.tool_wait_ms[0] <= args.tool_wait_ms[1]):
+        parser.error('--tool-wait-ms requires finite 0 <= MIN <= MAX')
     for name in ['tensor_parallel_size', 'max_model_len', 'episodes', 'turns', 'prompt_tokens',
                  'append_tokens', 'max_tokens', 'repeats', 'max_sessions']:
         if getattr(args, name) < 1:

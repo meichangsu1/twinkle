@@ -13,7 +13,9 @@ from scripts.benchmark_sticky_session import (
     comparisons,
     local_ray_options,
     parse_args,
+    prompt_key,
     request_metrics,
+    run_trial,
     summarize,
     worker_options,
 )
@@ -29,6 +31,90 @@ def test_workload_is_fixed_append_only_and_unique():
         assert [len(tokens) for tokens in episode['prompts']] == [64, 96, 128, 160]
         for previous, current in zip(episode['prompts'], episode['prompts'][1:], strict=False):
             assert current[:len(previous)] == previous
+
+
+def test_variable_workload_freezes_lengths_budgets_and_waits_with_one_seed():
+    options = {'max_tokens': 16, 'prompt_tokens_range': [64, 160], 'append_tokens_range': [32, 64],
+               'output_tokens_range': [2, 16], 'tool_wait_ms': [1, 7]}
+    workload = build_workload(lambda text: list(text.encode()), 20, 4, 160, 64, 42, **options)
+    assert workload == build_workload(lambda text: list(text.encode()), 20, 4, 160, 64, 42, **options)
+    assert workload != build_workload(lambda text: list(text.encode()), 20, 4, 160, 64, 43, **options)
+    assert len({len(episode['prompts'][0]) for episode in workload}) > 1
+    assert len({limit for episode in workload for limit in episode['max_tokens']}) > 1
+    for episode in workload:
+        assert 64 <= len(episode['prompts'][0]) <= 160
+        assert len(episode['max_tokens']) == len(episode['tool_wait_s']) == 4
+        assert all(2 <= limit <= 16 for limit in episode['max_tokens'])
+        assert episode['tool_wait_s'][0] == 0
+        assert all(0.001 <= value <= 0.007 for value in episode['tool_wait_s'][1:])
+        for previous, current in zip(episode['prompts'], episode['prompts'][1:], strict=False):
+            assert 32 <= len(current) - len(previous) <= 64
+            assert current[:len(previous)] == previous
+
+
+@pytest.mark.parametrize('fail_turn', [None, 1])
+def test_replay_preserves_plan_and_session_but_releases_execution_during_tool_wait(monkeypatch, fail_turn):
+    from io import StringIO
+
+    import scripts.benchmark_sticky_session as benchmark
+    from twinkle.infra.routing import RequestRouter
+
+    workload = [{'episode_id': 'episode', 'prompts': [[1], [1, 2], [1, 2, 3]],
+                 'max_tokens': [2, 4, 8], 'tool_wait_s': [0, 0.002, 0.004]}]
+    clock = [100.0]
+    monkeypatch.setattr(benchmark.time, 'perf_counter', lambda: clock[0])
+    def replay(group):
+        router = RequestRouter({'one': None, 'two': None})
+        calls, waits, session_ids = [], [], []
+
+        class Sampler:
+
+            def status(self):
+                return router.get_status()
+
+            def sample(self, inputs, session_ids=None, max_tokens=None):
+                sid = session_ids[0] if session_ids else None
+                lease = router.acquire(sid)
+                try:
+                    assert set(inputs[0]) == {'input_ids'}
+                    calls.append((list(inputs[0]['input_ids']), max_tokens, sid))
+                    clock[0] += 0.01
+                    if len(calls) - 1 == fail_turn:
+                        raise RuntimeError('planned failure')
+                    return [{'instance_id': lease.instance_id, 'input_tokens': len(inputs[0]['input_ids']),
+                             'output_tokens': max_tokens, 'cached_tokens': 0, 'engine_call_s': 0.01}]
+                finally:
+                    router.release(lease)
+
+            def release_sessions(self, ids):
+                session_ids.extend(ids)
+                router.release_sessions(ids)
+
+        def wait(seconds):
+            status = router.get_status()
+            assert status['active_leases'] == status['total_inflight'] == 0
+            assert status['session_count'] == (1 if group == 'D' else 0)
+            waits.append(seconds)
+            clock[0] += seconds
+
+        monkeypatch.setattr(benchmark.time, 'sleep', wait)
+        output = StringIO()
+        result = run_trial(Sampler(), workload, group, 0, 1, output)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        assert result['errors'] == (0 if fail_turn is None else 1)
+        assert result['router_after']['active_leases'] == result['router_after']['session_count'] == 0
+        if group == 'B':
+            assert all(call[2] is None for call in calls)
+        else:
+            assert all(call[2] == session_ids[0] for call in calls)
+        assert [row['max_tokens'] for row in rows] == workload[0]['max_tokens'][:len(calls)]
+        assert result['planned_tool_wait_s'] == pytest.approx(sum(waits))
+        if fail_turn is None:
+            assert result['episode_latency_p95_s'] == pytest.approx(0.036)
+            assert result['latency_s']['p95'] == pytest.approx(0.01)
+        return [(tokens, budget) for tokens, budget, _ in calls], waits
+
+    assert replay('B') == replay('D')
 
 
 def test_request_metrics_does_not_mix_vllm_clock_domains():
@@ -101,6 +187,7 @@ def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeyp
             pass
 
         def sample(self, inputs, sampling_params):
+            assert sampling_params.max_tokens == 3
             async def drain():
                 outputs = [output async for output in self.engine.engine.generate()]
                 assert outputs[-1].outputs[0].token_ids == [4]
@@ -116,8 +203,8 @@ def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeyp
     monkeypatch.setattr(sampler_module, 'vLLMSampler', FakeSampler)
     worker = BenchmarkWorker({'backend': 'vllm', 'device': 'cuda', 'model': 'unused', 'tensor_parallel_size': 1,
                               'gpu_memory_utilization': 0.5, 'max_model_len': 128, 'seed': 0,
-                              'max_tokens': 1}, True)
-    result = asyncio.run(worker._twinkle_async_sample([{'input_ids': [1, 2, 3]}]))[0]
+                              'max_tokens': 8}, True)
+    result = asyncio.run(worker._twinkle_async_sample([{'input_ids': [1, 2, 3]}], max_tokens=3))[0]
     assert result['engine_request_id'] == 'engine-generated-id'
     assert result['cached_tokens'] == 2
     assert result['engine_prefill_s'] == pytest.approx(0.05)
@@ -230,28 +317,43 @@ def test_prefix_cache_flag_is_explicit_in_actual_engine_arguments(monkeypatch, e
 @pytest.mark.parametrize('options', [
     ['--replicas', '1'], ['--concurrency', '0'], ['--groups', 'B', 'B'],
     ['--max-model-len', '1'], ['--backend', 'vllm'],
+    ['--prompt-tokens-range', '128', '64'], ['--output-tokens-range', '0', '8'],
+    ['--tool-wait-ms', '-1', '10'], ['--tool-wait-ms', '1', 'nan'],
+    ['--prompt-tokens-range', '8000', '8192'],
 ])
 def test_invalid_benchmark_configuration_fails_before_ray_startup(tmp_path, options):
     with pytest.raises(SystemExit):
         parse_args(['--backend', 'mock', '--output-dir', str(tmp_path / 'result'), *options])
 
 
-def test_mock_benchmark_runs_full_matrix_and_releases_routes(tmp_path):
+@pytest.mark.parametrize('variable', [False, True])
+def test_mock_benchmark_runs_full_matrix_and_releases_routes(tmp_path, variable):
     root = Path(__file__).resolve().parents[2]
     output = tmp_path / 'benchmark'
+    options = (['--prompt-tokens-range', '64', '128', '--append-tokens-range', '32', '48',
+                '--output-tokens-range', '1', '8', '--tool-wait-ms', '1', '5'] if variable else [])
     result = subprocess.run([
         sys.executable, str(root / 'scripts/benchmark_sticky_session.py'),
         '--backend', 'mock', '--episodes', '4', '--turns', '3', '--prompt-tokens', '64',
         '--append-tokens', '32', '--max-tokens', '4', '--concurrency', '2', '3',
         '--repeats', '2', '--warmup-requests', '1', '--output-dir', str(output),
+        *options,
     ], cwd=root, capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     summary = json.loads((output / 'summary.json').read_text())
     records = [json.loads(line) for line in (output / 'requests.jsonl').read_text().splitlines()]
+    workload = {row['episode_id']: row for row in
+                (json.loads(line) for line in (output / 'workload.jsonl').read_text().splitlines())}
     assert summary['synthetic'] is True
     assert len(summary['trials']) == 16
     assert len(records) == 16 * 4 * 3
     assert all(record['metrics_source'] == 'synthetic_mock' for record in records)
+    for record in records:
+        episode = workload[record['episode_id']]
+        turn = record['turn']
+        assert record['max_tokens'] == record['output_tokens'] == episode['max_tokens'][turn]
+        assert record['planned_tool_wait_s'] == episode['tool_wait_s'][turn]
+        assert record['input_hash'] == prompt_key(episode['prompts'][turn])
     for trial in summary['trials']:
         assert trial['errors'] == 0
         assert trial['completed_episodes'] == 4

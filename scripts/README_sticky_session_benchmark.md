@@ -2,7 +2,8 @@
 
 `benchmark_sticky_session.py` 重放固定的多轮 token 输入，复用生产代码的
 `_run_continous_work`、共享 `RequestRouter`、lease 和结果收集。
-每个 Ray replica 内部运行本地 `vLLMSampler.sample()`，使用真实引擎；不经过训练器、工具或 partial rollout。
+每个 Ray replica 内部运行本地 `vLLMSampler.sample()`，使用真实引擎；可模拟工具等待，
+不执行真实工具、训练或 partial rollout。
 这用于隔离路由与 prefix cache 的交互，不是完整 RL 训练性能测试。
 
 ## GPU 实验
@@ -67,8 +68,49 @@ python scripts/benchmark_sticky_session.py \
 默认跑四组，重点比较 D/B。仅跑主对照可加 `--groups B D`。
 相同 cache 配置复用一个实例池，每次测量前等待缓存重置完成；不同 cache 配置重建实例池。
 启动与预热不计入测量，同一 cache 配置内的组运行顺序按 repeat 打乱。
-所有组重放完全相同的输入，模型和引擎 seed 固定，输出长度上限相同，实际输出 token 数单独记录。
+所有组重放完全相同的输入和逐轮生成上限，模型和引擎 seed 固定，实际输出 token 数单独记录。
 异步任务到达顺序和普通负载均衡不保证确定性，需要观察多次 repeat 的波动。
+
+## 可变长度与工具等待
+
+默认仍是固定长度、无等待的负载。要观察 episode 交错执行时的路由行为，可以保持两个实例，运行：
+
+```bash
+python scripts/benchmark_sticky_session.py \
+  --device npu --model /path/to/Qwen3.5-0.8B \
+  --replicas 2 --tensor-parallel-size 1 \
+  --episodes 64 --turns 6 --max-model-len 8192 \
+  --prompt-tokens-range 512 4096 \
+  --append-tokens-range 64 256 \
+  --output-tokens-range 16 128 \
+  --tool-wait-ms 50 500 \
+  --concurrency 4 8 --repeats 5 --groups B D \
+  --output-dir /tmp/sticky-session-npu-variable
+```
+
+三个 token 范围分别覆盖固定参数 `--prompt-tokens`、`--append-tokens`、`--max-tokens`。
+初始长度按 episode 采样，追加长度与生成上限按轮采样，均为闭区间内的均匀整数。
+生成上限不是强制输出长度，模型遇到 EOS 仍可提前结束；真实输出长度单独统计。
+上下文容量按各范围最大值校验。
+
+`--tool-wait-ms MIN MAX` 在第一轮之后、每轮采样之前模拟工具等待，时长在范围内均匀采样。
+等待发生在调用端线程里，占用一个活跃 episode 名额；此时执行 lease 已释放，会话绑定仍保留。
+`--concurrency` 因此表示活跃 episode 数，不等于每个时刻正在生成的请求数。
+单次请求 `latency_s` 不含等待，episode 延迟和总吞吐包含等待。
+等待过长时，端到端耗时可能主要由等待决定，应同时观察引擎指标。
+
+所有计划由 `--seed` 一次性生成。`workload.jsonl` 除 `prompts` 外，还保存逐轮的
+`max_tokens` 和 `tool_wait_s`；A/B/C/D、全部 repeat 和并发配置复用相同计划。
+`workload_hash` 包含这些安排，`requests.jsonl` 逐条记录 `max_tokens` 与 `planned_tool_wait_s`。
+固定的是相对等待时长和输入，不保证墙钟到达顺序一致。
+
+可变负载用于检验规则负载下的结论是否仍成立，不保证普通路由一定频繁切换，也不保证 sticky 一定加速。
+先对比切换率、缓存命中和实例分布，再评估性能；将这次结果与原固定负载分别保存在不同目录。
+画图方式保持不变：
+
+```bash
+python scripts/plot_sticky_session.py /tmp/sticky-session-npu-variable/summary.json
+```
 
 ## CPU 功能检查
 
@@ -110,7 +152,7 @@ mock 结果显式标记 `SYNTHETIC / MOCK`；中途失败的实验标记 `INCOMP
 ## 输出与解读
 
 - `config.json`：参数、包版本（包括 torch_npu、vLLM-Ascend）、实验类型。
-- `workload.jsonl`：每条 episode 的固定 token 输入；每轮只追加，且在靠前位置区分 episode。
+- `workload.jsonl`：每条 episode 的固定 token 输入、逐轮生成上限与工具等待；每轮只追加输入，靠前位置区分 episode。
 - `requests.jsonl`：group/repeat/concurrency、episode/turn、输入 hash、实际实例、延迟、token 数及引擎观测。
 - `summary.json`：每次测量的 p50/p95、吞吐、缓存命中、实例切换、各实例工作量、路由清理状态，以及逐 repeat 的 D/B 比值。
 
