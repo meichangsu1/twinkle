@@ -83,6 +83,30 @@ python scripts/benchmark_sticky_session.py \
 mock 使用真实 Ray actor 和生产分发/路由代码，缓存命中与计算延迟均为合成值。
 输出标记 `synthetic: true`、`metrics_source: synthetic_mock`，只能证明基准流程有效。
 
+## 画图比较
+
+画图在 CPU 上离线运行，只需 `matplotlib`，不需要 Ray、vLLM 或 NPU 环境：
+
+```bash
+python -m pip install matplotlib
+python scripts/plot_sticky_session.py /tmp/sticky-session-npu/summary.json
+```
+
+默认写到实验目录下的 `plots/`，也可以直接传实验目录。
+支持 `--output-dir /path/to/plots` 和 `--formats png svg pdf`。
+重复运行会覆盖同名图，不修改原始实验结果。
+
+- `overview.png`：按并发比较各组的 episode 吞吐、episode p95 延迟、后续轮次缓存命中率、
+  引擎 TTFT/prefill p50 和实例切换率。
+- `sticky_ratio.png`：同一 concurrency/repeat 的 D/B 配对比值；吞吐大于 1、p95 延迟小于 1 时有利于 sticky。
+- `instance_load.png`：各实例平均输入 token 占比，包含未接到请求的注册实例；用于查看工作量分布，
+  不代表 NPU 利用率。副本编号只在同一个 cache 配置的实例池内对应。
+
+散点保留各次 repeat，折线表示中位数，阴影是最小到最大范围，不是置信区间。
+缺失指标留空；有请求错误或 episode 未完成的测量会被排除，并在图上标注数量。
+仅有部分组或部分 repeat 时仍可画已有结果，缺少配对 B/D 时比值图提示不可用。
+mock 结果显式标记 `SYNTHETIC / MOCK`；中途失败的实验标记 `INCOMPLETE RUN`。
+
 ## 输出与解读
 
 - `config.json`：参数、包版本（包括 torch_npu、vLLM-Ascend）、实验类型。
