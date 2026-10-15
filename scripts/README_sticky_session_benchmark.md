@@ -23,6 +23,40 @@ python scripts/benchmark_sticky_session.py \
 连接已有 Ray 集群时加 `--ray-address auto`。默认启动本地 Ray；资源不足会报错。
 输出目录必须不存在，避免覆盖实验结果。
 
+## NPU 实验
+
+使用已能运行 Twinkle `vLLMSampler` 的昇腾环境，包含配套的 CANN、torch_npu、vLLM 和
+vLLM-Ascend；无需安装训练后端。环境准备见[项目 NPU 指南](../docs/source_zh/使用指引/NPU的支持.md)。
+先准备一个当前环境支持、能单卡运行的模型，并使用其本地路径。
+
+最小配置是 **2 张 NPU、2 个副本、每副本 TP=1**。四组依次运行，共用这些设备；
+若每副本 TP=2，则需要 4 张 NPU，每个副本的 TP 设备必须在同一节点。
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+
+python scripts/benchmark_sticky_session.py \
+  --device npu --model /path/to/cached/model \
+  --replicas 2 --tensor-parallel-size 1 \
+  --episodes 32 --turns 4 \
+  --prompt-tokens 2048 --append-tokens 128 --max-tokens 64 \
+  --concurrency 4 8 --repeats 3 --groups B D \
+  --output-dir /tmp/sticky-session-npu
+```
+
+该命令先比较开启 prefix cache 时的普通路由 B 和 sticky 路由 D；去掉 `--groups B D`
+即可跑完整四组。`--gpu-memory-utilization` 沿用 vLLM 的参数名称，在 NPU 上同样表示设备内存比例。
+
+本地启动时根据可见 NPU 数注册 Ray 的 `NPU` 资源，每个副本占用 TP 数量的完整资源，
+并在加载引擎前使用 Ray 分配的设备 ID 设置 `ASCEND_RT_VISIBLE_DEVICES`。
+连接已有集群时仍使用 `--ray-address auto`，各节点需提前注册相应的 `NPU` 资源，
+可见设备范围应在启动 Ray 节点前设置；此时脚本不会重新注册集群资源。
+`summary.json` 的 `replica_pools` 记录节点、设备类型及设备 ID，可核对同节点副本是否使用不同的卡。
+引擎指标缺失仍记录为 `null`，不会以 mock 数据代替 NPU 测量。
+
+## 对照组
+
 | 组 | session affinity | prefix cache |
 |---|---|---|
 | A | 关闭 | 关闭 |
@@ -51,7 +85,7 @@ mock 使用真实 Ray actor 和生产分发/路由代码，缓存命中与计算
 
 ## 输出与解读
 
-- `config.json`：参数、包版本、实验类型。
+- `config.json`：参数、包版本（包括 torch_npu、vLLM-Ascend）、实验类型。
 - `workload.jsonl`：每条 episode 的固定 token 输入；每轮只追加，且在靠前位置区分 episode。
 - `requests.jsonl`：group/repeat/concurrency、episode/turn、输入 hash、实际实例、延迟、token 数及引擎观测。
 - `summary.json`：每次测量的 p50/p95、吞吐、缓存命中、实例切换、各实例工作量、路由清理状态，以及逐 repeat 的 D/B 比值。
@@ -64,7 +98,7 @@ mock 使用真实 Ray actor 和生产分发/路由代码，缓存命中与计算
 缓存命中按 token 加权，单独统计第二轮及以后的命中率。缺少 `num_cached_tokens` 时记录 `null`，
 不会伪造为零；聚合命中率只有在对应请求指标完整时才计算。
 prefill/queue/TTFT 根据部署版本支持的 `RequestOutput.metrics` 提取，缺失时同样为 `null`，
-汇总中的 `count` 表示指标覆盖情况。prefill 是引擎统计口径的调度至首 token 时间，不是 GPU kernel 独占耗时。
+汇总中的 `count` 表示指标覆盖情况。prefill 是引擎统计口径的调度至首 token 时间，不是设备 kernel 独占耗时。
 `first_output_s` 是观测到首次非空输出的 worker 时长，不冒充不可用的引擎 TTFT；
 `latency_s` 是调用端整个同步采样时长，包含路由、Ray、排队和完整生成。
 

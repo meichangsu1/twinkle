@@ -3,11 +3,12 @@
 """Fixed-prompt, multi-turn replay through Twinkle's continuous-work dispatcher.
 
 GPU: python scripts/benchmark_sticky_session.py --model /path/to/model --output-dir /tmp/sticky-gpu
+NPU: python scripts/benchmark_sticky_session.py --device npu --model /path/to/model --output-dir /tmp/sticky-npu
 CPU: python scripts/benchmark_sticky_session.py --backend mock --episodes 8 --turns 3 \
          --prompt-tokens 64 --append-tokens 16 --max-tokens 4 --concurrency 4 \
          --repeats 1 --output-dir /tmp/sticky-smoke
 
-Mock cache/timing data are synthetic and cannot establish GPU performance gains.
+Mock cache/timing data are synthetic and cannot establish accelerator performance gains.
 This benchmark fixes weights and prompts; it does not run tools, training, or partial rollout.
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import os
 import random
 import statistics
 import threading
@@ -29,6 +31,52 @@ import json
 # (session affinity, prefix cache)
 GROUPS = {'A': (False, False), 'B': (False, True), 'C': (True, False), 'D': (True, True)}
 logger = logging.getLogger(__name__)
+
+
+def local_ray_options(config):
+    options = {'num_cpus': max(2, config['replicas'])}
+    if config['backend'] == 'vllm' and config['device'] == 'npu':
+        from twinkle.utils.platforms.npu import ensure_npu_backend
+        ensure_npu_backend()
+        import torch
+
+        count = torch.npu.device_count() if torch.npu.is_available() else 0
+        if not count:
+            raise RuntimeError('No visible NPU; check torch_npu, CANN and ASCEND_RT_VISIBLE_DEVICES')
+        options['resources'] = {'NPU': count}
+    return options
+
+
+def worker_options(config):
+    """Reserve whole devices per replica; TP runs inside that replica on one node."""
+    options = {'num_cpus': 1, 'num_gpus': 0, 'max_concurrency': max(config['concurrency']) + 2}
+    if config['backend'] == 'vllm':
+        if config['device'] == 'npu':
+            options['resources'] = {'NPU': config['tensor_parallel_size']}
+            visible_flag = 'RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES'
+        else:
+            options['num_gpus'] = config['tensor_parallel_size']
+            visible_flag = 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'
+        # Unlike Twinkle's placement-group workers, these raw actors let Ray pin devices.
+        options['runtime_env'] = {'env_vars': {visible_flag: '0'}}
+    return options
+
+
+def worker_device_info(config):
+    import ray
+
+    context = ray.get_runtime_context()
+    info = {'device': 'cpu', 'device_ids': [], 'node_id': context.get_node_id()}
+    if config['backend'] == 'vllm':
+        resource = 'NPU' if config['device'] == 'npu' else 'GPU'
+        device_ids = [str(value) for value in context.get_accelerator_ids().get(resource, [])]
+        if len(device_ids) != config['tensor_parallel_size']:
+            raise RuntimeError(f'Expected {config["tensor_parallel_size"]} {resource} devices, got {device_ids}')
+        env = 'ASCEND_RT_VISIBLE_DEVICES' if resource == 'NPU' else 'CUDA_VISIBLE_DEVICES'
+        # Pin before importing the sampler/torch; never inherit the driver's full visible pool.
+        os.environ[env] = ','.join(device_ids)
+        info.update(device=config['device'], device_ids=device_ids, visible_device_env=env)
+    return info
 
 
 def prompt_key(tokens):
@@ -111,6 +159,7 @@ class BenchmarkWorker:
         import ray
 
         self.instance_id = str(ray.get_runtime_context().get_actor_id())
+        self.device_info = worker_device_info(config)
         self.config = config
         self.prefix_cache = prefix_cache
         self.cache = []
@@ -120,6 +169,10 @@ class BenchmarkWorker:
         self.sampler = None
         if config['backend'] == 'mock':
             return
+
+        if config['device'] == 'npu':
+            from twinkle.utils.platforms.npu import ensure_npu_backend
+            ensure_npu_backend()
 
         import twinkle.infra as infra
         from twinkle.sampler.vllm_sampler import vLLMSampler
@@ -169,7 +222,8 @@ class BenchmarkWorker:
                               self.config['prompt_tokens'], self.config['append_tokens'], self.config['seed'])
 
     def info(self):
-        return {'instance_id': self.instance_id, 'prefix_cache': self.prefix_cache, 'backend': self.config['backend']}
+        return {'instance_id': self.instance_id, 'prefix_cache': self.prefix_cache,
+                'backend': self.config['backend'], **self.device_info}
 
     async def reset(self):
         if self.active:
@@ -409,10 +463,13 @@ def comparisons(trials):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--backend', choices=['vllm', 'mock'], default='vllm')
+    parser.add_argument('--device', choices=['cuda', 'npu'], default='cuda',
+                        help='Accelerator for vllm; mock always runs on CPU.')
     parser.add_argument('--model', help='Cached model path or a Twinkle model ID; required for vllm.')
     parser.add_argument('--replicas', type=int, default=2)
     parser.add_argument('--tensor-parallel-size', type=int, default=1)
-    parser.add_argument('--gpu-memory-utilization', type=float, default=0.7)
+    parser.add_argument('--gpu-memory-utilization', type=float, default=0.7,
+                        help='vLLM device memory fraction; applies to both GPU and NPU.')
     parser.add_argument('--max-model-len', type=int, default=8192)
     parser.add_argument('--episodes', type=int, default=64)
     parser.add_argument('--turns', type=int, default=6)
@@ -458,7 +515,7 @@ def main(argv=None):
     config = vars(args).copy()
     config['output_dir'] = str(args.output_dir)
     packages = {}
-    for name in ['ray', 'vllm', 'torch', 'twinkle']:
+    for name in ['ray', 'vllm', 'vllm-ascend', 'torch', 'torch-npu', 'twinkle']:
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
@@ -467,26 +524,24 @@ def main(argv=None):
                 'synthetic': args.backend == 'mock', 'trials': [], 'replica_pools': [],
                 'started_unix_s': time.time()}
     if args.backend == 'mock':
-        manifest['notice'] = 'Synthetic cache/timing data: validates the harness, not GPU performance.'
+        manifest['notice'] = 'Synthetic cache/timing data: validates the harness, not accelerator performance.'
     (args.output_dir / 'config.json').write_text(json.dumps(manifest, indent=2) + '\n')
     try:
         ray.init(address=args.ray_address, namespace=f'sticky-benchmark-{time.time_ns()}',
                  include_dashboard=False, log_to_driver=False,
-                 **({'num_cpus': max(2, args.replicas)} if not args.ray_address else {}))
+                 **(local_ray_options(config) if not args.ray_address else {}))
         resources = ray.available_resources()
-        needed_gpus = args.replicas * args.tensor_parallel_size if args.backend == 'vllm' else 0
-        if resources.get('GPU', 0) < needed_gpus or resources.get('CPU', 0) < args.replicas:
-            raise RuntimeError(f'Need {args.replicas} CPUs and {needed_gpus} GPUs; available: {resources}')
+        resource = 'NPU' if args.device == 'npu' else 'GPU'
+        needed_devices = args.replicas * args.tensor_parallel_size if args.backend == 'vllm' else 0
+        if resources.get(resource, 0) < needed_devices or resources.get('CPU', 0) < args.replicas:
+            raise RuntimeError(f'Need {args.replicas} CPUs and {needed_devices} {resource}s; available: {resources}')
         workload = None
         with (args.output_dir / 'requests.jsonl').open('w') as output:
             for cache in sorted({GROUPS[group][1] for group in args.groups}):
                 workers = []
                 sampler = None
                 try:
-                    worker_cls = ray.remote(BenchmarkWorker).options(
-                        num_cpus=1, num_gpus=args.tensor_parallel_size if args.backend == 'vllm' else 0,
-                        max_concurrency=max(args.concurrency) + 2,
-                    )
+                    worker_cls = ray.remote(BenchmarkWorker).options(**worker_options(config))
                     workers = [worker_cls.remote(config, cache) for _ in range(args.replicas)]
                     infos = ray.get([worker.info.remote() for worker in workers], timeout=args.timeout)
                     manifest['replica_pools'].append(infos)

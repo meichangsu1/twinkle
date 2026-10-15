@@ -11,9 +11,11 @@ from scripts.benchmark_sticky_session import (
     BenchmarkWorker,
     build_workload,
     comparisons,
+    local_ray_options,
     parse_args,
     request_metrics,
     summarize,
+    worker_options,
 )
 
 
@@ -107,10 +109,12 @@ def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeyp
 
             return asyncio.run(drain())
 
-    monkeypatch.setattr(ray, 'get_runtime_context', lambda: SimpleNamespace(get_actor_id=lambda: 'replica'))
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '2')
+    monkeypatch.setattr(ray, 'get_runtime_context', lambda: SimpleNamespace(
+        get_actor_id=lambda: 'replica', get_node_id=lambda: 'node', get_accelerator_ids=lambda: {'GPU': ['2']}))
     monkeypatch.setattr(infra, 'initialize', lambda **kwargs: None)
     monkeypatch.setattr(sampler_module, 'vLLMSampler', FakeSampler)
-    worker = BenchmarkWorker({'backend': 'vllm', 'model': 'unused', 'tensor_parallel_size': 1,
+    worker = BenchmarkWorker({'backend': 'vllm', 'device': 'cuda', 'model': 'unused', 'tensor_parallel_size': 1,
                               'gpu_memory_utilization': 0.5, 'max_model_len': 128, 'seed': 0,
                               'max_tokens': 1}, True)
     result = asyncio.run(worker._twinkle_async_sample([{'input_ids': [1, 2, 3]}]))[0]
@@ -120,6 +124,73 @@ def test_vllm_observer_preserves_generation_and_extracts_request_metrics(monkeyp
     assert result['output_tokens'] == 1
     assert result['metrics_source'] == 'vllm_request_output'
     assert worker.observations == {} and worker.active == 0
+    assert worker.info()['device_ids'] == ['2']
+
+
+def test_local_npu_resources_use_visible_device_count(monkeypatch):
+    import torch
+
+    import twinkle.utils.platforms.npu as npu_module
+
+    monkeypatch.setattr(npu_module, 'ensure_npu_backend', lambda: None)
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(is_available=lambda: True, device_count=lambda: 4), raising=False)
+    config = {'backend': 'vllm', 'device': 'npu', 'replicas': 2}
+    assert local_ray_options(config) == {'num_cpus': 2, 'resources': {'NPU': 4}}
+    monkeypatch.setattr(torch.npu, 'device_count', lambda: 0)
+    with pytest.raises(RuntimeError, match='No visible NPU'):
+        local_ray_options(config)
+    config['backend'] = 'mock'
+    assert local_ray_options(config) == {'num_cpus': 2}
+
+
+@pytest.mark.parametrize('tp', [1, 2])
+def test_ray_npu_replicas_receive_disjoint_devices_without_cuda(tmp_path, tp):
+    # Real Ray allocation with simulated NPU resources: no torch_npu/model/hardware.
+    script = tmp_path / 'npu_allocation.py'
+    script.write_text('''
+import os
+import sys
+import ray
+from scripts.benchmark_sticky_session import worker_options, worker_device_info
+
+tp = int(sys.argv[1])
+visible_ids = [str(2 * index + 1) for index in range(2 * tp)]
+os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(visible_ids)
+os.environ['RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES'] = '1'
+config = {'backend': 'vllm', 'device': 'npu', 'tensor_parallel_size': tp, 'concurrency': [2]}
+options = worker_options(config)
+assert options['num_gpus'] == 0 and options['resources'] == {'NPU': tp}
+ray.init(num_cpus=2, resources={'NPU': 2 * tp}, include_dashboard=False, log_to_driver=False)
+try:
+    @ray.remote
+    class Probe:
+        def info(self):
+            assigned = ray.get_runtime_context().get_accelerator_ids()['NPU']
+            assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == ','.join(assigned)
+            info = worker_device_info(config)
+            assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == ','.join(info['device_ids'])
+            return info
+
+    actors = [Probe.options(**options).remote() for _ in range(2)]
+    infos = ray.get([actor.info.remote() for actor in actors], timeout=30)
+    assert all(info['device'] == 'npu' and len(info['device_ids']) == tp for info in infos)
+    assert set(infos[0]['device_ids'] + infos[1]['device_ids']) == set(visible_ids)
+    assert set(infos[0]['device_ids']).isdisjoint(infos[1]['device_ids'])
+finally:
+    ray.shutdown()
+''')
+    root = Path(__file__).resolve().parents[2]
+    # Pass the repository path explicitly because this script lives outside it.
+    result = subprocess.run([sys.executable, '-c',
+                             f'import sys; sys.path.insert(0, {str(root)!r}); '
+                             f'exec(compile(open({str(script)!r}).read(), {str(script)!r}, "exec"))', str(tp)],
+                            cwd=root, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_mock_never_requests_accelerators():
+    config = {'backend': 'mock', 'device': 'npu', 'concurrency': [4], 'tensor_parallel_size': 2}
+    assert worker_options(config) == {'num_cpus': 1, 'num_gpus': 0, 'max_concurrency': 6}
 
 
 @pytest.mark.parametrize('enabled', [False, True])
