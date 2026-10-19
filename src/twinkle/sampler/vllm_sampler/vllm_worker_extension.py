@@ -522,14 +522,29 @@ class TwinkleWorkerExtension:
             return
         drafter_model.load_weights(weights)
 
+    @staticmethod
+    def _get_loadable_state_keys(model):
+        """Report loader names, which can differ from LoRA state_dict names."""
+        modules = dict(model.named_modules(remove_duplicate=False))
+        keys = []
+        for key in model.state_dict():
+            prefix, separator, suffix = key.partition('.base_layer.')
+            # Newer vLLM LoRA wrappers delegate load_weights to base_layer;
+            # that loader expects `weight`, not `base_layer.weight`. Older
+            # wrappers lack this method and still need the internal name.
+            if separator and callable(getattr(modules[prefix], 'load_weights', None)):
+                key = f'{prefix}.{suffix}'
+            keys.append(key)
+        return keys
+
     def get_state_keys(self):
-        keys = list(self.model_runner.model.state_dict().keys())
+        keys = self._get_loadable_state_keys(self.model_runner.model)
         drafter_model = self._drafter_model()
         if drafter_model is not None:
             # The union, because callers use these keys to decide how to *name* what they send
             # (e.g. whether a LoRA base layer keeps its ``.base_layer`` suffix). Reporting only the
             # target's keys would make those decisions wrong for every MTP weight.
-            keys.extend(drafter_model.state_dict().keys())
+            keys.extend(self._get_loadable_state_keys(drafter_model))
         return keys
 
     def _get_zmq_handle(self) -> str:
