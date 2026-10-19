@@ -21,6 +21,7 @@ import torch
 from typing import Dict, List, Optional, Tuple
 
 from twinkle import get_logger
+from twinkle.patch.vllm_weight_loader import streaming_weight_sync
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
@@ -114,6 +115,7 @@ class TwinkleWorkerExtension:
     # Public API — called via collective_rpc from VLLMEngine
     # -----------------------------------------------------------------
 
+    @streaming_weight_sync()
     def update_weights_from_ipc(
         self,
         peft_config: Optional[Dict] = None,
@@ -522,29 +524,15 @@ class TwinkleWorkerExtension:
             return
         drafter_model.load_weights(weights)
 
-    @staticmethod
-    def _get_loadable_state_keys(model):
-        """Report loader names, which can differ from LoRA state_dict names."""
-        modules = dict(model.named_modules(remove_duplicate=False))
-        keys = []
-        for key in model.state_dict():
-            prefix, separator, suffix = key.partition('.base_layer.')
-            # Newer vLLM LoRA wrappers delegate load_weights to base_layer;
-            # that loader expects `weight`, not `base_layer.weight`. Older
-            # wrappers lack this method and still need the internal name.
-            if separator and callable(getattr(modules[prefix], 'load_weights', None)):
-                key = f'{prefix}.{suffix}'
-            keys.append(key)
-        return keys
-
     def get_state_keys(self):
-        keys = self._get_loadable_state_keys(self.model_runner.model)
+        """Return internal parameter names; each loader adapts its own input names."""
+        keys = list(self.model_runner.model.state_dict().keys())
         drafter_model = self._drafter_model()
         if drafter_model is not None:
             # The union, because callers use these keys to decide how to *name* what they send
             # (e.g. whether a LoRA base layer keeps its ``.base_layer`` suffix). Reporting only the
             # target's keys would make those decisions wrong for every MTP weight.
-            keys.extend(self._get_loadable_state_keys(drafter_model))
+            keys.extend(drafter_model.state_dict().keys())
         return keys
 
     def _get_zmq_handle(self) -> str:
