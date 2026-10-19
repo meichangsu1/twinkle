@@ -101,6 +101,50 @@ sh run_openenv.sh --batch-size 2 --num-generations 4 --max-steps 2
 
 `agentenv` memory = `batch-size × num-generations × 1GB + 8GB`, i.e. ~40GB at the default 32 concurrent sandboxes.
 
+## Prefix-cache and sticky-session comparison
+
+Compare three groups through the same training entry point:
+
+| Group | Prefix cache | Session affinity |
+|---|---|---|
+| A | off | off |
+| B | on | off |
+| D | on | on |
+
+From this directory, with the OpenEnv server already running:
+
+```bash
+# A: both off
+sh run_openenv.sh --no-enable-prefix-caching --no-session-affinity --seed 42 --output-dir output/A
+# B: prefix cache only
+sh run_openenv.sh --enable-prefix-caching --no-session-affinity --seed 42 --output-dir output/B
+# D: both on
+sh run_openenv.sh --enable-prefix-caching --session-affinity --seed 42 --output-dir output/D
+```
+
+Use `run_agentenv.sh` in place of `run_openenv.sh` for the AgentENV backend.
+Keep the same initial model/adapter, dataset order, environment backend, device allocation,
+generation settings and training budget. Each command starts an independent training run;
+do not resume a later group from a checkpoint produced by an earlier group.
+`--seed` is passed to Twinkle initialization and is the default sampling seed. Actual trajectories
+and tool-call timings can still differ. For repeated measurements, use separate output directories
+per group and seed; randomize group order and compare matching seeds.
+
+The default remains prefix cache off and session affinity on. Both switches are logged at startup.
+`--output-dir` controls checkpoint placement. A/B measures the prefix-cache benefit, B/D measures
+the incremental sticky benefit with prefix caching, and A/D measures the combined result.
+Compare training wall time and rollout time alongside
+the solve rate and token/turn counts, since faster runs can also produce different trajectories.
+These switches do not change the example's GPU device layout into an NPU training configuration.
+
+The standalone sampling benchmark defaults to the same A/B/D groups:
+
+```bash
+python ../../../scripts/benchmark_sticky_session.py \
+  --device npu --model /path/to/model --groups A B D \
+  --output-dir /tmp/sticky-three-groups
+```
+
 ## Files
 
 | File | Role |

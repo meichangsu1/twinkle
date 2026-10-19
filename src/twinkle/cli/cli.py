@@ -149,6 +149,7 @@ class SamplerArgs:
     enable_lora: bool = False
     max_lora_rank: int = 32
     enforce_eager: bool = False
+    enable_prefix_caching: bool = False
 
 
 @dataclass
@@ -200,6 +201,7 @@ class ServerArgs:
 @dataclass
 class RLArgs:
     num_generations: int = 8
+    session_affinity: bool = True
     advantage_type: str = 'GRPOAdvantage'
     advantage_scale: Literal['group', 'batch', 'none'] = 'group'
     reward_fns: list[str] | None = None

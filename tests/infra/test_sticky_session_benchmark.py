@@ -365,7 +365,7 @@ def test_invalid_benchmark_configuration_fails_before_ray_startup(tmp_path, opti
 
 
 @pytest.mark.parametrize('variable', [False, True])
-def test_mock_benchmark_runs_full_matrix_and_releases_routes(tmp_path, variable):
+def test_mock_benchmark_runs_default_groups_and_releases_routes(tmp_path, variable):
     root = Path(__file__).resolve().parents[2]
     output = tmp_path / 'benchmark'
     options = (['--prompt-tokens-range', '64', '128', '--append-tokens-range', '32', '48',
@@ -383,8 +383,9 @@ def test_mock_benchmark_runs_full_matrix_and_releases_routes(tmp_path, variable)
     workload = {row['episode_id']: row for row in
                 (json.loads(line) for line in (output / 'workload.jsonl').read_text().splitlines())}
     assert summary['synthetic'] is True
-    assert len(summary['trials']) == 16
-    assert len(records) == 16 * 4 * 3
+    assert {trial['group'] for trial in summary['trials']} == {'A', 'B', 'D'}
+    assert len(summary['trials']) == 12
+    assert len(records) == 12 * 4 * 3
     assert all(record['metrics_source'] == 'synthetic_mock' for record in records)
     for record in records:
         episode = workload[record['episode_id']]

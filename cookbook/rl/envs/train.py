@@ -146,7 +146,9 @@ def main():
     ]
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
-    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
+    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False,
+                       extra_torch_kwargs={'seed': args.training.seed,
+                                           'full_determinism': args.training.full_determinism})
 
     lora_config = LoraConfig(
         target_modules='all-linear',
@@ -176,6 +178,7 @@ def main():
         engine_args={
             'gpu_memory_utilization': 0.8,
             'max_model_len': 8192,
+            'enable_prefix_caching': args.sampler.enable_prefix_caching,
             'max_lora_rank': 32,
             'enable_lora': True,
             'enable_tower_connector_lora': True,
@@ -193,12 +196,14 @@ def main():
     sampling_params = SamplingParams(
         max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1,
         temperature=1.0, top_p=0.95,
+        seed=args.training.seed if args.sampling.seed is None else args.sampling.seed,
     )
     rollout = MultiTurnRollout(
         sampler=sampler,
         template=rollout_template,
         sampling_params=sampling_params,
         max_turns=MAX_TURNS,
+        session_affinity=args.rl.session_affinity,
     )
 
     advantage_fn = GRPOAdvantage()
@@ -209,6 +214,9 @@ def main():
     optim_step = 0
     sample_cursor = 0
     logger.info(f'Starting code RL [{backend.NAME}] — {backend.describe()}')
+    logger.info(f'Routing comparison: prefix_cache={args.sampler.enable_prefix_caching}, '
+                f'session_affinity={args.rl.session_affinity}, seed={args.training.seed}, '
+                f'output_dir={args.training.output_dir}')
     logger.info(f'Concurrent envs needed: {BATCH_SIZE * NUM_GENERATIONS}')
     logger.info(get_device_placement())
 
@@ -308,7 +316,7 @@ def main():
             if optim_step >= MAX_STEPS:
                 break
             if optim_step % SAVE_STEPS == 0:
-                model.save(f'code-rl-{backend.NAME}-checkpoint-{optim_step}')
+                model.save(f'code-rl-{backend.NAME}-checkpoint-{optim_step}', output_dir=args.training.output_dir)
 
         # 8. Step summary
         log_dict = metrics.calculate()                             # train/*_reward, train/completion_length
@@ -324,7 +332,7 @@ def main():
 
     env_pool.shutdown(wait=False)
     logger.info(f'Training completed. optim_steps={optim_step}')
-    model.save(f'code-rl-{backend.NAME}-final')
+    model.save(f'code-rl-{backend.NAME}-final', output_dir=args.training.output_dir)
 
 
 if __name__ == '__main__':

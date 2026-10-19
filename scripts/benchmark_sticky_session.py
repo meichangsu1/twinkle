@@ -536,7 +536,8 @@ def parse_args(argv=None):
     parser.add_argument('--tool-wait-ms', nargs=2, type=float, default=[0, 0], metavar=('MIN', 'MAX'),
                         help='Simulated tool waits before continuation turns; defaults to no waits.')
     parser.add_argument('--concurrency', nargs='+', type=int, default=[8])
-    parser.add_argument('--groups', nargs='+', choices=list(GROUPS), default=list(GROUPS))
+    parser.add_argument('--groups', nargs='+', choices=list(GROUPS), default=['A', 'B', 'D'],
+                        help='Comparison groups; defaults to A B D.')
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--max-sessions', type=int, default=10000)
     parser.add_argument('--warmup-requests', type=int, default=2)

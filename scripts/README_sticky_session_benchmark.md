@@ -1,5 +1,8 @@
 # Sticky session 基准
 
+真实单轮 GRPO 训练的 A/B/D 对照见 [GRPO 端到端实验](README_grpo_sticky_session.md)，
+包含组内亲和路由、NPU 配置、训练分阶段计时和独立画图脚本。
+
 `benchmark_sticky_session.py` 重放固定的多轮 token 输入，复用生产代码的
 `_run_continous_work`、共享 `RequestRouter`、lease 和结果收集。
 每个 Ray replica 内部运行本地 `vLLMSampler.sample()`，使用真实引擎；可模拟工具等待，
@@ -30,7 +33,7 @@ python scripts/benchmark_sticky_session.py \
 vLLM-Ascend；无需安装训练后端。环境准备见[项目 NPU 指南](../docs/source_zh/使用指引/NPU的支持.md)。
 先准备一个当前环境支持、能单卡运行的模型，并使用其本地路径。
 
-最小配置是 **2 张 NPU、2 个副本、每副本 TP=1**。四组依次运行，共用这些设备；
+最小配置是 **2 张 NPU、2 个副本、每副本 TP=1**。各组依次运行，共用这些设备；
 若每副本 TP=2，则需要 4 张 NPU，每个副本的 TP 设备必须在同一节点。
 
 ```bash
@@ -47,7 +50,7 @@ python scripts/benchmark_sticky_session.py \
 ```
 
 该命令先比较开启 prefix cache 时的普通路由 B 和 sticky 路由 D；去掉 `--groups B D`
-即可跑完整四组。`--gpu-memory-utilization` 沿用 vLLM 的参数名称，在 NPU 上同样表示设备内存比例。
+即可跑默认的 A/B/D 三组。`--gpu-memory-utilization` 沿用 vLLM 的参数名称，在 NPU 上同样表示设备内存比例。
 
 本地启动时根据可见 NPU 数注册 Ray 的 `NPU` 资源，每个副本占用 TP 数量的完整资源，
 并在加载引擎前使用 Ray 分配的设备 ID 设置 `ASCEND_RT_VISIBLE_DEVICES`。
@@ -62,10 +65,10 @@ python scripts/benchmark_sticky_session.py \
 |---|---|---|
 | A | 关闭 | 关闭 |
 | B | 关闭 | 开启 |
-| C | 开启 | 关闭 |
 | D | 开启 | 开启 |
 
-默认跑四组，重点比较 D/B。仅跑主对照可加 `--groups B D`。
+默认跑 A/B/D 三组：B/A 查看 prefix cache 收益，D/B 查看 sticky 的增量收益，D/A 查看整体收益。
+仅跑 sticky 主对照可加 `--groups B D`。
 相同 cache 配置复用一个实例池，每次测量前等待缓存重置完成；不同 cache 配置重建实例池。
 启动与预热不计入测量，同一 cache 配置内的组运行顺序按 repeat 打乱。
 所有组重放完全相同的输入和逐轮生成上限，模型和引擎 seed 固定，实际输出 token 数单独记录。
@@ -101,7 +104,7 @@ python scripts/benchmark_sticky_session.py \
 等待过长时，端到端耗时可能主要由等待决定，应同时观察引擎指标。
 
 所有计划由 `--seed` 一次性生成。`workload.jsonl` 除 `prompts` 外，还保存逐轮的
-`max_tokens` 和 `tool_wait_s`；A/B/C/D、全部 repeat 和并发配置复用相同计划。
+`max_tokens` 和 `tool_wait_s`；所有选中组、全部 repeat 和并发配置复用相同计划。
 `workload_hash` 包含这些安排，`requests.jsonl` 逐条记录 `max_tokens` 与 `planned_tool_wait_s`。
 固定的是相对等待时长和输入，不保证墙钟到达顺序一致。
 
