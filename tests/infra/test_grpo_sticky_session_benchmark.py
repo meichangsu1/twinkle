@@ -15,6 +15,7 @@ from scripts.benchmark_grpo_sticky_session import (
     observe_engine,
     paired_comparisons,
     parse_args,
+    prepare_inputs,
     prompt_key,
     read_inputs,
     run_experiment,
@@ -219,13 +220,48 @@ def test_input_plan_rejects_missing_labels_and_bad_lengths(tmp_path):
         read_inputs(path, config(plan_hash=None))
 
 
+def test_prepare_inputs_reads_standard_local_train_split_and_preserves_reward_labels(tmp_path, monkeypatch):
+    from datasets import Dataset as HFDataset
+
+    from twinkle.dataset import Dataset
+    from twinkle.hub import HubOperation
+
+    def no_remote(*args, **kwargs):
+        raise AssertionError('Local datasets must not call the remote hub')
+
+    monkeypatch.setattr(HubOperation, 'load_dataset', no_remote)
+    train = HFDataset.from_list([{'question': 'Train question', 'answer': 'Reasoning\n#### 1'}])
+    test = HFDataset.from_list([{'question': 'Test question', 'answer': '#### 2'}])
+    source = tmp_path / 'gsm8k'
+    source.mkdir()
+    train.to_parquet(source / 'train-00000-of-00001.parquet')
+    test.to_parquet(source / 'test-00000-of-00001.parquet')
+
+    def encode(self, add_generation_prompt):
+        assert add_generation_prompt
+        self.dataset = self.dataset.map(lambda row: {'input_ids': [11, 22]})
+
+    # Exercise local loading and the real GSM8K preprocessor without downloading a tokenizer.
+    monkeypatch.setattr(Dataset, 'set_template', lambda *args, **kwargs: None)
+    monkeypatch.setattr(Dataset, 'encode', encode)
+    plan = tmp_path / 'inputs.jsonl'
+    options = config(steps=1, batch_size=1, plan_hash=None, input_plan=None, dataset_id=str(source),
+                     model='unused', plan_file=str(plan))
+    prepare_inputs(options)
+    rows = read_inputs(plan, options)
+    assert len(rows) == 1
+    assert rows[0]['input_ids'] == [11, 22]
+    assert dict(rows[0]['user_data']) == {'ground_truth': '1'}
+    assert rows[0]['messages'][-1]['content'] == 'Train question'
+
+
 @pytest.mark.parametrize('flags', [
     ['--temperature', '0'], ['--warmup-steps', '50'], ['--replicas', '1'],
     ['--mini-batch-size', '7'], ['--max-model-len', '1024'], ['--seeds', '42', '42'],
 ])
 def test_invalid_experiments_fail_before_loading_models(flags):
     with pytest.raises(SystemExit):
-        parse_args(['--model', 'local-model', '--output-dir', 'unused', *flags])
+        parse_args(['--model', 'local-model', '--output-dir', 'unused', '--dataset-id', '/data/gsm8k', *flags])
 
 
 def test_seed_pairs_and_failed_trials_do_not_pollute_ratios():

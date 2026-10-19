@@ -21,6 +21,7 @@
 ```bash
 python scripts/benchmark_grpo_sticky_session.py \
   --device npu --model /path/to/Qwen3.5-0.8B \
+  --dataset-id /path/to/gsm8k \
   --groups A B D --seeds 42 \
   --steps 3 --warmup-steps 1 \
   --batch-size 4 --num-generations 8 --mini-batch-size 16 \
@@ -34,6 +35,7 @@ python scripts/benchmark_grpo_sticky_session.py \
 ```bash
 python scripts/benchmark_grpo_sticky_session.py \
   --device npu --model /path/to/Qwen3.5-0.8B \
+  --dataset-id /path/to/gsm8k \
   --groups A B D --seeds 42 43 44 \
   --steps 50 --warmup-steps 5 \
   --batch-size 16 --num-generations 8 --mini-batch-size 32 \
@@ -51,9 +53,19 @@ CUDA 使用 `--device cuda`。`--language-model-only` 适合支持此参数的�
 
 ## 数据与随机性
 
-运行前在独立 CPU 准备进程中加载 `ms://modelscope/gsm8k`、`main/train`，使用现有 `GSM8KProcessor` 和 `Template(enable_thinking=False)`，保存一次编码后的 `inputs.jsonl`，包含评分所需的 ground truth。各组、各 seed 读取同一份文件，相同批次使用相同 prompt 顺序。数据不足以覆盖所有批次时直接报错，不循环补齐。
+运行前在独立 CPU 准备进程中加载 GSM8K 的 train split，使用现有 `GSM8KProcessor` 和 `Template(enable_thinking=False)`，保存一次编码后的 `inputs.jsonl`，包含评分所需的 ground truth。各组、各 seed 读取同一份文件，相同批次使用相同 prompt 顺序。数据不足以覆盖所有批次时直接报错，不循环补齐。
 
-`--dataset-id` / `--dataset-revision` / `--subset` 可以固定 GSM8K 来源；处理器要求 `question`、`answer` 的 GSM8K 格式。`--input-plan /previous/run/inputs.jsonl` 可以跨运行重用编码输入，要求行数恰好等于 steps × batch-size，且使用相同 tokenizer、模板、模型和长度设置。
+通过 `--dataset-id /path/to/gsm8k` 指定存放 Parquet 文件的本地目录，脚本直接读取该目录的 train split：
+
+```text
+/path/to/gsm8k/
+  train-00000-of-00001.parquet
+  test-00000-of-00001.parquet
+```
+
+每条数据使用标准 `question` 和 `answer` 字段，answer 包含 `#### 最终答案`。首次运行需通过 `--dataset-id` 显式提供本地路径。
+
+`--input-plan /previous/run/inputs.jsonl` 可以跨运行重用编码输入，此时无需提供 `--dataset-id`；要求行数恰好等于 steps × batch-size，且使用相同 tokenizer、模板、模型和长度设置。
 
 训练和 vLLM 引擎设置相同 seed，但**不会给 G 个 n=1 请求设置相同的请求级采样 seed**，避免生成完全相同的候选、使 GRPO advantage 退化。实际完成内容、长度、后续策略权重可能因调度及数值差异而改变；本实验保证输入和训练预算一致，不声称完整轨迹重放或逐步权重一致。
 

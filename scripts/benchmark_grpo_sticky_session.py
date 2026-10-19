@@ -128,14 +128,17 @@ def observed_classes():
 
 def prepare_inputs(config):
     """Freeze encoded real dataset inputs (including reward labels) before any trial."""
+    from datasets import load_dataset
+
     from twinkle.dataset import Dataset, DatasetMeta
     from twinkle.preprocessor.llm import GSM8KProcessor
 
     if config['input_plan']:
         inputs = read_inputs(config['input_plan'], config)
     else:
-        options = {'revision': config['dataset_revision']} if config['dataset_revision'] else {}
-        dataset = Dataset(DatasetMeta(config['dataset_id'], subset_name=config['subset'], split='train'), **options)
+        directory = Path(config['dataset_id']).expanduser().resolve()
+        data = load_dataset(str(directory), split='train')
+        dataset = Dataset(DatasetMeta(data=data))
         dataset.map(GSM8KProcessor())
         dataset.set_template('Template', model_id=config['model'], max_length=config['max_prompt_tokens'],
                              truncation_strategy='delete', enable_thinking=False)
@@ -556,9 +559,7 @@ def parse_args(argv=None):
     parser.add_argument('--enforce-eager', action='store_true')
     parser.add_argument('--language-model-only', action='store_true')
     parser.add_argument('--save-checkpoint', action='store_true')
-    parser.add_argument('--dataset-id', default='ms://modelscope/gsm8k')
-    parser.add_argument('--dataset-revision')
-    parser.add_argument('--subset', default='main')
+    parser.add_argument('--dataset-id', help='Local directory containing GSM8K train/test Parquet files')
     parser.add_argument('--input-plan', help='Encoded GSM8K JSONL from a previous run; exact row count must match')
     args = parser.parse_args(argv)
     if args.prepare_config or args.trial_config:
@@ -567,6 +568,8 @@ def parse_args(argv=None):
         return args
     if not args.model or not args.output_dir:
         parser.error('--model and --output-dir are required')
+    if not args.dataset_id and not args.input_plan:
+        parser.error('--dataset-id is required unless --input-plan is provided')
     positive = ('model_devices', 'replicas', 'steps', 'batch_size', 'num_generations', 'mini_batch_size',
                 'micro_batch_size', 'max_prompt_tokens', 'max_tokens', 'max_model_len', 'max_num_seqs')
     if any(getattr(args, name) < 1 for name in positive):
