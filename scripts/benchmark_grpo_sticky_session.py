@@ -414,7 +414,7 @@ def run_training(config):
         if any(item['logprobs_mode'] != 'raw_logprobs' for item in info):
             raise RuntimeError(f'Engine must return raw model logprobs for GRPO training: {info}')
         write_json(output / 'instances.json', info)
-        checkpoint = CheckpointEngineManager(model=model, sampler=sampler)
+        checkpoint = CheckpointEngineManager(model=model, sampler=sampler, platform=platform)
         # Do not give all n=1 copies the same per-request seed: that collapses GRPO diversity.
         sampling_params = SamplingParams(num_samples=1, max_tokens=config['max_tokens'], logprobs=1,
                                          temperature=config['temperature'], top_p=config['top_p'])
@@ -470,10 +470,10 @@ def paired_comparisons(trials):
 
 def launch_process(flag, config_file, log_file):
     with Path(log_file).open('x') as stream:
-        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), flag, str(config_file)],
+        result = subprocess.run([sys.executable, '-u', str(Path(__file__).resolve()), flag, str(config_file)],
                                 stdout=stream, stderr=subprocess.STDOUT, check=False)
     if result.returncode:
-        tail = '\n'.join(Path(log_file).read_text(errors='replace').splitlines()[-25:])
+        tail = '\n'.join(Path(log_file).read_text(errors='replace').splitlines()[-150:])
         raise RuntimeError(f'Child process exited {result.returncode}; inspect {log_file}\n{tail}')
 
 

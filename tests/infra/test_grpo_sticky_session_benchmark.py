@@ -12,6 +12,7 @@ import pytest
 
 from scripts.benchmark_grpo_sticky_session import (
     expand_groups,
+    launch_process,
     observe_engine,
     paired_comparisons,
     parse_args,
@@ -308,6 +309,19 @@ def test_parent_uses_fresh_processes_rotates_order_and_records_failures(tmp_path
     assert len(summary['trials']) == 4
     assert summary['trials'][-1]['status'] == 'failed'
     assert (output / 'B-seed-43' / 'error.json').exists()
+
+
+def test_failure_diagnostics_retain_exception_before_trailing_worker_logs(tmp_path, monkeypatch):
+    def failed_child(command, *, stdout, **kwargs):
+        stdout.write('Traceback (most recent call last):\nRuntimeError: engine startup failed\n')
+        stdout.write('worker compiler cleanup log\n' * 100)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(subprocess, 'run', failed_child)
+    with pytest.raises(RuntimeError, match='Child process exited 1') as error:
+        launch_process('--trial-config', tmp_path / 'config.json', tmp_path / 'run.log')
+    assert 'RuntimeError: engine startup failed' in str(error.value)
+    assert 'Traceback (most recent call last)' in str(error.value)
 
 
 def test_observed_subclasses_run_through_real_ray_continuous_work():
