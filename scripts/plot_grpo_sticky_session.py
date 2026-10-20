@@ -22,7 +22,7 @@ def load_summary(path):
     if path.is_dir():
         path /= 'summary.json'
     summary = json.loads(path.read_text())
-    if summary.get('benchmark') != 'real_grpo_group_affinity':
+    if summary.get('benchmark') not in ('real_grpo_group_affinity', 'synthetic_multiturn_grpo_affinity'):
         raise ValueError('Expected the parent summary from benchmark_grpo_sticky_session.py')
     trials = [trial for trial in summary['trials'] if trial['status'] == 'complete']
     if not trials:
@@ -47,7 +47,10 @@ def render(path, output_dir=None, formats=('png',), dpi=160):
     output = Path(output_dir) if output_dir else path.parent / 'plots'
     output.mkdir(parents=True, exist_ok=True)
     groups = [group for group in COLORS if any(trial['group'] == group for trial in trials)]
-    title = f'GRPO | {summary["config"]["model"]} | {summary["config"]["device"]}'
+    synthetic = summary['benchmark'] == 'synthetic_multiturn_grpo_affinity'
+    task = 'Synthetic multi-turn GRPO' if synthetic else 'GRPO'
+    title = f'{task} | {summary["config"]["model"]} | {summary["config"]["device"]}'
+    labels = {**LABELS, 'D': 'D: cache on / episode affinity on'} if synthetic else LABELS
     if summary['status'] != 'complete':
         title += ' | INCOMPLETE RUN'
     footer = ('Dots: independent seed trials; bars: median; whiskers: min-max (not a confidence interval).\n'
@@ -91,12 +94,16 @@ def render(path, output_dir=None, formats=('png',), dpi=160):
         ('accuracy', 'Training rollout answer accuracy', '%', 100),
         ('mean_replicas_per_prompt', 'Instances serving one prompt group', 'instances / prompt', 1),
     ]
+    if synthetic:
+        panels[3] = ('completion_tokens_mean', 'Actual generated tokens across all turns', 'tokens / episode', 1)
+        panels[4] = ('accuracy', 'Synthetic lookup accuracy across turns', '%', 100)
+        panels[5] = ('mean_replicas_per_episode', 'Instances serving one episode', 'instances / episode', 1)
     for axis, (metric, panel_title, ylabel, scale) in zip(axes.flat, panels, strict=True):
         bars(axis, metric, ylabel, scale)
         axis.set_title(panel_title, fontsize=11)
     figure.suptitle(title)
     figure.legend([plt.Rectangle((0, 0), 1, 1, color=COLORS[group]) for group in groups],
-                  [LABELS[group] for group in groups], loc='upper center', bbox_to_anchor=(0.5, 0.94), ncol=3)
+                  [labels[group] for group in groups], loc='upper center', bbox_to_anchor=(0.5, 0.94), ncol=3)
     figure.text(0.02, 0.01, footer, fontsize=9, color='#555555')
     figure.tight_layout(rect=(0, 0.08, 1, 0.89))
     save(figure, 'overview')
@@ -115,6 +122,18 @@ def render(path, output_dir=None, formats=('png',), dpi=160):
     axis.legend(loc='upper left', bbox_to_anchor=(1, 1))
     figure.tight_layout()
     save(figure, 'stage_times')
+
+    if synthetic:
+        figure, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+        for axis, (metric, panel_title, ylabel, scale) in zip(axes, [
+                ('continuation_cache_hit_fraction', 'Prefix-cache hits after the first turn', '% of input tokens', 100),
+                ('replica_switch_rate', 'Replica switches between consecutive turns', '% of transitions', 100),
+                ('initial_prompt_tokens_mean', 'Actual initial prompt length', 'tokens', 1)], strict=True):
+            bars(axis, metric, ylabel, scale)
+            axis.set_title(panel_title, fontsize=10)
+        figure.suptitle(title)
+        figure.tight_layout()
+        save(figure, 'multiturn')
 
     if pairs:
         figure, axes = plt.subplots(1, 3, figsize=(14, 4.5))

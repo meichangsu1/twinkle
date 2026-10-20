@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Real single-turn GRPO training: prefix-cache / group-affinity A/B/D trials.
+"""Real GRPO training: GSM8K or synthetic multi-turn prefix-cache / affinity trials.
 
 Run from the repository root; see README_grpo_sticky_session.md. Each trial
 runs in a fresh process with a fresh trainer, sampler pool and optimizer.
@@ -98,6 +98,14 @@ def observed_classes():
             self._benchmark_instance = str(self._benchmark_instance)
             observe_engine(self.engine.engine, self._benchmark_rows, self._benchmark_instance)
 
+        async def _sample_single(self, *args, **kwargs):
+            # Benchmark-only correlation: identical prompt copies still have distinct
+            # native engine requests. Keep routing IDs out of the engine API.
+            kwargs['request_id'] = kwargs.get('request_id') or uuid.uuid4().hex
+            response = await super()._sample_single(*args, **kwargs)
+            response._benchmark_request_id = kwargs['request_id']
+            return response
+
         @remote_function(collect='flatten', lazy_collect=False)
         def take_observations(self):
             # Run on the engine loop after sample completes, without a cross-thread race.
@@ -128,6 +136,9 @@ def observed_classes():
 
 def prepare_inputs(config):
     """Freeze encoded real dataset inputs (including reward labels) before any trial."""
+    if config.get('task') == 'synthetic':
+        from scripts.synthetic_grpo_workload import prepare_inputs as prepare_synthetic
+        return prepare_synthetic(config)
     from datasets import load_dataset
 
     from twinkle.dataset import Dataset, DatasetMeta
@@ -212,6 +223,10 @@ def summarize_observations(rows, prompts, generations):
 def train_batches(config, inputs, model, sampler, checkpoint, sampling_params, reward_fn, advantage_fn,
                   steps_stream, requests_stream, router_status):
     """Real update loop, injectable so lifecycle and update order can be verified on CPU."""
+    if config.get('task') == 'synthetic':
+        from scripts.synthetic_grpo_workload import train_batches as train_synthetic
+        return train_synthetic(config, inputs, model, sampler, checkpoint, sampling_params, advantage_fn,
+                               steps_stream, requests_stream, router_status)
     affinity, _ = GROUPS[config['group']]
     generations = config['num_generations']
     records = []
@@ -314,7 +329,7 @@ def summarize_trial(config, records):
     inputs = sum(row['input_tokens'] for row in measured)
     outputs = sum(row['output_tokens'] for row in measured)
     cached = [row['cached_tokens'] for row in measured]
-    return {
+    summary = {
         'status': 'complete', 'group': config['group'], 'seed': config['seed'],
         'plan_hash': config['plan_hash'], 'config': config,
         'measured_batches': len(measured), 'optimizer_updates': sum(row['optimizer_updates'] for row in measured),
@@ -335,6 +350,10 @@ def summarize_trial(config, records):
             count for row in measured for count in row['group_replica_counts'])
         if any(row['group_replica_counts'] for row in measured) else None,
     }
+    if config.get('task') == 'synthetic':
+        from scripts.synthetic_grpo_workload import summarize_multiturn
+        summary.update(summarize_multiturn(measured))
+    return summary
 
 
 def run_training(config):
@@ -353,7 +372,6 @@ def run_training(config):
     from twinkle.checkpoint_engine import CheckpointEngineManager
     from twinkle.data_format import SamplingParams
     from twinkle.processor import InputProcessor
-    from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
 
     platform = 'NPU' if config['device'] == 'npu' else 'GPU'
     accelerator = torch.npu if platform == 'NPU' else torch.cuda
@@ -405,7 +423,8 @@ def run_training(config):
                               device_mesh=DeviceMesh.from_sizes(world_size=config['replicas'],
                                                                 dp_size=config['replicas'],
                                                                 device_type=config['device']),
-                              routing_config={'max_sessions': config['batch_size']})
+                              routing_config={'max_sessions': config['batch_size'] * (
+                                  config['num_generations'] if config.get('task') == 'synthetic' else 1)})
         sampler.set_template('Template', model_id=config['model'], max_length=config['max_model_len'],
                              enable_thinking=False)
         info = sampler.benchmark_info()
@@ -418,11 +437,14 @@ def run_training(config):
         # Do not give all n=1 copies the same per-request seed: that collapses GRPO diversity.
         sampling_params = SamplingParams(num_samples=1, max_tokens=config['max_tokens'], logprobs=1,
                                          temperature=config['temperature'], top_p=config['top_p'])
-        accuracy_fn, format_fn = GSM8KAccuracyReward(), GSM8KFormatReward()
+        reward_fn = None
+        if config.get('task') != 'synthetic':
+            from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
+            accuracy_fn, format_fn = GSM8KAccuracyReward(), GSM8KFormatReward()
 
-        def reward_fn(features):
-            accuracy, formats = accuracy_fn(features), format_fn(features)
-            return [a + f for a, f in zip(accuracy, formats, strict=True)], accuracy
+            def reward_fn(features):
+                accuracy, formats = accuracy_fn(features), format_fn(features)
+                return [a + f for a, f in zip(accuracy, formats, strict=True)], accuracy
 
         def router_status():
             return ray.get(sampler._request_router.get_status.remote())
@@ -487,12 +509,14 @@ def run_experiment(config):
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = None
-    manifest = {'benchmark': 'real_grpo_group_affinity', 'status': 'running', 'config': config,
+    benchmark = ('synthetic_multiturn_grpo_affinity' if config.get('task') == 'synthetic'
+                 else 'real_grpo_group_affinity')
+    manifest = {'benchmark': benchmark, 'status': 'running', 'config': config,
                 'packages': packages, 'trials': [], 'comparisons': []}
     write_json(output / 'config.json', config)
     write_json(output / 'summary.json', manifest)
     try:
-        logger.info('Preparing fixed GSM8K inputs; log: %s', output / 'prepare.log')
+        logger.info('Preparing fixed %s inputs; log: %s', config.get('task', 'gsm8k'), output / 'prepare.log')
         prepare_begin = time.perf_counter()
         launch_process('--prepare-config', output / 'config.json', output / 'prepare.log')
         manifest['prepare_wall_s'] = time.perf_counter() - prepare_begin
@@ -559,8 +583,18 @@ def parse_args(argv=None):
     parser.add_argument('--enforce-eager', action='store_true')
     parser.add_argument('--language-model-only', action='store_true')
     parser.add_argument('--save-checkpoint', action='store_true')
+    parser.add_argument('--task', choices=['gsm8k', 'synthetic'], default='gsm8k')
+    parser.add_argument('--prompt-tokens', type=int, default=3072,
+                        help='Synthetic initial prompt target (including the chat template)')
+    parser.add_argument('--turns', type=int, default=4, help='Fixed generation turns per synthetic episode')
+    parser.add_argument('--feedback-tokens', type=int, default=256,
+                        help='Per-episode synthetic observation payload tokens, excluding the next query')
+    parser.add_argument('--feedback-delay-ms', type=float, default=100,
+                        help='Synthetic waits are frozen uniformly between zero and this value')
+    parser.add_argument('--episode-concurrency', type=int, default=8)
+    parser.add_argument('--data-seed', type=int, default=2026, help='Synthetic plan seed, independent of training seeds')
     parser.add_argument('--dataset-id', help='Local directory containing GSM8K train/test Parquet files')
-    parser.add_argument('--input-plan', help='Encoded GSM8K JSONL from a previous run; exact row count must match')
+    parser.add_argument('--input-plan', help='Encoded input JSONL from a previous run; exact row count must match')
     args = parser.parse_args(argv)
     if args.prepare_config or args.trial_config:
         if args.prepare_config and args.trial_config:
@@ -568,8 +602,24 @@ def parse_args(argv=None):
         return args
     if not args.model or not args.output_dir:
         parser.error('--model and --output-dir are required')
-    if not args.dataset_id and not args.input_plan:
+    if args.task == 'gsm8k' and not args.dataset_id and not args.input_plan:
         parser.error('--dataset-id is required unless --input-plan is provided')
+    if args.task == 'synthetic':
+        if args.dataset_id:
+            parser.error('--task synthetic generates its own inputs; omit --dataset-id')
+        if args.prompt_tokens < 512 or args.prompt_tokens > args.max_prompt_tokens:
+            parser.error('Synthetic --prompt-tokens must be >= 512 and <= --max-prompt-tokens')
+        if args.turns < 2 or args.episode_concurrency < 1:
+            parser.error('Synthetic experiments need at least two turns and positive episode concurrency')
+        if args.feedback_tokens < 0:
+            parser.error('--feedback-tokens must be nonnegative')
+        if not math.isfinite(args.feedback_delay_ms) or args.feedback_delay_ms < 0:
+            parser.error('--feedback-delay-ms must be finite and nonnegative')
+        # Reserve room for feedback and chat separators as well as every completion.
+        if (args.prompt_tokens + args.turns * args.max_tokens
+                + (args.turns - 1) * (args.feedback_tokens + 256) > args.max_model_len):
+            parser.error('--max-model-len must fit the synthetic prompt, all outputs and feedback '
+                         '(reserve feedback payload + 256 tokens per feedback turn)')
     positive = ('model_devices', 'replicas', 'steps', 'batch_size', 'num_generations', 'mini_batch_size',
                 'micro_batch_size', 'max_prompt_tokens', 'max_tokens', 'max_model_len', 'max_num_seqs')
     if any(getattr(args, name) < 1 for name in positive):

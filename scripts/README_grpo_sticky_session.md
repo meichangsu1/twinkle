@@ -1,14 +1,55 @@
 # GRPO 端到端 Prefix Cache / Sticky Session 实验
 
-本实验执行真实 GSM8K 单轮 GRPO：采样、评分、组内 advantage、前后向、优化器更新，以及下一批前的权重同步。它与 `benchmark_sticky_session.py` 的固定权重多轮重放实验独立。
+本实验支持真实 GSM8K 单轮任务和合成多轮任务，两种模式均执行真实 GRPO：采样、评分、组内 advantage、前后向、优化器更新，以及下一批前的权重同步。它与 `benchmark_sticky_session.py` 的固定权重多轮重放实验独立。
 
-同一 prompt 的 G 个候选使用相同路由 ID，在采样结束的 `finally` 中解除绑定。ID 不进入输入特征或引擎请求参数；生产 sampler、router 和训练实现保持原样。
+GSM8K 模式下，同一 prompt 的 G 个候选使用相同路由 ID，在采样结束的 `finally` 中解除绑定。合成多轮模式改为逐 episode 绑定，详见下文。ID 不进入输入特征或引擎请求参数；生产 sampler、router 和训练实现保持原样。
 
 | 组别 | Prefix cache | 路由 |
 | --- | --- | --- |
 | A | 关闭 | 普通最小在途负载 |
 | B | 开启 | 普通最小在途负载 |
 | D | 开启 | 同一个 GRPO prompt 组绑定同一实例 |
+
+## 合成多轮端到端实验
+
+使用 `--task synthetic`，无需下载数据集或启动 OpenEnv。输入是由 `--data-seed` 生成的长查找表（例如 `k00012=C`）。模型每轮查询一个键并回答 A/B/C/D，本地模拟器按固定计划等待后给出下一轮查询。每条 episode 进行 `--turns` 次真实生成，整条轨迹的所有生成 token 参与 GRPO 训练。
+
+合成模式的 D 组为**每条 episode 单独创建 session ID，跨轮复用**；同题的 G 条候选各有自己的会话。绑定在 episode 退出时清理。A/B 每轮使用普通最小在途路由。
+
+最小设备配置仍为 1 张训练卡 + 2 张采样卡，共 3 张；先验证三批、四轮的完整链路：
+
+```bash
+python scripts/benchmark_grpo_sticky_session.py \
+  --task synthetic --device npu --model /path/to/Qwen3-4B \
+  --groups A B D --seeds 42 \
+  --steps 3 --warmup-steps 1 \
+  --batch-size 2 --num-generations 4 --mini-batch-size 8 --micro-batch-size 1 \
+  --prompt-tokens 3072 --max-prompt-tokens 3072 \
+  --turns 4 --feedback-tokens 256 --max-tokens 32 --max-model-len 8192 \
+  --episode-concurrency 8 --feedback-delay-ms 100 --max-num-seqs 16 \
+  --output-dir output/grpo-synthetic-smoke
+```
+
+CUDA 改为 `--device cuda`。Qwen3.5 的纯文本实验按引擎支持情况追加 `--language-model-only`。
+
+正式对照可使用相同参数，改为 `--steps 30 --warmup-steps 3 --seeds 42 43 44`，并选用新的输出目录。先检查资源和实际生成情况，再增加输入长度、并发量。
+
+- `--prompt-tokens` 是**初始编码输入的目标长度**，包括 chat template；准备阶段保证实际长度位于目标以下 16 token 范围内，保留完整问题及被查询的记录。实际初始长度也写入 summary。
+- `--feedback-tokens` 控制每条轨迹每轮新增的随机观察载荷长度，默认 256，另有简短标识和下一轮查询。观察内容因候选和轮次而异，促使历史逐轮分化；初始 prompt 和目标查询在同题的 G 条候选中保持一致。
+- `--max-tokens` 是每轮输出上限。上下文还包含所有前轮回答和反馈，启动前按 `prompt_tokens + turns × max_tokens + (turns − 1) × (feedback_tokens + 256)` 检查预算；额外 256 是每次查询及聊天分隔符的预留。运行时继续检查实际长度，超长直接报错，避免静默截断历史。
+- 等待时长在 `[0, feedback_delay_ms]` 中生成，按 prompt、候选编号和轮次写入同一份 `inputs.jsonl`，各组各 seed 复用。反馈文本和目标答案也保存在其中。实际请求到达时刻仍取决于上一轮真实生成耗时。
+- 每个线程独立推进一条 episode；没有“等全部轨迹结束本轮才进入下一轮”的屏障。采样阶段耗时包含模拟等待，各等待可以重叠，`feedback_wait_s_sum` 是累计等待量。
+- 使用生产 `TurnLedger` 保留真实采样的 token、label 和 logprob，反馈和初始上下文均不参与 loss。固定轮数由基准内的循环控制，便于模拟普通文本反馈；每轮碰到输出长度上限后仍进入下一轮，并如实记录 `stop_reason` 和 `length_stop_fraction`。不伪造模型回答或结束原因。
+- 奖励为每轮“答案正确 +1、回答格式有效 +0.1”的均值；accuracy 是真实回答的正确率。不会按候选编号制造不同奖励。整组奖励相同时 GRPO advantage 为零，日志发出提示，检查 `nonzero_advantage_fraction` 判断是否有训练信号。
+- 每批权重同步和清缓存一次，然后整批多轮 rollout 完成，再更新模型；episode 内权重保持不变。
+
+请求日志通过唯一的原生引擎请求 ID 关联到 `episode` 和 `turn`，记录真实缓存命中、实例、回答和目标答案。合成模式额外统计 `continuation_cache_hit_fraction`（仅第二轮起）、`replica_switch_rate`、`mean_replicas_per_episode`。D 组若跨实例或有残留路由状态，实验失败。
+
+```bash
+python scripts/plot_grpo_sticky_session.py output/grpo-synthetic-smoke --formats png svg
+```
+
+除原有三张图外生成 `multiturn.*`，比较后续轮次缓存命中率、实例切换率和实际初始输入长度。这是可控合成负载下的端到端性能实验，不代表真实任务收益或模型能力提升；A/B/D 保证初始数据、反馈计划及训练预算相同，真实生成内容和后续权重可以不同。
 
 ## 启动
 

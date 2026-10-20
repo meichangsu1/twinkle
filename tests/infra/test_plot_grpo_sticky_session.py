@@ -61,3 +61,21 @@ def test_incomplete_run_ignores_failed_trials(tmp_path):
     _, summary, trials = load_summary(tmp_path)
     assert summary['status'] == 'failed'
     assert len(trials) == 9
+
+
+def test_synthetic_multiturn_summary_renders_episode_and_continuation_metrics(tmp_path):
+    pytest.importorskip('matplotlib')
+    data = example()
+    data['benchmark'] = 'synthetic_multiturn_grpo_affinity'
+    for trial in data['trials']:
+        trial.update(mean_replicas_per_episode=1 if trial['group'] == 'D' else 2,
+                     continuation_cache_hit_fraction=None if trial['group'] == 'A' else 0.8,
+                     replica_switch_rate=0 if trial['group'] == 'D' else 0.5,
+                     initial_prompt_tokens_mean=3072)
+    path = tmp_path / 'summary.json'
+    path.write_text(json.dumps(data))
+    artifacts = render(path, formats=('png', 'svg'), dpi=70)
+    assert len(artifacts) == 8
+    assert all(artifact.stat().st_size > 1000 for artifact in artifacts)
+    assert 'episode affinity on' in (tmp_path / 'plots' / 'overview.svg').read_text()
+    assert 'consecutive turns' in (tmp_path / 'plots' / 'multiturn.svg').read_text()
