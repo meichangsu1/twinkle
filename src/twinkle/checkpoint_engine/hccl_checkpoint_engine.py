@@ -156,10 +156,18 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 )
             return None
 
-        self._audit_memory('prepare.before_allocate')
-        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
-        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
-        self._audit_memory('prepare.after_allocate')
+        with torch.npu.device(self.device):
+            self._audit_memory('prepare.before_allocate')
+            self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
+            self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device='npu')
+            self._audit_memory('prepare.after_allocate')
+            # Training refills PyTorch's cache after the previous finalize().
+            # Keep the live buckets but return idle blocks before native HCCL
+            # allocates its communicator/warmup buffers outside PyTorch.
+            torch.npu.synchronize(self.device)
+            self._audit_memory('prepare.before_empty_cache')
+            torch.npu.empty_cache()
+            self._audit_memory('prepare.after_empty_cache')
 
         if self.is_master:
             self._start_zmq_server()
