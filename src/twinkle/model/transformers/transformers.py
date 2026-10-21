@@ -39,7 +39,7 @@ from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.state_dict_utils import normalize_adapter_keys
-from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
+from twinkle.model.micro_batch import MicroBatchConfig, merge_micro_batch_outputs, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers import feature_hooks
 from twinkle.model.transformers.moe import apply_expert_parallel
@@ -658,7 +658,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         # into the exception string and that dump swallows the real traceback.
         return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
 
-    @staticmethod
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
@@ -940,10 +939,56 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             **kwargs:
                 adapter_name: Lora adapter name.
                 disable_lora: If True, disable LoRA and use base model for inference.
+                micro_batch_size: Maximum samples per local micro-batch.
+                dynamic_batching: Pack samples under max_tokens_per_micro_batch.
+                max_tokens_per_micro_batch: Token budget required for dynamic batching.
+                packing_algorithm: Dynamic packing strategy, 'ffd' (default) or 'kk'.
         Returns:
             The output of the model forward.
         """
+        config = MicroBatchConfig.from_kwargs(kwargs)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
+        if config is None:
+            return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
+        return self._forward_only_micro_batches(
+            inputs=inputs, config=config, optimizer_config=optimizer_config, **kwargs)
+
+    def _prepare_forward_only_inputs(self, inputs, optimizer_config):
+        """Normalize and encode the local batch once, before optional micro-batching."""
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if not inputs:
+            raise ValueError('inputs empty, check your DataLoader outputs')
+        if self._not_encoded(inputs[0]):
+            assert optimizer_config.template is not None, \
+                'Use set_template to add a template when trying to input `List[Trajectory]`'
+            inputs = optimizer_config.template.batch_encode(inputs)
+        if not inputs:
+            raise ValueError('encoded inputs empty, check your template outputs')
+        return inputs
+
+    def _forward_only_micro_batches(self, *, inputs, config, optimizer_config, **kwargs):
+        """Execute a local micro-batch plan and restore the complete return value."""
+        plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        batches = []
+        for indices in plan:
+            micro_kwargs = {key: select_batch(value, indices, len(inputs)) for key, value in kwargs.items()}
+            outputs = self._forward_only_single(
+                inputs=[inputs[index] for index in indices], optimizer_config=optimizer_config,
+                _unpack_routing=True, **micro_kwargs)
+            batches.append(dict(outputs))
+        micro_batch_scales = None
+        if any(output.get('aux_loss') is not None for output in batches):
+            loss_instance = optimizer_config.get_loss(kwargs.get('loss_key'))
+            micro_batch_scales = [loss_instance.micro_batch_scale(inputs, indices) for indices in plan]
+        return merge_micro_batch_outputs(
+            batches, plan, task=kwargs.get('task', 'causal_lm'), micro_batch_scales=micro_batch_scales)
+
+    def _forward_only_single(self, *, inputs, optimizer_config, **kwargs):
+        """Run one evaluation micro-batch, retaining its state for metric accumulation."""
+        unpack_routing = kwargs.pop('_unpack_routing', False)
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
@@ -954,19 +999,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
         # to skip here; popped so it does not linger in eval_status.forward_kwargs.
         kwargs.pop('compute_loss', None)
-        optimizer_config = self.optimizer_group[adapter_name]
         self._lazy_wrap_model()
-        if not inputs:
-            raise ValueError('inputs empty, check your DataLoader outputs')
         self.model.eval()
-        if (isinstance(inputs, dict) and self._not_encoded(inputs)) or (isinstance(inputs, list)
-                                                                        and self._not_encoded(inputs[0])):
-            # Trajectory or List[Trajectory]
-            assert optimizer_config.template is not None, \
-                'Use set_template to add a template when trying to input `List[Trajectory]`'
-            if isinstance(inputs, dict):
-                inputs = [inputs]
-            inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         with torch.no_grad():
             processor: InputProcessor = optimizer_config.processor
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
@@ -1029,6 +1063,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 outputs = self.model(**inputs)
 
             recorded_routing = rr.finish()
+            if unpack_routing and recorded_routing is not None and processor._is_packed_position_ids(
+                    inputs.get('position_ids')):
+                recorded_routing, = processor._unpack_by_position_ids(inputs['position_ids'], recorded_routing)
 
             inputs['labels'] = labels
             if loss_scale is not None:

@@ -190,3 +190,130 @@ def select_batch(value: Any, indices: list[int], batch_size: int) -> Any:
     if hasattr(value, 'shape') and len(value.shape) > 0 and value.shape[0] == batch_size:
         return value[indices]
     return value
+
+
+def merge_micro_batch_outputs(
+    outputs: list[dict[str, Any]], plan: list[list[int]], *, task: str = 'causal_lm',
+    micro_batch_scales: list[float] | None = None,
+) -> dict[str, Any]:
+    """Restore sample outputs and reduce auxiliary loss with explicit training scales."""
+    merger = _MicroBatchOutputMerger(plan)
+    return merger.merge(outputs, task=task, micro_batch_scales=micro_batch_scales)
+
+
+class _MicroBatchOutputMerger:
+    """Keep sample ordering shared across field-specific and recursive merge operations."""
+
+    def __init__(self, plan):
+        if not plan or any(not indices for indices in plan):
+            raise ValueError('outputs must match a non-empty micro-batch plan')
+        merged_sample_indices = [index for indices in plan for index in indices]
+        if sorted(merged_sample_indices) != list(range(len(merged_sample_indices))):
+            raise ValueError('micro-batch plan must cover every sample exactly once')
+        self.plan = plan
+        self.restore_order_indices = sorted(range(len(merged_sample_indices)), key=merged_sample_indices.__getitem__)
+
+    @staticmethod
+    def _invalid(path, reason):
+        raise ValueError(f'{path}: {reason}')
+
+    def merge(self, outputs, *, task, micro_batch_scales):
+        if not outputs or len(outputs) != len(self.plan):
+            raise ValueError('outputs must match a non-empty micro-batch plan')
+        if any(set(output) != set(outputs[0]) for output in outputs):
+            self._invalid('outputs', 'inconsistent output keys across micro-batches')
+        pooled_tasks = ('embedding', 'generative_reranker', 'seq_cls', 'reranker')
+        known_sequence_dims = {
+            'logps': (1,), 'values': (1,), 'entropies': (1,),
+            'logits': () if task in pooled_tasks else (1,),
+            'embeddings': (), 'routed_experts': (1,),
+        }
+        return {
+            field: self._merge_field(field, [output[field] for output in outputs], known_sequence_dims, micro_batch_scales)
+            for field in outputs[0]
+        }
+
+    def _merge_field(self, field, values, known_sequence_dims, micro_batch_scales):
+        path = f'outputs.{field}'
+        if field == 'aux_loss':
+            return self._reduce_aux_loss(values, path, micro_batch_scales)
+        if field == 'past_key_values':
+            if any(value is not None for value in values):
+                self._invalid(path, 'forward_only expects None')
+            return None
+        if field in known_sequence_dims:
+            return self._merge_values(values, path, known_sequence_dims[field])
+        return self._merge_values(values, path)
+
+    @staticmethod
+    def _reduce_aux_loss(values, path, micro_batch_scales):
+        import torch
+
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise ValueError(f'{path}: inconsistent optional outputs across micro-batches')
+        if micro_batch_scales is None or len(micro_batch_scales) != len(values):
+            raise ValueError(f'{path}: one training scale per micro-batch is required')
+        if any(not isinstance(value, (int, float, torch.Tensor))
+               or (isinstance(value, torch.Tensor) and value.ndim != 0) for value in values):
+            raise ValueError(f'{path}: expected scalar auxiliary losses')
+        return sum(value * scale for value, scale in zip(values, micro_batch_scales))
+
+    def _merge_values(self, values, path, sequence_dims=None):
+        import torch
+
+        first = values[0]
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            self._invalid(path, 'inconsistent optional outputs across micro-batches')
+        if any(type(value) is not type(first) for value in values):
+            self._invalid(path, 'inconsistent output types across micro-batches')
+        if isinstance(first, torch.Tensor):
+            return self._merge_tensors(values, path, sequence_dims)
+        if isinstance(first, dict):
+            return self._merge_dicts(values, path, sequence_dims)
+        if isinstance(first, tuple):
+            return self._merge_tuples(values, path, sequence_dims)
+        if isinstance(first, list):
+            return self._merge_sample_lists(values, path)
+        self._invalid(path, f'unsupported micro-batch output type: {type(first).__name__}')
+
+    def _merge_tensors(self, values, path, sequence_dims):
+        from twinkle.utils import pad_and_stack_tensors
+
+        first = values[0]
+        if first.ndim == 0:
+            self._invalid(path, 'scalar forward outputs require an explicit reduction rule')
+        if any(value.ndim != first.ndim or value.dtype != first.dtype or value.device != first.device
+               for value in values):
+            self._invalid(path, 'tensor rank, dtype and device must agree across micro-batches')
+        if any(value.shape[0] != len(indices) for value, indices in zip(values, self.plan)):
+            self._invalid(path, f'expected a sample dimension matching the plan; got {[tuple(v.shape) for v in values]}')
+        # Known fields specify their sequence axes; unknown tensors use generic padding.
+        padding_dims = tuple(range(1, first.ndim)) if sequence_dims is None else sequence_dims
+        for dim in range(1, first.ndim):
+            if dim not in padding_dims and any(value.shape[dim] != first.shape[dim] for value in values):
+                self._invalid(path, f'non-sequence dimension {dim} must agree across micro-batches')
+        combined = pad_and_stack_tensors(values, pad_value=0)
+        return combined[self.restore_order_indices]
+
+    def _merge_dicts(self, values, path, sequence_dims):
+        first = values[0]
+        if any(set(value) != set(first) for value in values):
+            self._invalid(path, 'inconsistent output keys across micro-batches')
+        return {key: self._merge_values([value[key] for value in values], f'{path}.{key}', sequence_dims)
+                for key in first}
+
+    def _merge_tuples(self, values, path, sequence_dims):
+        if any(len(value) != len(values[0]) for value in values):
+            self._invalid(path, 'tuple lengths must agree across micro-batches')
+        return tuple(self._merge_values([value[index] for value in values], f'{path}[{index}]', sequence_dims)
+                     for index in range(len(values[0])))
+
+    def _merge_sample_lists(self, values, path):
+        if any(len(value) != len(indices) for value, indices in zip(values, self.plan)):
+            self._invalid(path, 'output list does not match micro-batch sample counts')
+        flattened = [item for value in values for item in value]
+        return [flattened[index] for index in self.restore_order_indices]
