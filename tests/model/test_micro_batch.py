@@ -6,6 +6,7 @@ import pytest
 from twinkle.loss import CrossEntropyLoss, GRPOLoss
 from twinkle.loss.base import Loss
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches
+from twinkle.model.optimizer_group import BaseOptimizerGroup
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
 
@@ -78,8 +79,15 @@ def test_loss_without_micro_batch_semantics_fails_when_split():
 
 def test_transformers_forward_backward_keeps_original_default_path():
     class ModelHarness:
+        _forward_backward_single = TransformersModel._forward_backward_single
+        _not_encoded = staticmethod(lambda inputs: False)
+
+        def _get_default_group(self):
+            return 'adapter'
+
         def __init__(self):
             self.calls = []
+            self.optimizer_group = {'adapter': BaseOptimizerGroup(loss_instance=CrossEntropyLoss())}
 
         def forward(self, *, inputs, **_kwargs):
             self.calls.append(('forward', inputs))
@@ -103,8 +111,9 @@ def test_transformers_forward_backward_keeps_original_default_path():
 
 
 def test_transformers_forward_backward_executes_real_micro_batches():
-    class OptimizerConfig:
+    class OptimizerConfig(BaseOptimizerGroup):
         def __init__(self):
+            super().__init__()
             self.processor = InputProcessor(padding_free=False)
             self.template = None
             self.train_status = SimpleNamespace(loss_value=None, num_tokens=0.0)
@@ -117,6 +126,7 @@ def test_transformers_forward_backward_executes_real_micro_batches():
             pass
 
     class ModelHarness:
+        _forward_backward_single = TransformersModel._forward_backward_single
         _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
         _forward_backward_micro_batch = TransformersModel._forward_backward_micro_batch
         _forward_backward_micro_batches = TransformersModel._forward_backward_micro_batches
@@ -164,6 +174,7 @@ def test_transformers_forward_backward_executes_real_micro_batches():
         sync_gradients=True,
     )
 
+    assert outputs['loss'] == 2.0
     assert model.forward_batches == [[0, 1], [2, 3]]
     assert model.backward_calls == [(False, 1.0), (True, 1.0)]
     assert model.optimizer_group['adapter'].train_status.num_tokens == 1.0
