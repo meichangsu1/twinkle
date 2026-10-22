@@ -27,6 +27,8 @@ def _get_workers(workers, execute):
 # Affinity survives completed calls, but idle sessions must not accumulate forever.
 # Expired entries are reclaimed on the next sticky call for the same method.
 _CW_SESSION_IDLE_TIMEOUT = 30 * 60
+# Limit bindings per driver and method; overflow evicts the least recently used session.
+_CW_SESSION_CACHE_SIZE = 10_000
 
 
 @dataclass
@@ -267,9 +269,9 @@ def _sticky_session_cw_plan(worker_ids: tuple, load: List[int], session_ids: tup
     """Plan session affinity under the caller's continuous-work lock.
 
     New sessions use least load; existing sessions keep their stable actor ID even
-    when workers are reordered or added. An idle expiry, or a bound actor missing
-    from this call's eligible workers, permits rebinding. ``None`` uses ordinary
-    least-load routing without retaining a binding. Like ``_cw_plan``, update the
+    when workers are reordered or added. Idle expiry, LRU eviction, or a bound
+    actor missing from this call's eligible workers permits rebinding. ``None``
+    uses ordinary least-load routing without retaining a binding. Like ``_cw_plan``, update the
     local planning loads; the RPC submission loop owns actual load accounting.
     """
     if not worker_ids:
@@ -293,6 +295,8 @@ def _sticky_session_cw_plan(worker_ids: tuple, load: List[int], session_ids: tup
         if session_id is not None:
             session_bindings[session_id] = _StickySessionBinding(worker_ids[target], now)
             session_bindings.move_to_end(session_id)
+            while len(session_bindings) > _CW_SESSION_CACHE_SIZE:
+                session_bindings.popitem(last=False)
         per_worker[target].append(index)
         load[target] += 1
     return per_worker

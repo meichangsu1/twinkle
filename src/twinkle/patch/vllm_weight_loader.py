@@ -16,6 +16,8 @@ def streaming_weight_sync():
     token = _pending_alias_checks.set(checks)
     try:
         yield
+        # Per-bucket validation can miss tied parameters loaded by another bucket.
+        # Merge loaded names per module before running the original alias checks.
         loaded_by_module = {}
         for _, loader, loaded in checks:
             loaded_by_module.setdefault(id(loader.module), set()).update(loaded)
@@ -35,6 +37,8 @@ def patch_lora_weight_loader():
     from vllm.lora.layers import BaseLayerWithLoRA
     from vllm.model_executor.models.utils import AutoWeightsLoader
 
+    # Delegating "base_layer.weight" to the inner loader fails because it expects "weight".
+    # Adapt input names, then report internal names so tied-weight validation still works.
     original_load = getattr(BaseLayerWithLoRA, "load_weights", None)
     if original_load is not None and not getattr(original_load, "_twinkle_weight_sync_patch", False):
 
@@ -58,9 +62,6 @@ def patch_lora_weight_loader():
             checks = _pending_alias_checks.get()
             if checks is None:
                 return original_check(self, autoloaded_weights)
-            # A fresh AutoWeightsLoader is created for each bucket. Retain its
-            # original check and combine loaded names only for this model and
-            # this sync; missing canonical weights still fail at stream end.
             checks.append((original_check, self, set(autoloaded_weights)))
 
         check_skipped_aliases._twinkle_weight_sync_patch = True
