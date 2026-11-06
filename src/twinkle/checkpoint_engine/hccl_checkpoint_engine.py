@@ -11,12 +11,14 @@ from __future__ import annotations
 import os
 import time
 import torch
+import torch.distributed as dist
 import zmq
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
-from twinkle.utils import find_free_port, find_node_ip, is_valid_ipv6_address, stateless_init_process_group
+from twinkle.utils import ensure_hccl_socket_env, find_free_port, find_node_ip, is_valid_ipv6_address
 from twinkle.utils.zmq_utils import configure_zmq_socket
 from .base import CheckpointEngine
 from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
@@ -36,7 +38,7 @@ class MasterMetadata:
 
 
 class HCCLCheckpointEngine(CheckpointEngine):
-    """HCCL checkpoint engine for Ascend NPU."""
+    """HCCL checkpoint engine using an independent torch-npu process group."""
 
     backend_name = 'hccl'
 
@@ -52,7 +54,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
-        self.pyhccl = None
+        self._pg = None
+        self._store = None
 
         self.meta_timeout_s = int(os.environ.get('TWINKLE_CKPT_HCCL_META_TIMEOUT_S', '300'))
         self.meta_timeout_ms = self.meta_timeout_s * 1000
@@ -185,12 +188,11 @@ class HCCLCheckpointEngine(CheckpointEngine):
                     logger.warning(f'Error terminating ZMQ context: {e}')
                 self._zmq_ctx = None
 
-            if self.rank is not None and self.rank >= 0 and self.pyhccl is not None:
-                try:
-                    self.pyhccl.destroyComm(self.pyhccl.comm)
-                except Exception as e:
-                    logger.warning(f'Error destroying HCCL communicator: {e}')
-                self.pyhccl = None
+            # This group is not registered with torch.distributed's default world.
+            # Dropping references invokes torch-npu's communicator/thread cleanup;
+            # dist.destroy_process_group() only accepts registered groups.
+            self._pg = None
+            self._store = None
 
             self.rank = None
             self.world_size = None
@@ -242,15 +244,27 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if self._group_initialized and not self.rebuild_group:
             return
 
-        if self.rebuild_group or self.pyhccl is None:
-            self.pyhccl = stateless_init_process_group(
-                master_address=master_metadata.dist_ip,
-                master_port=master_metadata.dist_port,
-                rank=rank,
+        if self._pg is None:
+            from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+            ensure_hccl_socket_env(master_metadata.dist_port)
+            torch.npu.set_device(self.device)
+            self._store = dist.TCPStore(
+                host_name=master_metadata.dist_ip,
+                port=master_metadata.dist_port,
                 world_size=world_size,
-                device=self.device,
-                backend='hccl',
+                is_master=(rank == 0),
+                timeout=timedelta(seconds=300),
+                wait_for_workers=True,
+                use_libuv=False,
             )
+            options = ProcessGroupHCCL.Options()
+            options._timeout = timedelta(seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200')))
+            # Empty global_ranks_in_group denotes the default HCCL group in torch-npu.
+            # Supply explicit members and a shared channel ID to keep this group independent.
+            options.global_ranks_in_group = list(range(world_size))
+            options.group_id = f'{self.group_name}:{master_metadata.dist_ip}:{master_metadata.dist_port}'
+            self._pg = ProcessGroupHCCL(self._store, rank, world_size, options)
             self.rank = rank
             self.world_size = world_size
         else:
@@ -260,13 +274,19 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if self.rank > 0 and self.socket is None:
             self._connect_zmq_client(master_metadata)
 
-        # self.device (not a bare torch.npu.current_device()) so the barrier signal lands on the
-        # same device the communicator was built on.
-        signal = torch.tensor([1], dtype=torch.int8, device=self.device)
-        self.pyhccl.all_reduce(signal)
+        signal = torch.zeros(1, dtype=torch.int32, device=f'npu:{self.device}')
+        self._broadcast(signal)
+        torch.npu.synchronize(self.device)
 
         self._group_initialized = True
         logger.info(f'init_process_group: rank={self.rank}, world_size={self.world_size}')
+
+    def _broadcast(self, tensor: torch.Tensor, src: int = 0) -> None:
+        """Broadcast on the unregistered HCCL group and order its work on the current stream."""
+        assert self._pg is not None
+        options = dist.BroadcastOptions()
+        options.rootRank = src
+        self._pg.broadcast([tensor], options).wait()
 
     def _serve_bucket_requests(self, bucket_id: int, metadata: dict[str, Any]) -> None:
         assert self.rank == 0
@@ -364,8 +384,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 'payload_size': offset,
             }
             self._serve_bucket_requests(bucket_id, metadata)
-            self.pyhccl.broadcast(send_buf, src=0)
-            torch.npu.synchronize()
+            self._broadcast(send_buf)
+            torch.npu.synchronize(self.device)
 
             total_chunks += len(bucket_meta)
             total_bytes += offset
@@ -438,8 +458,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         while True:
             metadata = self._request_bucket(bucket_id)
-            self.pyhccl.broadcast(recv_buf, src=0)
-            torch.npu.synchronize()
+            self._broadcast(recv_buf)
+            torch.npu.synchronize(self.device)
 
             bucket_meta = metadata['bucket_meta']
             if isinstance(bucket_meta, dict):

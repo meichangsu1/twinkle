@@ -224,8 +224,9 @@ class DeepSpeedStrategy(TransformerStrategyBase):
     def _build_plugin(config: Dict[str, Any]):
         """Build a ``DeepSpeedPlugin`` from a raw config dict.
 
-        Uses ``HfTrainerDeepSpeedConfig`` when available so that ``"auto"``
-        values are resolved; falls back to a plain dict otherwise.
+        Uses ``HfTrainerDeepSpeedConfig`` when available for Transformers
+        integration; ``"auto"`` values are resolved by Accelerate later.
+        Falls back to a plain dict otherwise.
         """
         from accelerate.utils import DeepSpeedPlugin
 
@@ -264,9 +265,10 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         if self.is_zero_stage(3):
             import deepspeed
 
-            cfg = self._deepspeed_plugin.deepspeed_config
-            if not isinstance(cfg, dict):
-                cfg = getattr(cfg, 'config', cfg)
+            # Accelerator creates a separate loading config with numeric batch
+            # fields. The training config can still contain "auto" here; passing
+            # it to zero.Init bypasses that preparation and fails DS validation.
+            cfg = self._deepspeed_plugin.dschf.config
             return deepspeed.zero.Init(config_dict_or_path=cfg)
         return nullcontext()
 

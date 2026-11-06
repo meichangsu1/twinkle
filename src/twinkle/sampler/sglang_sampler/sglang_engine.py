@@ -77,6 +77,15 @@ class SGLangEngine(BaseSamplerEngine):
         requires('sglang')
         import sglang as sgl
 
+        # Newer SGLang removed this legacy switch; Swift still supplies its disabled default.
+        if 'enable_ep_moe' in engine_kwargs:
+            from sglang.srt.server_args import ServerArgs
+            if 'enable_ep_moe' not in inspect.signature(ServerArgs).parameters:
+                if engine_kwargs.pop('enable_ep_moe'):
+                    raise ValueError('This SGLang version no longer supports enable_ep_moe. '
+                                     'Remove the legacy flag and configure ep_size instead '
+                                     '(--sglang_ep_size in Swift).')
+
         self.model_id = model_id
         self.tensor_parallel_size = tensor_parallel_size
         self._tokenizer = None
