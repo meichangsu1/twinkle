@@ -1,4 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
+import os
+import re
 import torch
 from dataclasses import field
 from typing import Dict, Optional
@@ -10,6 +13,25 @@ try:
     from vllm.lora.request import LoRARequest
 except (ModuleNotFoundError, ImportError):
     LoRARequest = object
+
+
+def is_packed_moe_lora(names) -> bool:
+    """Recognize PEFT expert parameters rather than per-expert linear adapters."""
+    return any(re.search(r'(?:^|\.)experts(?:\.base_layer)*\.lora_[AB]\.weight$', name) for name in names)
+
+
+def is_packed_moe_lora_checkpoint(path: str) -> bool:
+    from safetensors import safe_open
+
+    tensor_path = os.path.join(path, 'adapter_model.safetensors')
+    if os.path.isfile(tensor_path):
+        with safe_open(tensor_path, framework='pt', device='cpu') as tensors:
+            return is_packed_moe_lora(tensors.keys())
+    for filename in ('adapter_model.bin', 'adapter_model.pt'):
+        tensor_path = os.path.join(path, filename)
+        if os.path.isfile(tensor_path):
+            return is_packed_moe_lora(torch.load(tensor_path, map_location='cpu', weights_only=True))
+    raise FileNotFoundError(f'No adapter weights found in {path}')
 
 
 class TensorLoRARequest(LoRARequest):
@@ -29,9 +51,11 @@ class TensorLoRARequest(LoRARequest):
 class VLLMLoraWeights(Patch):
 
     def __call__(self, sampler, **kwargs):
-        from twinkle.patch.vllm_moe_loader import patch_qwen35_moe_is_3d_moe_weight_false
+        # Mixed-format vLLM selects the layout per adapter; retain the old path on older builds.
+        if not hasattr(LoRARequest, 'is_3d_lora_weight'):
+            from twinkle.patch.vllm_moe_loader import patch_qwen35_moe_is_3d_moe_weight_false
 
-        patch_qwen35_moe_is_3d_moe_weight_false()
+            patch_qwen35_moe_is_3d_moe_weight_false()
 
         _sampler_ref = sampler
 
@@ -47,7 +71,6 @@ class VLLMLoraWeights(Patch):
         except ImportError:
             # vllm >= 0.13 https://github.com/vllm-project/vllm/pull/30253
             from vllm.lora.lora_model import LoRAModel
-        from vllm.lora.utils import get_adapter_absolute_path
 
         try:
             from vllm.transformers_utils.tokenizer_group import TokenizerGroup
@@ -56,34 +79,14 @@ class VLLMLoraWeights(Patch):
             TokenizerGroup = None
 
         def patched_load_adapter(self: LRUCacheWorkerLoRAManager, lora_request: TensorLoRARequest) -> LoRAModel:
-            """
-            code borrowed from verl.utils.vllm.utils.py
-            based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
-            Reason:
-            VLLM does not support adding LoRA from tensors directly. It only supports adding LoRA via file paths.
-            To synchronize the LoRA tensors of the actor model, we need to find a workaround to enable VLLM to
-            load memory-based LoRA tensors.
-            """
+            # Native file loading preserves mixed-format validation and EP handling.
+            if not isinstance(lora_request, TensorLoRARequest):
+                return self._old_load_adapter(lora_request)
+
             try:
-                supported_lora_modules = self._adapter_manager.supported_lora_modules
-                packed_modules_mapping = self._adapter_manager.packed_modules_mapping
-                expected_lora_modules: list[str] = []
-                for module in supported_lora_modules:
-                    if module in packed_modules_mapping:
-                        expected_lora_modules.extend(packed_modules_mapping[module])
-                    else:
-                        expected_lora_modules.append(module)
-                expected_lora_modules = list(set(expected_lora_modules))
-                # this is the patch
-                lora_tensors = None
                 from vllm.lora.peft_helper import PEFTHelper
-                if isinstance(lora_request, TensorLoRARequest):
-                    peft_config = lora_request.peft_config
-                    lora_tensors = lora_request.lora_tensors
-                    peft_helper = PEFTHelper.from_dict(peft_config)
-                else:
-                    lora_path = get_adapter_absolute_path(lora_request.lora_path)
-                    peft_helper = PEFTHelper.from_local_dir(lora_path, self.max_position_embeddings)
+
+                peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
                 # Validates the LoRA configuration against requirements before
                 # loading weights, throwing an exception if validation fails.
                 peft_helper.validate_legal(self.lora_config)
@@ -119,17 +122,19 @@ class VLLMLoraWeights(Patch):
                     lora_request_kwargs['target_embedding_padding'] = (
                         self.vocab_size + self.lora_config.lora_extra_vocab_size)
 
-                if isinstance(lora_request, TensorLoRARequest):
-                    lora = self._lora_model_cls.from_lora_tensors(
-                        tensors=lora_tensors,
-                        **lora_request_kwargs,
-                    )
-                else:
-                    lora = self._lora_model_cls.from_local_checkpoint(
-                        lora_path,
-                        expected_lora_modules,
-                        **lora_request_kwargs,
-                    )
+                if 'skip_prefixes' in inspect.signature(self._lora_model_cls.from_lora_tensors).parameters:
+                    lora_request_kwargs['skip_prefixes'] = getattr(model, 'lora_skip_prefixes', None)
+                lora = self._lora_model_cls.from_lora_tensors(
+                    tensors=lora_request.lora_tensors,
+                    **lora_request_kwargs,
+                )
+                # The adapter manager uses this flag to convert packed MoE tensors before activation.
+                if hasattr(lora_request, 'is_3d_lora_weight'):
+                    lora.is_3d_lora_weight = lora_request.is_3d_lora_weight
+                for name in ('_validate_modules_to_save', '_validate_token_classification_lora'):
+                    validate = getattr(self._adapter_manager, name, None)
+                    if validate is not None:
+                        validate(lora)
             except Exception as e:
                 raise e
 

@@ -372,6 +372,8 @@ class VLLMEngine(BaseSamplerEngine):
             engine_config['enable_return_sampling_mask'] = True
             engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
+        if self.enable_lora and 'enable_mixed_moe_lora_format' in valid_args:
+            engine_config.setdefault('enable_mixed_moe_lora_format', True)
         # engine_kwargs are the caller's escape hatch into AsyncEngineArgs: a key the installed
         # vLLM does not know is a typo'd knob that would otherwise warn and vanish (the filter
         # below still carries twinkle's own injected keys, which are allowed to warn-and-drop).
@@ -795,6 +797,7 @@ class VLLMEngine(BaseSamplerEngine):
 
     async def _load_lora(self, lora_path: str):
         from vllm.lora.request import LoRARequest
+        from twinkle.patch.vllm_lora_weights import is_packed_moe_lora_checkpoint
 
         # Fail loudly, matching the sglang side: a silent None here means the sampler keeps serving
         # BASE weights -- an RL policy rollout would train on a different model than it samples.
@@ -807,11 +810,15 @@ class VLLMEngine(BaseSamplerEngine):
 
         lora_int_id = self._generate_lora_id()
         lora_name = str(lora_int_id)
+        layout_kwargs = {}
+        if hasattr(LoRARequest, 'is_3d_lora_weight'):
+            layout_kwargs['is_3d_lora_weight'] = is_packed_moe_lora_checkpoint(lora_path)
 
         lora_request = LoRARequest(
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             lora_path=lora_path,
+            **layout_kwargs,
         )
 
         logger.info(f'Loading LoRA from {lora_path}')

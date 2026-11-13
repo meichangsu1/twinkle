@@ -606,9 +606,12 @@ class TwinkleWorkerExtension:
         here.
         """
         if peft_config and base_sync_done:
-            from twinkle.patch.vllm_lora_weights import TensorLoRARequest
+            from twinkle.patch.vllm_lora_weights import TensorLoRARequest, is_packed_moe_lora
 
             converted = {self._convert_peft_to_vllm_lora_name(n): t for n, t in weights}
+            layout_kwargs = {}
+            if hasattr(TensorLoRARequest, 'is_3d_lora_weight'):
+                layout_kwargs['is_3d_lora_weight'] = is_packed_moe_lora(converted)
             lora_request = TensorLoRARequest(
                 lora_name=VLLM_LORA_NAME,
                 lora_int_id=VLLM_LORA_INT_ID,
@@ -616,6 +619,7 @@ class TwinkleWorkerExtension:
                 peft_config=peft_config,
                 lora_tensors=converted,
                 load_inplace=True,
+                **layout_kwargs,
             )
             self.add_lora(lora_request)
         else:
